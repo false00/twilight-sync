@@ -56,7 +56,7 @@ fn run() -> Result<()> {
     }
     if first.as_deref().is_some_and(|a| a == "--help" || a == "-h") {
         println!(
-            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
+            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save-location\n                                Show the automatically detected Dusklight save\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
         return Ok(());
     }
@@ -174,6 +174,32 @@ fn run() -> Result<()> {
             network.gateway,
             network.router_mac,
             network.fingerprint
+        );
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|a| a == "--check-save-location")
+    {
+        if arguments.next().is_some() {
+            bail!("Automatic save detection does not accept a custom directory");
+        }
+        let settings = twilight_sync::config::Settings::load(&twilight_sync::config::root_path()?)?;
+        let default = twilight_sync::save_location::default_profile()?;
+        let profile =
+            twilight_sync::save_location::profile(&default, settings.game_exe.as_deref())?;
+        let path = twilight_sync::save_location::discover(&profile)?;
+        let hash = twilight_sync::save_location::hash(&profile, &path)?;
+        println!(
+            "AUTOMATIC DUSKLIGHT SAVE\nProfile: {}\nSave: {}\nState: {}\nSHA-256: {}\nOld manual Sync paths were ignored. No files or settings were changed.",
+            profile.display(),
+            path.display(),
+            if hash.is_some() {
+                "Valid standard save"
+            } else {
+                "No save yet; automatic receive destination ready"
+            },
+            hash.as_deref().unwrap_or("none"),
         );
         return Ok(());
     }

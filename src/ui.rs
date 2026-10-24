@@ -540,6 +540,8 @@ impl Dashboard {
             && Self::management_available(snapshot)
             && !snapshot.textures.recovery_needed
             && snapshot.settings.save_file.is_some()
+            && snapshot.save_profile.is_some()
+            && snapshot.save_ready
             && snapshot.settings.game_exe.is_some()
             && !snapshot.pending_save
             && !snapshot.pending_iso
@@ -577,18 +579,6 @@ impl Dashboard {
         }
     }
 
-    fn choose_save(&mut self, destination: bool) {
-        let dialog = rfd::FileDialog::new().add_filter("Dusklight GCI save", &["gci"]);
-        let selected = if destination {
-            dialog.set_file_name("01-GZ2E-zeldaTp.dat.gci").save_file()
-        } else {
-            dialog.pick_file()
-        };
-        if let Some(path) = selected {
-            self.dispatch(Command::SetSave(path));
-        }
-    }
-
     fn overview(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let p = Palette::of(ui);
         Self::card(ui, |ui| {
@@ -617,7 +607,16 @@ impl Dashboard {
                     if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
                         self.dispatch(Command::Launch);
                     }
-                    if ui.button("Send this save").clicked() {
+                    if ui
+                        .add_enabled(
+                            snapshot.save_ready
+                                && snapshot.local_hash.is_some()
+                                && Self::management_available(snapshot)
+                                && snapshot.transfer.is_empty(),
+                            egui::Button::new("Send this save"),
+                        )
+                        .clicked()
+                    {
                         self.dispatch(Command::SendSave);
                     }
                     if ui.button("Connection details").clicked() {
@@ -642,7 +641,10 @@ impl Dashboard {
                     "Select or install Dusklight on the Dusklight page before playing.",
                 );
             } else if snapshot.settings.save_file.is_none() {
-                Self::secondary(ui, "Choose your save file or a receive destination below.");
+                Self::secondary(
+                    ui,
+                    "Automatic save detection needs attention. Check the status message; no folder selection is needed.",
+                );
             }
             if snapshot.ready && snapshot.settings.play_lock.is_none() {
                 Self::secondary(ui, "Protected launch allows one game session at a time.");
@@ -703,7 +705,7 @@ impl Dashboard {
         }
         ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::section_title(ui, "Save file");
+            Self::section_title(ui, "Automatic save sync");
             let matching =
                 snapshot.local_hash.is_some() && snapshot.local_hash == snapshot.remote_hash;
             let (state, color) = if matching {
@@ -712,44 +714,33 @@ impl Dashboard {
                 ("Different copies - approval may be required", p.warning)
             } else if snapshot.local_hash.is_some() {
                 ("Local save is ready", p.success)
-            } else if snapshot.settings.save_file.is_some() {
-                ("Waiting for a valid, stable save", p.secondary)
+            } else if snapshot.settings.save_file.is_some() && snapshot.save_ready {
+                (
+                    "No save yet - ready for Dusklight or your partner",
+                    p.secondary,
+                )
             } else {
-                ("No save selected", p.secondary)
+                ("Automatic detection needs attention", p.warning)
             };
             Self::status(ui, "Status", state, color);
-            if let Some(path) = &snapshot.settings.save_file {
-                Self::path(ui, path);
-            }
+            Self::secondary(
+                ui,
+                "Uses the standard save inside Dusklight's active profile, including its own portable or custom profile. No folders to choose.",
+            );
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        Self::management_available(snapshot),
-                        egui::Button::new("Choose save file..."),
-                    )
-                    .clicked()
-                {
-                    self.choose_save(false);
-                }
-                if ui
-                    .add_enabled(
-                        Self::management_available(snapshot),
-                        egui::Button::new("Set receive destination..."),
-                    )
-                    .clicked()
-                {
-                    self.choose_save(true);
-                }
                 if ui.button("View history").clicked() {
                     self.page = Page::History;
                 }
             });
             Self::secondary(
                 ui,
-                "Use Dusklight's actual Card A .gci file. A PC without a save needs a receive destination.",
+                "A PC without a save is prepared automatically. Old manual selections are ignored; existing files are not moved or deleted.",
             );
             ui.collapsing("Save details", |ui| {
+                if let Some(path) = &snapshot.settings.save_file {
+                    Self::path(ui, path);
+                }
                 if let Some(hash) = &snapshot.local_hash {
                     ui.label(RichText::new(format!("Local SHA-256: {hash}")).monospace());
                 }
@@ -1043,7 +1034,7 @@ impl Dashboard {
             });
             Self::secondary(
                 ui,
-                "Protected play requires both paired managers online and an explicit save destination.",
+                "Protected play requires both paired managers online and an automatically detected save profile.",
             );
         });
         ui.add_space(12.0);
@@ -1450,14 +1441,16 @@ impl Dashboard {
             });
         });
         ui.add_space(12.0);
-        let can_restore =
-            snapshot.settings.save_file.is_some() && Self::management_available(snapshot);
+        let can_restore = snapshot.settings.save_file.is_some()
+            && snapshot.save_profile.is_some()
+            && snapshot.save_ready
+            && Self::management_available(snapshot);
         if snapshot.history.entries.is_empty() {
             Self::notice(
                 ui,
                 Tone::Info,
                 "No snapshots yet",
-                "Choose a valid GCI save on Home. Stable saves are recorded automatically; refresh can also migrate older backups.",
+                "Valid saves are recorded automatically from Dusklight's detected profile. Play and save in Dusklight, or receive your partner's save - no location setup is needed.",
             );
         }
         for entry in &snapshot.history.entries {
@@ -1469,9 +1462,18 @@ impl Dashboard {
                         if current {
                             ui.label(RichText::new("Current save").color(p.success));
                         } else if ui.add_enabled(can_restore, egui::Button::new("Restore...")).clicked() {
-                            let Some(destination) = snapshot.settings.save_file.as_ref() else {
-                                self.local_error = Some("Choose a local GCI destination before restoring.".into());
+                            let Some(profile) = snapshot.save_profile.as_deref() else {
+                                self.local_error = Some("Automatic Dusklight profile detection is not ready.".into());
                                 return;
+                            };
+                            let destination = match crate::save_location::path_for_identity(profile, &crate::files::SaveIdentity {
+                                game: entry.game.clone(), name: entry.name.clone(),
+                            }) {
+                                Ok(path) => path,
+                                Err(error) => {
+                                    self.local_error = Some(format!("{error:#}"));
+                                    return;
+                                }
                             };
                             let approved = rfd::MessageDialog::new().set_title("Restore save snapshot")
                                 .set_description(format!("Restore {} / {} to {}?\n\nThe current valid save is snapshotted first. This creates a new commit; paired-device conflicts still need approval.", entry.game, entry.name, destination.display()))
@@ -1987,6 +1989,8 @@ mod tests {
         let ready = ready_snapshot()?;
         for condition in [
             "save",
+            "profile",
+            "save-not-ready",
             "game",
             "save-consent",
             "iso-consent",
@@ -1997,6 +2001,8 @@ mod tests {
             let mut snapshot = ready.clone();
             match condition {
                 "save" => snapshot.settings.save_file = None,
+                "profile" => snapshot.save_profile = None,
+                "save-not-ready" => snapshot.save_ready = false,
                 "game" => snapshot.settings.game_exe = None,
                 "save-consent" => snapshot.pending_save = true,
                 "iso-consent" => snapshot.pending_iso = true,

@@ -82,27 +82,66 @@ The startup entry is per-user, not a scheduled task or administrator service.
 5. Compare the full eight-digit code on both screens. Approve on **each** device
    only if every digit matches. Reject a mismatch. Neither device can transfer
    game data after only one approval.
-6. Select Dusklight's actual `.gci` save on each device, or choose an explicit
-   receive destination for a device without a save. Use the game's real Card A
-   path, not an unrelated export. Different local directory paths are fine.
-7. Locate your existing `dusklight.exe`, or choose **Install official Dusklight**.
+6. Locate your existing `dusklight.exe`, or choose **Install official Dusklight**.
    Configure Dusklight with your own disc dump as its official guide describes.
+7. Save detection is automatic. Sync follows Dusklight's active profile and
+   standard Card A save; there are no save-path controls. Each PC can have a
+   different local profile location.
 8. If both saves exist and differ initially, use **Send this save** on the copy
    you want. The other device must approve replacement; its old copy is backed up.
 9. Launch with **Play Dusklight**. Both managers must be online and their save
    states must match. After exit, the final save is synced before play is unlocked.
 
-For a new game, both users can select the correct, not-yet-existing GCI
-destinations. An intentional empty destination is distinguished from a missing
-configuration or an invalid save. The manager can reserve exclusive play before
-the first save exists; it never manufactures a game save.
+For a new game, an automatically resolved empty destination is distinguished from
+an unavailable profile or an invalid save. The manager can reserve exclusive play
+before the first save exists; it never manufactures a game save. The first
+received or created save selects its supported regional Card A filename.
+
+### Automatic save locations
+
+The normal Windows profile is `%APPDATA%\TwilitRealm\Dusklight`. A stock US
+GameCube save is:
+
+```text
+%APPDATA%\TwilitRealm\Dusklight\USA\Card A\01-GZ2E-gczelda2.gci
+```
+
+The stock internal save name is **`gczelda2`**, not `zeldaTp.dat`. Supported
+GameCube/Wii IDs select `USA`, `JAP`, or `EUR` and their matching GCI filename.
+Detection examines only these known standard Card A locations, not arbitrary
+directories or the whole home folder.
+
+Sync follows Dusklight's own `data_location.json` precedence: beside the selected
+game executable, then the normal profile, then the legacy `TwilitRealm\Dusk`
+profile descriptor. Native portable mode uses the executable's `data` folder;
+native custom mode uses its recorded safe local profile. Sync does not rewrite
+those descriptors, force a different game profile, reset game settings/textures,
+or move existing saves. Dusklight remains responsible for its own migrations.
+Pending game migrations are reported rather than treated as an empty save.
+
+Old manually chosen Sync saves and receive destinations are ignored without
+opening or importing their files. The existing `save_file` settings value is now
+derived metadata, not a directory override; it is recomputed on startup. A
+location change clears the old common-sync base while preserving pairing and
+durable play locks. Profile binding stays pinned during gameplay and transfers;
+the profile is checked again before a protected launch.
+
+Malformed or oversized profile metadata, raw-card storage, unsafe paths,
+corrupt saves, alternate named saves, and multiple standard regional saves
+produce explicit errors. The app will not guess a winner or silently fall back
+to an old manual path.
+
+These conventions are verified against released Dusklight v2.0.3 and its pinned
+platform libraries: [profile policy](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/dusk/data.cpp),
+[stock save name](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/m_Do/m_Do_MemCard.cpp),
+and [regional Card A layout](https://github.com/encounter/aurora/blob/3227d76c60e1e782ca576610bce61c9e7744d8be/lib/dolphin/card.cpp).
 
 Dusklight supports several storage formats, but this release intentionally syncs
 **only individual four-block GCI saves** with data version 6. It does not sync raw
 memory-card images, `.dusksave` ZIP containers, mod sidecars, scripts, settings, or
-entire directories. Use Dusklight's GCI-directory storage. Identify your active
-Card A file using Dusklight's save tools/storage configuration; the manager does
-not guess a destination from a peer-supplied filename.
+entire directories. Use Dusklight's standard GCI-directory storage and stock save.
+The manager computes the local filename from the validated supported identity;
+a peer never supplies a directory or arbitrary destination filename.
 
 ### Network compatibility
 
@@ -252,7 +291,8 @@ Both sending and receiving validate the actual save:
 7. Transfer SHA-256 and the locally expected destination hash.
 
 Before writing, the manager checks again for a local Dusklight process. The
-destination is chosen **only on the receiving device**. UNC/device paths,
+destination is derived **only on the receiving device** from its detected
+profile and the fixed stock-save convention. UNC/device paths,
 alternate data streams, traversal, symbolic links, reparse points, reserved
 Windows device names, and ambiguous Windows components are refused.
 
@@ -619,7 +659,8 @@ router, or write application state:
 
 ```powershell
 cargo run --locked -- --help
-cargo run --locked -- --check-save 'C:\Games\Dusklight\Card A\01-GZ2E-zeldaTp.dat.gci'
+cargo run --locked -- --check-save-location
+cargo run --locked -- --check-save "$env:APPDATA\TwilitRealm\Dusklight\USA\Card A\01-GZ2E-gczelda2.gci"
 cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.iso'
 cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.rvz'
 cargo run --locked -- --check-network

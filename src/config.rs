@@ -29,6 +29,7 @@ pub struct Settings {
     pub startup: bool,
     pub network: Option<String>,
     pub peer: Option<Peer>,
+    // Derived by discovery; persisted only to bind the common sync base to its local save.
     pub save_file: Option<PathBuf>,
     pub game_exe: Option<PathBuf>,
     #[serde(default)]
@@ -148,10 +149,15 @@ impl Identity {
     }
 }
 
-pub fn root_directory() -> Result<PathBuf> {
+pub fn root_path() -> Result<PathBuf> {
     let home = directories::UserDirs::new().context("Cannot find user home directory")?;
     let root = home.home_dir().join(".twilight-sync");
     ensure_safe_path(&root)?;
+    Ok(root)
+}
+
+pub fn root_directory() -> Result<PathBuf> {
+    let root = root_path()?;
     fs::create_dir_all(&root)?;
     restrict_directory(&root)?;
     Ok(root)

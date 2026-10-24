@@ -442,6 +442,7 @@ impl History {
             .find(|entry| entry.stream == stream)
             .cloned();
         if let Some(previous) = &previous
+            && reason != Reason::Restored
             && self.commit(&previous.id)?.hash == hash
         {
             // Verify the existing reconstruction before trusting deduplication as a backup.
@@ -1017,6 +1018,28 @@ mod tests {
         }
         let reopened = open(temp.path())?;
         assert_eq!(reopened.index.pruned, history.index.pruned);
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_head_to_an_empty_default_records_a_commit_and_reuses_all_blocks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut history = open(temp.path())?;
+        let path = temp.path().join("save.gci");
+        let first = history.capture(&version(1), &path, Reason::Observed, None)?;
+        let before = history.stats()?;
+        let (_, restored) = history.restore(&first.id, &path, None)?;
+        let after = history.stats()?;
+        assert!(restored.added && restored.id != first.id);
+        assert_eq!(after.commits, before.commits + 1);
+        assert_eq!(after.blocks, before.blocks);
+        let page = history.page(None)?;
+        assert_eq!(page.entries[0].reason, Reason::Restored);
+        assert_eq!(
+            page.entries[0].restored_from.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(files::read_save(&path)?, version(1));
         Ok(())
     }
 

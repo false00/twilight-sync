@@ -74,14 +74,20 @@ Do these steps on **both PCs**:
 3. Open pairing on both PCs. On **one PC only**, choose the other device's
    **Compare codes** button. Compare the full code on both screens.
    **Both devices must approve the matching code.**
-4. In **Home**, choose Dusklight's actual `.gci` save, or select a receive
-   destination if this PC does not have a save yet.
-5. In **Dusklight**, locate `dusklight.exe` or use **Install / update Dusklight**.
+4. In **Dusklight**, locate `dusklight.exe` or use **Install / update Dusklight**.
    Configure the game with your own legally obtained disc dump.
+5. Save setup is automatic. Sync finds Dusklight's standard save in its active
+   profile and prepares a receiving PC when needed. There are no save-file or
+   save-folder pickers.
 6. Resolve any initial save conflict by sending the copy you want and approving
    replacement on the receiving PC.
 7. Use **Play Dusklight**. After you stop playing, the final save syncs before
    the other PC can start a protected session.
+
+Previous manual save selections in Sync are ignored. Existing files are not
+moved, deleted, or imported from those old locations. Dusklight's own profile
+settings and texture choices are preserved, including its portable/custom
+profile when configured.
 
 Installing or updating Dusklight through the app also creates or refreshes
 **Dusklight (Twilight Sync)** on your Windows desktop. It opens the manager's

@@ -8,7 +8,7 @@ use crate::{
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
     protocol::{self, Event, Handshake, SecureWriter},
-    self_update,
+    save_location, self_update,
     textures::{self, Activation, Pack},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -47,6 +47,8 @@ pub struct Snapshot {
     pub connecting: bool,
     pub pairing_open: bool,
     pub local_hash: Option<String>,
+    pub save_profile: Option<PathBuf>,
+    pub save_ready: bool,
     pub remote_hash: Option<String>,
     pub game_running: bool,
     pub remote_game: bool,
@@ -74,7 +76,6 @@ pub enum Command {
     Connect(String),
     ApprovePairing,
     RejectPairing,
-    SetSave(PathBuf),
     SetExecutable(PathBuf),
     SetIso(PathBuf),
     SetIsoEnabled(bool),
@@ -265,6 +266,9 @@ struct DiscVerification {
 struct Engine {
     root: PathBuf,
     settings: Settings,
+    default_profile: PathBuf,
+    save_profile: Option<PathBuf>,
+    save_location_error: Option<String>,
     identity: Arc<Identity>,
     audit: Audit,
     sender: Sender<Input>,
@@ -348,6 +352,7 @@ pub fn start() -> Result<Backend> {
     let root = config::root_directory()?;
     let instance = config::acquire_instance(&root)?;
     let settings = Settings::load(&root)?;
+    let default_profile = save_location::default_profile()?;
     let audit = Audit::new(&root)?;
     let identity = Arc::new(Identity::load(&root)?);
     settings.persist(&root)?;
@@ -360,10 +365,13 @@ pub fn start() -> Result<Backend> {
         "Startup preference applied; no network trusted implicitly",
     )?;
     let (sender, receiver) = bounded(128);
-    let view = Arc::new(Mutex::new(initial_snapshot(&settings, &identity.public)));
+    let mut initial = initial_snapshot(&settings, &identity.public);
+    initial.settings.save_file = None;
+    let view = Arc::new(Mutex::new(initial));
     let mut engine = Engine::new(
         root,
         settings,
+        default_profile,
         identity,
         audit,
         sender.clone(),
@@ -373,6 +381,9 @@ pub fn start() -> Result<Backend> {
         .name("twilight-manager".into())
         .spawn(move || {
             let _instance = instance;
+            if let Err(error) = engine.refresh_default_save() {
+                engine.report(error);
+            }
             if let Err(error) = engine.refresh_history() {
                 engine.report(error);
             }
@@ -406,6 +417,13 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
     let mut snapshot = initial_snapshot(&settings, &"0".repeat(64));
     snapshot.message =
         "Approve your home network, then pair your other PC to start syncing.".into();
+    snapshot.settings.save_file = Some(PathBuf::from(
+        r"C:\Users\Player\AppData\Roaming\TwilitRealm\Dusklight\USA\Card A\01-GZ2E-gczelda2.gci",
+    ));
+    snapshot.save_profile = Some(PathBuf::from(
+        r"C:\Users\Player\AppData\Roaming\TwilitRealm\Dusklight",
+    ));
+    snapshot.save_ready = true;
     if scenario != "offline" {
         let network = Network::from_parts(
             "192.168.10.20".parse()?,
@@ -416,9 +434,6 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
         )?;
         snapshot.settings.network = Some(network.fingerprint.clone());
         snapshot.network = Some(network);
-        snapshot.settings.save_file = Some(PathBuf::from(
-            r"C:\Games\Dusklight\Card A\01-GZ2E-zeldaTp.dat.gci",
-        ));
         snapshot.settings.game_exe = Some(PathBuf::from(r"C:\Games\Dusklight\dusklight.exe"));
         snapshot.settings.texture_profile =
             Some(PathBuf::from(r"C:\Users\Player\AppData\Roaming\Dusklight"));
@@ -533,6 +548,8 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         connecting: false,
         pairing_open: false,
         local_hash: None,
+        save_profile: None,
+        save_ready: false,
         remote_hash: None,
         game_running: false,
         remote_game: false,
@@ -558,6 +575,7 @@ impl Engine {
     fn new(
         root: PathBuf,
         settings: Settings,
+        default_profile: PathBuf,
         identity: Arc<Identity>,
         audit: Audit,
         sender: Sender<Input>,
@@ -567,6 +585,9 @@ impl Engine {
         Self {
             root,
             settings,
+            default_profile,
+            save_profile: None,
+            save_location_error: None,
             identity,
             audit,
             sender,
@@ -805,6 +826,7 @@ impl Engine {
                     self.latest_release = None;
                 }
                 self.store(|s| s.game_exe = Some(installed.executable))?;
+                self.refresh_default_save()?;
                 self.message = format!(
                     "Dusklight {} {}. Desktop shortcut opens protected Play controls. Saves, profile, and texture selection were preserved; nothing was launched.",
                     installed.tag,
@@ -1259,46 +1281,12 @@ impl Engine {
                 self.pairing_until = None;
                 self.disconnect("Pairing rejected by the local user");
             }
-            Command::SetSave(path) => {
+            Command::SetExecutable(path) => {
                 self.require_idle()?;
                 ensure!(
                     self.no_transfer(),
-                    "Finish or reject the pending transfer first"
+                    "Finish pending transfers before changing the game executable"
                 );
-                ensure_safe_path(&path)?;
-                ensure!(
-                    path.extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("gci")),
-                    "Select a .gci save, not a raw card or archive"
-                );
-                ensure!(
-                    path.parent().is_some_and(|p| p.is_dir()),
-                    "Save directory does not exist"
-                );
-                if path.try_exists()? {
-                    files::read_save(&path)?;
-                }
-                self.audit.record(
-                    "save-selected",
-                    Some(&path),
-                    None,
-                    None,
-                    "Destination chosen locally; peer paths are never used",
-                )?;
-                self.store(|s| {
-                    s.save_file = Some(path);
-                    s.sync_base = None;
-                })?;
-                self.stable = 0;
-                self.history_candidate = None;
-                self.history_last_hash = None;
-                self.history_cursor = None;
-                self.refresh_save()?;
-                self.refresh_history()?;
-                self.send_state()?;
-            }
-            Command::SetExecutable(path) => {
-                self.require_idle()?;
                 ensure_safe_path(&path)?;
                 ensure!(
                     path.is_file()
@@ -1308,6 +1296,7 @@ impl Engine {
                     "Select dusklight.exe"
                 );
                 self.store(|s| s.game_exe = Some(path))?;
+                self.refresh_default_save()?;
                 self.selected_release =
                     install::selected_release(&self.root, self.settings.game_exe.as_deref())?;
             }
@@ -1696,12 +1685,15 @@ impl Engine {
                     self.no_transfer(),
                     "Finish or reject pending transfers before restoring"
                 );
-                let path = self
-                    .settings
-                    .save_file
-                    .clone()
-                    .context("Choose the local GCI destination first")?;
+                self.refresh_save()?;
                 self.ensure_history()?;
+                let bytes = self
+                    .history
+                    .as_ref()
+                    .context("History is unavailable")?
+                    .read(&id)?;
+                let path = self.save_destination(&bytes)?;
+                save_location::prepare(&path)?;
                 self.audit.record(
                     "snapshot-restore-approved",
                     Some(&path),
@@ -2204,7 +2196,13 @@ impl Engine {
                     files::sha256(&bytes) == hash,
                     "Save payload SHA-256 mismatch"
                 );
-                files::validate_save(&bytes)?;
+                let identity = files::validate_save(&bytes)?;
+                save_location::path_for_identity(
+                    self.save_profile
+                        .as_deref()
+                        .context("Automatic save profile is unavailable")?,
+                    &identity,
+                )?;
                 self.ensure_save_receive_allowed(lease.as_deref())?;
                 ensure!(
                     self.pending_save.is_none()
@@ -2346,6 +2344,14 @@ impl Engine {
                     .game_exe
                     .as_ref()
                     .context("Select or install Dusklight")?;
+                ensure!(
+                    self.save_profile.as_ref()
+                        == Some(&save_location::profile(
+                            &self.default_profile,
+                            Some(executable),
+                        )?),
+                    "Dusklight's profile changed while waiting for play approval; retry after automatic detection completes"
+                );
                 self.managed_token = Some(token);
                 let child = play::launch(executable)?;
                 self.child = Some(child);
@@ -2549,12 +2555,42 @@ impl Engine {
     }
 
     fn current_hash(&self) -> Result<Option<String>> {
-        files::save_hash(
+        save_location::hash(
+            self.save_profile
+                .as_deref()
+                .context("Dusklight's automatic save profile is unavailable")?,
             self.settings
                 .save_file
                 .as_ref()
-                .context("Select the local GCI save destination")?,
+                .context("Dusklight's automatic save location is unavailable")?,
         )
+    }
+
+    fn save_destination(&mut self, bytes: &[u8]) -> Result<PathBuf> {
+        let profile = self
+            .save_profile
+            .clone()
+            .context("Dusklight's automatic save profile is unavailable")?;
+        let identity = files::validate_save(bytes)?;
+        let target = save_location::path_for_identity(&profile, &identity)?;
+        let current = self
+            .settings
+            .save_file
+            .as_ref()
+            .context("Dusklight's automatic save location is unavailable")?;
+        if current != &target {
+            ensure!(
+                self.current_hash()?.is_none(),
+                "The existing default save belongs to another game region; it will not be replaced"
+            );
+            let discovered = save_location::discover(&profile)?;
+            ensure!(
+                !discovered.try_exists()? && !target.try_exists()?,
+                "A default save appeared after approval; refresh and retry rather than overwriting it"
+            );
+            self.apply_automatic_save_location(profile, target.clone())?;
+        }
+        Ok(target)
     }
 
     fn ensure_save_receive_allowed(&self, lease: Option<&str>) -> Result<()> {
@@ -2576,12 +2612,18 @@ impl Engine {
     fn receive_save(&mut self, pending: PendingSave, manual: bool) -> Result<()> {
         self.game_running = self.process.game_running();
         self.ensure_save_receive_allowed(pending.lease.as_deref())?;
-        let path = self
-            .settings
-            .save_file
-            .as_ref()
-            .context("Select a save destination")?
-            .clone();
+        if self.settings.play_lock.is_none() {
+            ensure!(
+                self.save_profile.as_ref()
+                    == Some(&save_location::profile(
+                        &self.default_profile,
+                        self.settings.game_exe.as_deref(),
+                    )?),
+                "Dusklight's active profile changed after the save offer; retry after automatic detection completes"
+            );
+        }
+        let path = self.save_destination(&pending.bytes)?;
+        save_location::prepare(&path)?;
         self.audit.record(
             "save-receive-approved",
             Some(&path),
@@ -2648,7 +2690,7 @@ impl Engine {
             .clone();
         ensure!(
             remote.save_ready,
-            "Select a valid save or receive destination on the other device"
+            "Wait for automatic save detection on the other device"
         );
         let lease = if let Some(lock) = &self.settings.play_lock {
             ensure!(
@@ -2666,8 +2708,15 @@ impl Engine {
             .settings
             .save_file
             .as_ref()
-            .context("Select a save file")?;
+            .context("Dusklight's automatic save location is unavailable")?;
         let bytes = files::read_save(path)?;
+        save_location::validate_at_path(
+            self.save_profile
+                .as_deref()
+                .context("Automatic save profile is unavailable")?,
+            path,
+            &bytes,
+        )?;
         let hash = files::sha256(&bytes);
         if remote.hash.as_ref() == Some(&hash) {
             return Ok(());
@@ -2783,7 +2832,93 @@ impl Engine {
         Ok(())
     }
 
+    fn refresh_default_save(&mut self) -> Result<()> {
+        let result = self
+            .resolve_default_save()
+            .context("Automatic Dusklight save detection failed; no save was moved or overwritten");
+        if let Err(error) = &result {
+            self.save_location_error = Some(format!("{error:#}"));
+            self.save_profile = None;
+            if self.settings.save_file.is_some() {
+                self.store(|s| {
+                    s.save_file = None;
+                    s.sync_base = None;
+                })?;
+            }
+            self.local_hash = None;
+            self.previous_hash = None;
+            self.save_valid = false;
+            self.stable = 0;
+            self.history_candidate = None;
+            self.send_state()?;
+        } else if let Some(detail) = self.save_location_error.take()
+            && self.error.as_deref() == Some(detail.as_str())
+        {
+            self.error = None;
+        }
+        result
+    }
+
+    fn resolve_default_save(&mut self) -> Result<()> {
+        let pinned = self.save_profile.is_some()
+            && (self.game_running
+                || self.child.is_some()
+                || self.settings.play_lock.is_some()
+                || self.launch_pending.is_some()
+                || !self.no_transfer());
+        let profile = if pinned {
+            if !self.no_transfer() {
+                return Ok(());
+            }
+            if let Some(path) = &self.settings.save_file
+                && path.try_exists()?
+            {
+                return Ok(());
+            }
+            self.save_profile
+                .clone()
+                .context("Pinned save profile is missing")?
+        } else {
+            save_location::profile(&self.default_profile, self.settings.game_exe.as_deref())?
+        };
+        let path = save_location::discover(&profile)?;
+        self.apply_automatic_save_location(profile, path)
+    }
+
+    fn apply_automatic_save_location(&mut self, profile: PathBuf, path: PathBuf) -> Result<()> {
+        let changed = self.settings.save_file.as_ref() != Some(&path);
+        if changed || self.save_profile.is_none() {
+            self.audit.record(
+                "automatic-save-location",
+                Some(&path),
+                None,
+                None,
+                "Resolved from Dusklight's active profile; legacy manual selections ignored without moving files",
+            )?;
+        }
+        if changed {
+            self.store(|s| {
+                s.save_file = Some(path);
+                s.sync_base = None;
+            })?;
+            self.local_hash = None;
+            self.previous_hash = None;
+            self.save_valid = false;
+            self.stable = 0;
+            self.stable_since = Instant::now();
+            self.history_candidate = None;
+            self.history_last_hash = None;
+            self.history_cursor = None;
+        }
+        self.save_profile = Some(profile);
+        if changed {
+            self.send_state()?;
+        }
+        Ok(())
+    }
+
     fn refresh_save(&mut self) -> Result<()> {
+        self.refresh_default_save()?;
         if self.game_running {
             self.stable = 0;
             self.stable_since = Instant::now();
@@ -2941,7 +3076,16 @@ impl Engine {
             self.history_candidate = None;
             return Ok(());
         }
-        let bytes = match files::read_save(&path) {
+        let bytes = match files::read_save(&path).and_then(|bytes| {
+            save_location::validate_at_path(
+                self.save_profile
+                    .as_deref()
+                    .context("Automatic save profile is unavailable")?,
+                &path,
+                &bytes,
+            )?;
+            Ok(bytes)
+        }) {
             Ok(bytes) => bytes,
             Err(error) if self.game_running => {
                 let notice = format!("Waiting for a complete valid in-game save: {error:#}");
@@ -3547,6 +3691,8 @@ impl Engine {
             connecting: self.connecting.load(Ordering::Acquire),
             pairing_open: self.pairing_open(),
             local_hash: self.local_hash.clone(),
+            save_profile: self.save_profile.clone(),
+            save_ready: self.save_valid,
             remote_hash: self.remote.as_ref().and_then(|r| r.hash.clone()),
             game_running: self.game_running,
             remote_game: self.remote.as_ref().is_some_and(|r| r.game),
@@ -3582,7 +3728,7 @@ impl Engine {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::files::{ISO_SIZE, fixture_save};
+    use crate::files::ISO_SIZE;
     use std::fs;
 
     struct Harness {
@@ -3594,7 +3740,7 @@ mod tests {
     }
 
     fn variant(marker: u8) -> Vec<u8> {
-        let mut bytes = fixture_save();
+        let mut bytes = save_location::tests::stock_save("GZ2E");
         bytes[0x100] = marker;
         bytes
     }
@@ -3617,8 +3763,15 @@ mod tests {
                     "02-AA-BB-CC-DD-EE",
                     "Test adapter".into(),
                 )?;
-                let path = root.join("selected-locally.gci");
+                let profile = root.join("Dusklight");
+                let path = match &save {
+                    Some(bytes) => {
+                        save_location::path_for_identity(&profile, &files::validate_save(bytes)?)?
+                    }
+                    None => save_location::discover(&profile)?,
+                };
                 if let Some(bytes) = save {
+                    save_location::prepare(&path)?;
                     files::atomic_write(&path, &bytes)?;
                 }
                 let settings = Settings {
@@ -3633,7 +3786,8 @@ mod tests {
                 let audit = Audit::new(&root)?;
                 let (sender, receiver) = bounded(128);
                 let view = Arc::new(Mutex::new(initial_snapshot(&settings, &identity.public)));
-                let mut engine = Engine::new(root, settings, identity, audit, sender, view);
+                let mut engine =
+                    Engine::new(root, settings, profile, identity, audit, sender, view);
                 engine.network = Some(network);
                 engine.last_verified = Instant::now();
                 engine.process = ProcessMonitor::for_test(false);
@@ -3946,7 +4100,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_sync_commits_only_to_the_local_selected_path() -> Result<()> {
+    fn encrypted_sync_commits_only_to_the_detected_local_default() -> Result<()> {
         let mut h = Harness::new(Some(variant(1)), None)?;
         h.pair()?;
         h.left.offer_save(false)?;
@@ -4622,6 +4776,341 @@ mod tests {
             )?,
             variant(1)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn old_custom_selection_is_ignored_without_opening_or_modifying_its_file() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), None)?;
+        let default = h
+            .left
+            .settings
+            .save_file
+            .clone()
+            .context("Missing automatic path")?;
+        let old = h.left.root.join("my-directory-experiment.gci");
+        fs::write(&old, b"not a GCI; never inspect, rename, or overwrite this")?;
+        let network = h.left.settings.network.clone();
+        h.left.store(|settings| {
+            settings.save_file = Some(old.clone());
+            settings.sync_base = Some("a".repeat(64));
+        })?;
+        h.left.save_profile = None;
+        h.left.refresh_save()?;
+        assert_eq!(h.left.settings.save_file.as_ref(), Some(&default));
+        assert_eq!(h.left.local_hash, Some(files::sha256(&variant(0))));
+        assert!(h.left.settings.sync_base.is_none());
+        assert_eq!(h.left.settings.network, network);
+        assert_eq!(
+            fs::read(&old)?,
+            b"not a GCI; never inspect, rename, or overwrite this"
+        );
+        assert_eq!(fs::read(default)?, variant(0));
+        assert_eq!(
+            Settings::load(&h.left.root)?.save_file,
+            h.left.settings.save_file
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_profile_changes_are_detected_without_moving_saves_or_resetting_game_settings()
+    -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), None)?;
+        let old = h
+            .left
+            .settings
+            .save_file
+            .clone()
+            .context("Missing automatic path")?;
+        let custom = h.left.root.join("existing-dusklight-profile");
+        let path = save_location::path_for_identity(&custom, &files::validate_save(&variant(1))?)?;
+        save_location::prepare(&path)?;
+        files::atomic_write(&path, &variant(1))?;
+        let config = b"{\"backend.cardFileType\":1,\"video.enableVsync\":false}";
+        fs::write(custom.join("config.json"), config)?;
+        files::atomic_write(
+            &h.left.default_profile.join("data_location.json"),
+            &serde_json::to_vec(
+                &serde_json::json!({"version":1,"mode":"custom","customPath":custom}),
+            )?,
+        )?;
+        h.left
+            .store(|settings| settings.sync_base = Some(files::sha256(&variant(0))))?;
+        h.left.refresh_save()?;
+        assert_eq!(h.left.settings.save_file.as_ref(), Some(&path));
+        assert_eq!(h.left.local_hash, Some(files::sha256(&variant(1))));
+        assert!(h.left.settings.sync_base.is_none());
+        assert_eq!(fs::read(old)?, variant(0));
+        assert_eq!(fs::read(&path)?, variant(1));
+        assert_eq!(fs::read(custom.join("config.json"))?, config);
+        Ok(())
+    }
+
+    #[test]
+    fn first_received_save_selects_its_default_region_without_a_picker_or_fake_file() -> Result<()>
+    {
+        let bytes = save_location::tests::stock_save("GZ2P");
+        let mut h = Harness::new(Some(bytes.clone()), None)?;
+        let empty = h
+            .right
+            .settings
+            .save_file
+            .clone()
+            .context("Missing automatic path")?;
+        assert!(!empty.exists());
+        assert!(!empty.parent().context("Missing Card A")?.exists());
+        assert!(h.right.save_valid);
+        h.pair()?;
+        h.left.command(Command::SendSave)?;
+        let hash = files::sha256(&bytes);
+        h.pump_until(|h| h.right.local_hash.as_ref() == Some(&hash) && h.left.sent_save.is_none())?;
+        let expected = h
+            .right
+            .default_profile
+            .join("EUR")
+            .join("Card A")
+            .join("01-GZ2P-gczelda2.gci");
+        assert_eq!(h.right.settings.save_file.as_ref(), Some(&expected));
+        assert_eq!(fs::read(expected)?, bytes);
+        assert!(!empty.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn running_game_keeps_its_profile_and_detects_its_first_regional_save() -> Result<()> {
+        let mut h = Harness::new(None, None)?;
+        let original = h
+            .left
+            .save_profile
+            .clone()
+            .context("Missing original profile")?;
+        let lock = PlayLock {
+            owner: h.left.identity.public.clone(),
+            token: token(),
+        };
+        h.left
+            .store(|settings| settings.play_lock = Some(lock.clone()))?;
+        h.left.managed_token = Some(lock.token);
+        h.left.game_running = true;
+        let custom = h.left.root.join("next-profile");
+        fs::create_dir_all(&h.left.default_profile)?;
+        files::atomic_write(
+            &h.left.default_profile.join("data_location.json"),
+            &serde_json::to_vec(
+                &serde_json::json!({"version":1,"mode":"custom","customPath":custom,"previousPath":original}),
+            )?,
+        )?;
+        let bytes = save_location::tests::stock_save("GZ2J");
+        let path = save_location::path_for_identity(&original, &files::validate_save(&bytes)?)?;
+        save_location::prepare(&path)?;
+        files::atomic_write(&path, &bytes)?;
+        h.left.refresh_save()?;
+        assert_eq!(h.left.save_profile.as_ref(), Some(&original));
+        assert_eq!(h.left.settings.save_file.as_ref(), Some(&path));
+        h.left.game_running = false;
+        h.left.refresh_save()?;
+        assert_eq!(h.left.local_hash, Some(files::sha256(&bytes)));
+        assert!(h.left.settings.play_lock.is_some());
+        h.left.store(|settings| settings.play_lock = None)?;
+        h.left.managed_token = None;
+        let error = h
+            .left
+            .refresh_save()
+            .err()
+            .context("Pending game migration was ignored")?;
+        assert!(format!("{error:#}").contains("migration"));
+        assert!(h.left.settings.save_file.is_none() && !h.left.save_valid);
+        assert_eq!(fs::read(path)?, bytes);
+        assert!(!custom.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_restore_to_an_empty_pc_uses_the_snapshots_default_region() -> Result<()> {
+        let mut h = Harness::new(None, None)?;
+        let bytes = save_location::tests::stock_save("RZDP");
+        h.right.ensure_history()?;
+        let source = h.right.root.join("old-snapshot-source.gci");
+        let capture = h.right.history.as_mut().context("No history")?.capture(
+            &bytes,
+            &source,
+            history::Reason::Observed,
+            None,
+        )?;
+        h.right.command(Command::RestoreSnapshot {
+            id: capture.id,
+            expected: None,
+        })?;
+        let path = h
+            .right
+            .default_profile
+            .join("EUR")
+            .join("Card A")
+            .join("01-RZDP-gczelda2.gci");
+        assert_eq!(h.right.settings.save_file.as_ref(), Some(&path));
+        assert_eq!(fs::read(path)?, bytes);
+        assert!(!source.exists());
+        assert!(
+            h.right
+                .history_page
+                .entries
+                .iter()
+                .any(|entry| entry.reason == history::Reason::Restored)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_defaults_pause_sync_instead_of_reusing_an_old_manual_path() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), None)?;
+        let bytes = save_location::tests::stock_save("GZ2P");
+        let other = save_location::path_for_identity(
+            &h.left.default_profile,
+            &files::validate_save(&bytes)?,
+        )?;
+        save_location::prepare(&other)?;
+        files::atomic_write(&other, &bytes)?;
+        let old = h.left.root.join("manual-path.gci");
+        fs::write(&old, b"untouched")?;
+        h.left.settings.save_file = Some(old.clone());
+        h.left.save_profile = None;
+        let error = h
+            .left
+            .refresh_save()
+            .err()
+            .context("Ambiguous saves were accepted")?;
+        assert!(format!("{error:#}").contains("Multiple"));
+        h.left.report(error);
+        assert!(
+            h.left.error.is_some() && !h.left.save_valid && h.left.settings.save_file.is_none()
+        );
+        assert_eq!(fs::read(old)?, b"untouched");
+        assert_eq!(fs::read(other)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn save_detection_recovers_automatically_without_dismissing_unrelated_errors() -> Result<()> {
+        for unrelated in [false, true] {
+            let mut h = Harness::new(Some(variant(0)), None)?;
+            let bytes = save_location::tests::stock_save("GZ2P");
+            let other = save_location::path_for_identity(
+                &h.left.default_profile,
+                &files::validate_save(&bytes)?,
+            )?;
+            save_location::prepare(&other)?;
+            files::atomic_write(&other, &bytes)?;
+            let error = h
+                .left
+                .refresh_save()
+                .err()
+                .context("Expected an ambiguous location")?;
+            h.left.report(error);
+            assert!(h.left.error.is_some());
+            if unrelated {
+                h.left.error = Some("Unrelated network problem".into());
+            }
+            fs::remove_file(other)?;
+            h.left.refresh_save()?;
+            assert!(h.left.save_valid && h.left.settings.save_file.is_some());
+            assert_eq!(
+                h.left.error.as_deref(),
+                if unrelated {
+                    Some("Unrelated network problem")
+                } else {
+                    None
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn receiving_checks_profile_changes_before_the_next_poll_and_never_writes_the_old_profile()
+    -> Result<()> {
+        for conflict in [false, true] {
+            let mut h = Harness::new(Some(variant(1)), Some(variant(0)))?;
+            h.pair()?;
+            let old = h
+                .right
+                .settings
+                .save_file
+                .clone()
+                .context("Missing default save")?;
+            let old_hash = files::sha256(&variant(0));
+            if conflict {
+                h.left.command(Command::SendSave)?;
+                h.pump_until(|h| h.right.pending_save.is_some())?;
+            }
+            let custom = h.right.root.join("new-active-profile");
+            let new =
+                save_location::path_for_identity(&custom, &files::validate_save(&variant(2))?)?;
+            save_location::prepare(&new)?;
+            files::atomic_write(&new, &variant(2))?;
+            files::atomic_write(
+                &h.right.default_profile.join("data_location.json"),
+                &serde_json::to_vec(
+                    &serde_json::json!({"version":1,"mode":"custom","customPath":custom}),
+                )?,
+            )?;
+            let result = if conflict {
+                h.right.command(Command::AcceptSave(true))
+            } else {
+                h.right.event(Event::Save {
+                    hash: files::sha256(&variant(1)),
+                    base: Some(old_hash.clone()),
+                    expected: Some(old_hash),
+                    manual: false,
+                    lease: None,
+                    bytes: variant(1),
+                })
+            };
+            let error = result
+                .err()
+                .context("Changed profile accepted a stale offer")?;
+            assert!(
+                format!("{error:#}").contains("active profile changed"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(old)?, variant(0));
+            assert_eq!(fs::read(new)?, variant(2));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_profile_during_play_approval_is_rejected_before_launching() -> Result<()> {
+        let mut h = Harness::new(None, None)?;
+        h.pair()?;
+        let executable = h.left.root.join("dusklight.exe");
+        fs::write(&executable, b"fixture that must never execute")?;
+        h.left.command(Command::SetExecutable(executable))?;
+        h.left.request_launch()?;
+        let token = h
+            .left
+            .launch_pending
+            .clone()
+            .context("Missing play request")?;
+        let custom = h.left.root.join("changed-profile");
+        fs::create_dir_all(&h.left.default_profile)?;
+        files::atomic_write(
+            &h.left.default_profile.join("data_location.json"),
+            &serde_json::to_vec(
+                &serde_json::json!({"version":1,"mode":"custom","customPath":custom}),
+            )?,
+        )?;
+        let error = h
+            .left
+            .event(Event::LeaseGranted { token })
+            .err()
+            .context("Changed profile was launched")?;
+        assert!(
+            format!("{error:#}").contains("profile changed"),
+            "{error:#}"
+        );
+        assert!(h.left.child.is_none() && h.left.managed_token.is_none());
+        assert!(h.left.settings.play_lock.is_some());
         Ok(())
     }
 
