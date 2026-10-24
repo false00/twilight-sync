@@ -22,6 +22,9 @@ irm https://raw.githubusercontent.com/false00/twilight-sync/main/install.ps1 | i
 a working graphics driver for the native dashboard. No Rust, Visual Studio,
 account, or administrator access is required for the downloaded app.
 
+Windows PowerShell 5.1 and PowerShell 7 are both supported, including 32-bit
+PowerShell on x64 Windows handhelds such as the Legion Go.
+
 The installer:
 
 - Downloads the latest stable release from this repository.

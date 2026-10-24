@@ -32,6 +32,11 @@ jobs:
       - name: Installer tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\scripts\Test-Installer.ps1
+      - name: Installer tests (32-bit Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          & "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -File .\scripts\Test-Installer.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Installer tests (PowerShell 7)
         shell: pwsh
         run: .\scripts\Test-Installer.ps1

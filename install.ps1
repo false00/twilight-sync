@@ -16,6 +16,16 @@ param(
         return 'false00/twilight-sync'
     }
 
+    function Assert-TwilightArchitecture {
+        param([string]$Architecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine'))
+        if ([string]::IsNullOrWhiteSpace($Architecture)) {
+            throw 'Cannot detect the native Windows architecture: the machine PROCESSOR_ARCHITECTURE value is missing.'
+        }
+        if (-not [Environment]::Is64BitOperatingSystem -or $Architecture -ine 'AMD64') {
+            throw 'The published installer currently supports Windows x64 (Intel/AMD). ARM64 users must build from source.'
+        }
+    }
+
     function Assert-TwilightPath {
         param([Parameter(Mandatory = $true)][string]$Path)
         if (-not [IO.Path]::IsPathRooted($Path) -or $Path -match '(^|[\\/])\.\.([\\/]|$)' -or $Path.StartsWith('\\')) {
@@ -239,9 +249,7 @@ param(
     function Install-TwilightSync {
         param([string]$Version = 'latest', [string]$InstallDirectory = '', [switch]$NoLaunch, [switch]$NoShortcut)
         if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Twilight Sync currently supports Windows only.' }
-        if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne 'X64') {
-            throw 'The published installer currently supports Windows x64 (Intel/AMD). ARM64 users must build from source.'
-        }
+        Assert-TwilightArchitecture
         if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
             $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
             $InstallDirectory = Join-Path $local 'Programs\TwilightSync'

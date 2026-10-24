@@ -98,6 +98,16 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('twilight-installer-tests-' + [gui
 $null = [IO.Directory]::CreateDirectory($root)
 try {
     Assert-Installer ($definitions.Count -ge 10) 'installer parses without executing its entry point'
+    Assert-TwilightArchitecture -Architecture 'AMD64'
+    Assert-Installer $true 'native x64 Windows is accepted without RuntimeInformation.OSArchitecture'
+    Assert-TwilightArchitecture -Architecture 'amd64'
+    Assert-Installer $true 'native architecture comparison is case-insensitive'
+    foreach ($architecture in @('x86', 'ARM64', 'unknown')) {
+        Assert-InstallerThrows { Assert-TwilightArchitecture -Architecture $architecture } 'supports Windows x64'
+    }
+    foreach ($architecture in @($null, '', ' ')) {
+        Assert-InstallerThrows { Assert-TwilightArchitecture -Architecture $architecture } 'Cannot detect the native Windows architecture'
+    }
     foreach ($path in @('relative', 'C:\', 'C:\Temp\..\escape', '\\server\share', 'C:\Temp\CON.app', 'C:\Temp\file.exe:stream', 'C:\Temp\ambiguous.')) {
         Assert-InstallerThrows { Assert-TwilightPath $path } $(if ($path -in @('relative', 'C:\Temp\..\escape', '\\server\share')) { 'not supported' } elseif ($path -eq 'C:\') { 'absolute, local' } elseif ($path -eq 'C:\Temp\CON.app') { 'device names' } elseif ($path -eq 'C:\Temp\file.exe:stream') { 'alternate data streams' } else { 'unsafe Windows component' })
     }
