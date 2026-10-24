@@ -1258,6 +1258,7 @@ impl Dashboard {
 impl eframe::App for Dashboard {
     fn update(&mut self, context: &egui::Context, _: &mut eframe::Frame) {
         if self.background.take_open_game_controls() {
+            self.start_hidden = false;
             self.page = Page::Overview;
         }
         self.tray_events();
