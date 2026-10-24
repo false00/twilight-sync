@@ -252,10 +252,10 @@ fn install_styles(context: &egui::Context) {
         visuals.warn_fg_color = colors.warning;
         visuals.error_fg_color = colors.error;
         visuals.selection.bg_fill = colors.selection;
-        visuals.selection.stroke = Stroke::new(1.0, colors.accent);
+        visuals.selection.stroke = Stroke::new(1.0_f32, colors.accent);
         visuals.window_corner_radius = egui::CornerRadius::same(6);
         visuals.menu_corner_radius = egui::CornerRadius::same(6);
-        visuals.window_stroke = Stroke::new(1.0, colors.border);
+        visuals.window_stroke = Stroke::new(1.0_f32, colors.border);
         visuals.window_shadow = egui::epaint::Shadow::NONE;
         visuals.button_frame = true;
         visuals.interact_cursor = None;
@@ -268,23 +268,23 @@ fn install_styles(context: &egui::Context) {
             &mut visuals.widgets.open,
         ] {
             widget.corner_radius = egui::CornerRadius::same(4);
-            widget.fg_stroke = Stroke::new(1.0, colors.text);
-            widget.bg_stroke = Stroke::new(1.0, colors.control_border);
+            widget.fg_stroke = Stroke::new(1.0_f32, colors.text);
+            widget.bg_stroke = Stroke::new(1.0_f32, colors.control_border);
             widget.expansion = 0.0;
         }
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.border);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, colors.border);
         visuals.widgets.noninteractive.bg_fill = colors.disabled;
         visuals.widgets.inactive.bg_fill = colors.surface;
         visuals.widgets.inactive.weak_bg_fill = colors.surface;
         visuals.widgets.hovered.bg_fill = colors.alternate;
         visuals.widgets.hovered.weak_bg_fill = colors.alternate;
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.accent);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, colors.accent);
         visuals.widgets.active.bg_fill = colors.selection;
         visuals.widgets.active.weak_bg_fill = colors.selection;
-        visuals.widgets.active.bg_stroke = Stroke::new(1.5, colors.accent);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, colors.accent);
         visuals.widgets.open.bg_fill = colors.selection;
         visuals.widgets.open.weak_bg_fill = colors.selection;
-        visuals.text_cursor.stroke = Stroke::new(1.5, colors.accent);
+        visuals.text_cursor.stroke = Stroke::new(1.5_f32, colors.accent);
         style.visuals = visuals;
         style.spacing.item_spacing = Vec2::new(10.0, 6.0);
         style.spacing.button_padding = Vec2::new(14.0, 7.0);

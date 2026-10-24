@@ -501,7 +501,10 @@ impl Dashboard {
                     p.secondary
                 }))
                 .fill(if enabled { p.accent } else { p.disabled })
-                .stroke(Stroke::new(1.0, if enabled { p.accent } else { p.border })),
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if enabled { p.accent } else { p.border },
+                )),
             )
         })
         .inner
@@ -1702,7 +1705,7 @@ impl Dashboard {
             ui.painter().rect_stroke(
                 rect.shrink(1.0),
                 4,
-                Stroke::new(1.5, p.accent),
+                Stroke::new(1.5_f32, p.accent),
                 egui::StrokeKind::Inside,
             );
         }
