@@ -23,13 +23,37 @@ only into a dedicated temporary test directory.
 The optional live updater test and debug-only native UI smoke commands are
 documented in the [technical guide](guide.md#diagnostics-and-tests).
 
+### Disc-image and Windows icon checks
+
+```powershell
+cargo test --lib --locked -- disc::tests protocol::tests runtime::tests ui::icons::tests
+python .\scripts\Generate-Icons.py
+```
+
+Disc tests generate synthetic RVZ data without copyrighted game assets. They
+exercise uncompressed and Zstandard reconstruction, size/metadata limits,
+official-catalog rejection, bounded worker resource checks, and cancellation.
+Actor tests separately inject worker results to exercise consent, stale-job
+rejection, final game/network/permission checks, compressed-byte commits, and
+no-clobber behavior. The ignored RVZ subprocess fixture is invoked only by its
+parent test. These fixtures do not replace read-only testing of an authorized
+real disc image with `--check-iso PATH`, which accepts ISO and RVZ.
+
+The original icon artwork and generated PNG/ICO assets live in `assets`.
+The standard-library-only generator produces 16/24/32/48/64/128/256-pixel ICO
+frames plus matching tray/window PNGs; keep its geometry and the SVG artwork in
+sync. The build script embeds the Windows executable icon/version resources.
+The runtime sets a stable application identity and supplies matching window and
+tray icons. Verify both PE resources and real native window icons in a debug UI
+smoke session; do not modify the running installation for a visual test.
+
 ## Windows release packaging
 
 The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.4.0
+.\scripts\Package-Release.ps1 -Version v0.5.0
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
@@ -43,11 +67,13 @@ Checksums cover both the executable and the bootstrap script.
 
 ## Publishing future versions
 
-1. Update the Cargo package version and lockfile, validate the code, and commit.
-2. Create and push the matching stable tag, such as `v0.3.1`.
-3. The release workflow builds and tests on Windows, creates a draft release,
+1. Update the Cargo package version and lockfile, refresh dependency notices,
+   validate the code, and commit.
+2. Push `main` and wait for CI on that exact commit to pass.
+3. Create and push the matching fresh stable tag, such as `v0.5.1`.
+4. The release workflow builds and tests on Windows, creates a draft release,
    uploads all assets, then publishes it as latest.
-4. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`
+5. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`
    before announcing the release.
 
 The release workflow can also be dispatched for an existing matching tag. It

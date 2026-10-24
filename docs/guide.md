@@ -32,7 +32,7 @@ It does not include game assets, saves, disc images, or a copy of Dusklight.
 | Native desktop | Dark dashboard, discovery/pairing screens, system-tray status and actions |
 | Windows startup | Enabled on the first normal launch; toggle in the tray or settings |
 | Private audit trail | Rotating JSON-lines logs under your home `.twilight-sync` directory |
-| Optional disc transfer | Separate, disabled-by-default, per-transfer consent for verified GameCube ISOs |
+| Optional disc transfer | Separate, disabled-by-default, per-transfer consent for verified GameCube ISO / RVZ images |
 | Dusklight updates | Check the latest official release; install/update side-by-side and verify existing managed files before reuse |
 | Texture library | Creator-download workflow for Henriko's 4K/1080p packs, authorized local HD imports, and safe per-user switching |
 
@@ -59,7 +59,7 @@ cargo run --locked
 
 Normal desktop startup creates the private application directory, protects the
 device key with Windows DPAPI, and applies the startup preference. It does **not**
-trust a router, pair a peer, download Dusklight, modify a save, or transfer an ISO
+trust a router, pair a peer, download Dusklight, modify a save, or transfer a disc image
 without the applicable approvals.
 
 Closing the window hides it in the tray. Double-click the moon icon, or use
@@ -216,12 +216,13 @@ Authentication or framing failure closes the session; partial frames are never
 retried as if they were whole events.
 
 The event set includes hello, bilateral pairing approval/readiness, save state,
-save offer/receipt, lock request/grant/release, crash recovery, explicit ISO
+save offer/receipt, lock request/grant/release, crash recovery, explicit ISO / RVZ
 offer/accept/chunk/receipt, bounded errors, and heartbeat. There is no arbitrary
 remote path, shell command, executable-install, or directory-listing event.
 
 - A complete save fits in one bounded event.
-- ISO chunks contain at most 32 KiB of file data.
+- Disc-image chunks contain at most 32 KiB of file data. RVZ transfers use the
+  original compressed bytes, not an expanded ISO.
 - Binary collection lengths are checked before allocating their payload.
 - Each direction rekeys after every **4,096 authenticated events**, independently.
 - Noise's direction-specific nonces and authentication reject modified/replayed
@@ -308,25 +309,46 @@ executable, modified client, compromised host, or independently launched second
 game can bypass cooperative exclusivity. Stronger enforcement requires an
 integration inside Dusklight itself.
 
-## Optional ISO sync and official installation
+## Optional ISO / RVZ sync and official installation
 
 ### Disc images
 
-Save sync cannot be used to smuggle an ISO or installer. Disc transfer uses
+Save sync cannot be used to smuggle a disc image or installer. Disc transfer uses
 separate event types and is disabled by default on **each** device.
 
-The sender must select a user-supplied, full-size **1,459,978,240-byte GameCube
-ISO** for `GZ2E01`, `GZ2J01`, or `GZ2P01`, revision 0. The entire file is checked
-against the official Dusklight disc catalog's XXH3-128 hash before an offer is
-sent. The receiver must opt in, approve that offer, select a new local `.iso`
-destination, and have enough staging space.
+The sender selects a user-supplied GameCube `.iso` or lossless `.rvz` for
+`GZ2E01`, `GZ2J01`, or `GZ2P01`, revision 0. Its reconstructed disc must be exactly
+**1,459,978,240 bytes** and match the official Dusklight disc catalog's XXH3-128
+hash before an offer is sent. The receiver must opt in, approve that offer,
+select a new local destination with the matching extension, and have enough
+staging space for the transferred file.
 
-The receiver streams to a temporary file, checks the disc header, exact size,
-official XXH3-128 hash, and full transfer SHA-256, and commits without replacing
-an existing file. A timeout, mismatch, disconnect, or refused approval discards
-staged data. Images are never mounted, extracted, downloaded from third parties,
-or executed. **Wii ISOs, RVZ, trimmed images, and modified discs are not supported
-in v0.2.** You must dump and own your own original game.
+The receiver stages the bytes and independently verifies the disc header,
+reconstructed size, official XXH3-128 hash, and full transferred-file SHA-256
+before committing without replacing an existing file. A timeout, mismatch,
+disconnect, or refused approval discards uncommitted staging data. Immediately
+before committing, the manager rechecks the trusted channel, router freshness,
+permissions, game state, play locks, and competing management operations.
+
+RVZ uses the established `nod` decoder, not a new compression format. Container
+headers, metadata ranges, counts, chunk sizes, and codecs are checked first.
+Untrusted decompression runs in a separate copy of this application's verifier,
+gated behind a Windows Job Object with a **512 MiB process-memory limit**, one
+active process, kill-on-close cleanup, and a **five-minute deadline**. Output is
+bounded to 4 KiB per pipe. This is resource containment, **not a privilege sandbox
+or a guarantee against every decoder vulnerability**.
+
+Verification streams the reconstructed bytes to the hash without writing an
+expanded ISO. ISO transfers retain their streaming checks; RVZ verification runs
+off the network actor so five-second heartbeats and router checks continue.
+Both managers need v0.5.0 or later for RVZ: its offer is a new appended event, while existing
+save and ISO event encodings remain unchanged. Older peers safely reject an RVZ
+offer; update both devices before sending one.
+
+Images are never mounted, extracted into game files, downloaded from third
+parties, or executed. Wii images, unrelated formats, and trimmed, scrubbed, or
+modified images that do not reconstruct an approved original disc are rejected.
+You must dump and own your own original game.
 
 ### Dusklight
 
@@ -599,6 +621,7 @@ router, or write application state:
 cargo run --locked -- --help
 cargo run --locked -- --check-save 'C:\Games\Dusklight\Card A\01-GZ2E-zeldaTp.dat.gci'
 cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.iso'
+cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.rvz'
 cargo run --locked -- --check-network
 cargo run --locked -- --check-updates
 cargo run --locked -- --check-app-updates
@@ -627,7 +650,9 @@ Windows tests create isolated temporary data and loopback Noise sessions. They
 exercise both-sided consent, key pinning, encrypted commits, conflicts/backups,
 outside-game checks, elapsed save stability, router-change/staleness gates,
 crash recovery, final-save-before-unlock ordering, strict parsers, framing bounds,
-tamper/replay rejection, rekeying, and the separate ISO permission. They do not
+tamper/replay rejection, rekeying, and the separate disc-image permission. RVZ
+fixtures also exercise receiver-side full reconstruction and catalog rejection
+over the encrypted transfer, with heartbeats still responsive. They do not
 modify real startup settings or require a copyrighted save/disc fixture.
 
 A debug-only, 20-second native UI smoke run is available with

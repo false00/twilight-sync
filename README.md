@@ -127,8 +127,9 @@ font files are loaded from the operating system, not bundled or redistributed.
   preserve your user profile and saves.
 - **Tray app updates:** optional automatic GitHub version checks, with a
   confirmation before downloading or installing Twilight Sync itself.
-- **Optional ISO transfer:** separately approved transfers of verified,
-  unmodified GameCube images you own. No game downloads are included.
+- **Optional ISO / RVZ transfer:** separately approved transfers of verified,
+  unmodified GameCube images you own. RVZ files stay compressed; no game
+  downloads are included.
 
 ### Textures
 
@@ -141,6 +142,18 @@ scrape logins, bypass access controls, or rehost texture assets. Nintendo-derive
 HD assets require your own authorization and are not bundled with this app.
 
 [Texture installation, switching, and recovery details](docs/guide.md#texture-packs-creator-downloads-managed-installs)
+
+### Your disc image
+
+Open **Dusklight** and choose your own `.iso` or `.rvz` file. Enable disc-image
+transfers on both devices, then **Offer verified disc image**. Your partner
+approves the transfer and chooses a new destination; existing images are never
+overwritten.
+
+Both managers need **v0.5.0 or later** to transfer RVZ. Lossless RVZ images are
+checked against the same original-disc catalog as ISOs, without writing an
+expanded ISO. Scrubbed or modified images that cannot reproduce an approved
+original disc are rejected.
 
 ### Save history
 
@@ -164,7 +177,7 @@ remain available.
 
 When a newer version exists, the tray shows **Update Twilight Sync to v...**:
 
-1. Stop both games and finish any save/ISO/texture work.
+1. Stop both games and finish any save/disc-image/texture work.
 2. Choose the update action and confirm the version/download size.
 3. The app checks the published SHA-256 digest and checksum list, stages a
    verified native helper, and waits for its readiness acknowledgement.

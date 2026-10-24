@@ -1,7 +1,8 @@
 use crate::{
     audit::Audit,
     config::{self, Identity, Peer, PlayLock, Settings},
-    files::{self, CHUNK_SIZE, ISO_SIZE, ensure_safe_path, valid_hash},
+    disc::{self, Format as DiscFormat, Verified as VerifiedDisc},
+    files::{self, CHUNK_SIZE, ensure_safe_path, valid_hash},
     history::{self, History},
     install::{self, Installed, ReleaseInfo},
     lan::{self, Advertisement, Discovered, Network},
@@ -29,7 +30,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Clone)]
@@ -51,6 +52,7 @@ pub struct Snapshot {
     pub remote_game: bool,
     pub pending_save: bool,
     pub pending_iso: bool,
+    pub pending_disc_format: Option<DiscFormat>,
     pub pending_recovery: bool,
     pub transfer: String,
     pub install_busy: bool,
@@ -163,7 +165,12 @@ enum Input {
     IsoPrepared {
         id: u64,
         path: PathBuf,
-        result: Result<(String, u64)>,
+        result: Result<VerifiedDisc>,
+    },
+    IsoVerified {
+        channel: u64,
+        pending: Box<PendingDisc>,
+        result: Result<VerifiedDisc>,
     },
     IsoSent {
         id: u64,
@@ -212,6 +219,7 @@ struct OutgoingIso {
     path: PathBuf,
     hash: String,
     size: u64,
+    format: DiscFormat,
     started: bool,
     sent: bool,
     deadline: Instant,
@@ -221,6 +229,7 @@ struct IsoOffer {
     id: String,
     hash: String,
     size: u64,
+    format: DiscFormat,
     deadline: Instant,
 }
 
@@ -228,6 +237,7 @@ struct IncomingIso {
     id: String,
     hash: String,
     size: u64,
+    format: DiscFormat,
     received: u64,
     sha: Sha256,
     official: Xxh3,
@@ -235,6 +245,21 @@ struct IncomingIso {
     temporary: NamedTempFile,
     destination: PathBuf,
     last_chunk: Instant,
+}
+
+struct PendingDisc {
+    id: String,
+    hash: String,
+    size: u64,
+    format: DiscFormat,
+    temporary: TempPath,
+    destination: PathBuf,
+}
+
+struct DiscVerification {
+    channel: u64,
+    id: String,
+    deadline: Instant,
 }
 
 struct Engine {
@@ -279,6 +304,7 @@ struct Engine {
     incoming_iso: Option<IncomingIso>,
     outgoing_iso: Option<OutgoingIso>,
     iso_preparing: bool,
+    iso_verifying: Option<DiscVerification>,
     cancel_transfer: Arc<AtomicBool>,
     install_busy: bool,
     latest_release: Option<ReleaseInfo>,
@@ -512,6 +538,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         remote_game: false,
         pending_save: false,
         pending_iso: false,
+        pending_disc_format: None,
         pending_recovery: false,
         transfer: String::new(),
         install_busy: false,
@@ -579,6 +606,7 @@ impl Engine {
             incoming_iso: None,
             outgoing_iso: None,
             iso_preparing: false,
+            iso_verifying: None,
             cancel_transfer: Arc::new(AtomicBool::new(false)),
             install_busy: false,
             latest_release: None,
@@ -739,7 +767,16 @@ impl Engine {
             }
             Input::Disconnected { id, reason } => {
                 if self.link.as_ref().is_some_and(|l| l.id == id) {
+                    let waiting_rvz = self
+                        .outgoing_iso
+                        .as_ref()
+                        .is_some_and(|image| image.format == DiscFormat::Rvz && !image.started);
                     self.disconnect(&reason);
+                    if waiting_rvz {
+                        bail!(
+                            "Peer disconnected before RVZ approval: {reason}. RVZ transfer requires support on both devices; update both managers. Play locks were preserved."
+                        );
+                    }
                     bail!("Peer disconnected: {reason}. Play locks were preserved.");
                 }
                 Ok(())
@@ -970,41 +1007,109 @@ impl Engine {
                 self.iso_preparing = false;
                 ensure!(
                     self.link.as_ref().is_some_and(|l| l.id == id && l.ready),
-                    "Peer changed during ISO verification"
+                    "Peer changed during disc verification"
                 );
-                let (hash, size) = result?;
+                let verified = match result {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        self.transfer.clear();
+                        return Err(error)
+                            .context("Disc image verification failed before any offer");
+                    }
+                };
                 self.require_idle()?;
                 let transfer_id = token();
-                self.send(&Event::IsoOffer {
-                    id: transfer_id.clone(),
-                    hash: hash.clone(),
-                    size,
-                })?;
+                let event = match verified.format {
+                    DiscFormat::Iso => Event::IsoOffer {
+                        id: transfer_id.clone(),
+                        hash: verified.sha256.clone(),
+                        size: verified.size,
+                    },
+                    DiscFormat::Rvz => Event::RvzOffer {
+                        id: transfer_id.clone(),
+                        hash: verified.sha256.clone(),
+                        size: verified.size,
+                    },
+                };
+                self.send(&event)?;
                 self.outgoing_iso = Some(OutgoingIso {
                     id: transfer_id,
                     path,
-                    hash,
-                    size,
+                    hash: verified.sha256,
+                    size: verified.size,
+                    format: verified.format,
                     started: false,
                     sent: false,
                     deadline: Instant::now() + Duration::from_secs(120),
                 });
-                self.transfer = "Verified ISO; waiting for approval on the other device".into();
+                self.transfer = format!(
+                    "Verified {}; waiting for approval on the other device",
+                    verified.format.label()
+                );
+                Ok(())
+            }
+            Input::IsoVerified {
+                channel,
+                pending,
+                result,
+            } => {
+                let current = self
+                    .iso_verifying
+                    .as_ref()
+                    .is_some_and(|job| job.channel == channel && job.id == pending.id)
+                    && self
+                        .link
+                        .as_ref()
+                        .is_some_and(|link| link.id == channel && link.ready);
+                if !current {
+                    self.audit.record(
+                        "disc-verification-discarded", Some(&pending.destination), Some(&pending.hash),
+                        None, "Verification completed after cancellation or a channel change; staging discarded",
+                    )?;
+                    return Ok(());
+                }
+                self.iso_verifying = None;
+                let validation = result.and_then(|verified| {
+                    ensure!(
+                        verified.format == pending.format
+                            && verified.size == pending.size
+                            && verified.sha256 == pending.hash,
+                        "Verified RVZ differs from the approved transfer"
+                    );
+                    Ok(())
+                });
+                if let Err(error) = validation {
+                    self.transfer.clear();
+                    self.send(&Event::Error {
+                        message: "RVZ validation failed; the receiver did not commit the image"
+                            .into(),
+                    })?;
+                    return Err(error).context("Received RVZ was rejected");
+                }
+                if let Err(error) = self.commit_disc(*pending) {
+                    self.disconnect("Disc commit could not complete; check the receiver log");
+                    return Err(error);
+                }
                 Ok(())
             }
             Input::IsoSent { id, result } => {
                 if self.link.as_ref().is_some_and(|l| l.id == id) {
                     if let Err(error) = result {
                         self.disconnect(
-                            "ISO sender failed; receiver must discard its staged image",
+                            "Disc sender failed; receiver must discard its staged image",
                         );
                         return Err(error);
                     }
                     if let Some(outgoing) = &mut self.outgoing_iso {
                         outgoing.sent = true;
-                        outgoing.deadline = Instant::now() + Duration::from_secs(60);
+                        outgoing.deadline = Instant::now()
+                            + if outgoing.format == DiscFormat::Rvz {
+                                disc::VERIFY_TIMEOUT + Duration::from_secs(60)
+                            } else {
+                                Duration::from_secs(60)
+                            };
                         self.transfer =
-                            "ISO sent; waiting for the receiver's verified commit".into();
+                            "Disc image sent; waiting for the receiver's verified commit".into();
                     }
                 }
                 Ok(())
@@ -1064,6 +1169,7 @@ impl Engine {
             && self.incoming_iso.is_none()
             && self.outgoing_iso.is_none()
             && !self.iso_preparing
+            && self.iso_verifying.is_none()
     }
 
     fn command(&mut self, command: Command) -> Result<()> {
@@ -1209,23 +1315,19 @@ impl Engine {
                 self.require_idle()?;
                 ensure!(self.no_transfer(), "Another transfer is active");
                 ensure_safe_path(&path)?;
-                ensure!(
-                    path.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("iso")),
-                    "Select your own uncompressed .iso dump"
-                );
+                ensure!(path.is_file(), "Select your own disc image file");
+                let format = DiscFormat::from_path(&path)?;
                 self.store(|s| s.iso_file = Some(path))?;
-                self.message =
-                    "ISO selected. Full official-disc verification happens before any offer."
-                        .into();
+                self.message = format!(
+                    "{} selected. Full original-disc verification happens before any offer.",
+                    format.label()
+                );
             }
             Command::SetIsoEnabled(enabled) => {
                 self.require_idle()?;
                 ensure!(
                     self.no_transfer(),
-                    "Finish the current transfer before changing ISO permissions"
+                    "Finish the current transfer before changing disc-image permissions"
                 );
                 self.store(|s| s.iso_enabled = enabled)?;
                 self.audit.record(
@@ -1343,7 +1445,7 @@ impl Engine {
             Command::SendIso => {
                 ensure!(
                     self.ready() && self.settings.iso_enabled,
-                    "Connect your partner and explicitly enable ISO transfer"
+                    "Connect your partner and explicitly enable disc-image transfer"
                 );
                 self.require_idle()?;
                 ensure!(self.no_transfer(), "Another transfer is active");
@@ -1351,18 +1453,20 @@ impl Engine {
                     .settings
                     .iso_file
                     .clone()
-                    .context("Select your own ISO first")?;
+                    .context("Select your own ISO or RVZ first")?;
                 let id = self.link.as_ref().context("No peer")?.id;
                 let sender = self.sender.clone();
+                let cancel = self.cancel_transfer.clone();
                 self.iso_preparing = true;
-                self.transfer = "Verifying the entire ISO against the official disc hash...".into();
+                self.transfer =
+                    "Verifying the entire reconstructed disc against the official hash...".into();
                 thread::spawn(move || {
-                    let result = files::verify_iso(&path);
+                    let result = disc::verify_with_cancel(&path, cancel);
                     if sender
                         .send(Input::IsoPrepared { id, path, result })
                         .is_err()
                     {
-                        eprintln!("Twilight Sync stopped before ISO verification completed");
+                        eprintln!("Twilight Sync stopped before disc verification completed");
                     }
                 });
             }
@@ -1685,7 +1789,7 @@ impl Engine {
                         && !self.texture_busy
                         && !self.self_updates.preparing
                         && !self.iso_preparing,
-                    "Wait for installation, textures, or ISO verification to finish"
+                    "Wait for installation, textures, or disc verification to finish"
                 );
                 self.shutdown = true;
             }
@@ -1761,6 +1865,7 @@ impl Engine {
         self.iso_offer = None;
         self.incoming_iso = None;
         self.outgoing_iso = None;
+        self.iso_verifying = None;
         self.release_sent = false;
         self.launch_pending = None;
         self.transfer.clear();
@@ -2013,6 +2118,22 @@ impl Engine {
                     "Invalid remote error"
                 );
                 ensure!(ready, "Unpaired peer sent an error");
+                if self.iso_verifying.is_some()
+                    || self
+                        .iso_offer
+                        .as_ref()
+                        .is_some_and(|image| image.format == DiscFormat::Rvz)
+                    || self
+                        .incoming_iso
+                        .as_ref()
+                        .is_some_and(|image| image.format == DiscFormat::Rvz)
+                {
+                    self.iso_offer = None;
+                    self.incoming_iso = None;
+                    self.iso_verifying = None;
+                    self.cancel_transfer.store(true, Ordering::Release);
+                    self.cancel_transfer = Arc::new(AtomicBool::new(false));
+                }
                 self.sent_save = None;
                 self.outgoing_iso = None;
                 self.requested_recovery = None;
@@ -2029,7 +2150,7 @@ impl Engine {
             event => {
                 ensure!(
                     ready,
-                    "Unpaired devices cannot exchange saves, ISO data, or play locks"
+                    "Unpaired devices cannot exchange saves, disc images, or play locks"
                 );
                 self.authenticated_event(event)?;
             }
@@ -2356,64 +2477,61 @@ impl Engine {
                         .into();
             }
             Event::IsoOffer { id, hash, size } => {
-                ensure!(
-                    self.settings.iso_enabled,
-                    "ISO transfer is disabled locally"
-                );
-                self.require_idle()?;
-                ensure!(self.no_transfer(), "A transfer is already active");
-                ensure!(
-                    valid_hash(&id) && valid_hash(&hash) && size == ISO_SIZE,
-                    "Invalid or unsupported ISO offer"
-                );
-                self.iso_offer = Some(IsoOffer {
-                    id,
-                    hash,
-                    size,
-                    deadline: Instant::now() + Duration::from_secs(120),
-                });
-                self.message =
-                    "Your partner offers a verified disc image. Accept only if you own this game."
-                        .into();
+                self.receive_disc_offer(DiscFormat::Iso, id, hash, size)?
+            }
+            Event::RvzOffer { id, hash, size } => {
+                self.receive_disc_offer(DiscFormat::Rvz, id, hash, size)?
             }
             Event::IsoAccept { id } => self.stream_iso(&id)?,
             Event::IsoChunk { id, bytes } => {
                 let incoming = self
                     .incoming_iso
                     .as_mut()
-                    .context("No approved ISO transfer")?;
+                    .context("No approved disc-image transfer")?;
                 ensure!(
                     incoming.id == id && !bytes.is_empty() && bytes.len() <= CHUNK_SIZE,
-                    "Unexpected ISO chunk"
+                    "Unexpected disc-image chunk"
                 );
                 ensure!(
                     !self.game_running,
-                    "An external game started during ISO transfer"
+                    "An external game started during disc-image transfer"
                 );
                 incoming.received += bytes.len() as u64;
                 ensure!(
                     incoming.received <= incoming.size,
-                    "ISO exceeds approved size"
+                    "Disc image exceeds approved size"
                 );
                 if incoming.header.len() < 0x440 {
                     let take = (0x440 - incoming.header.len()).min(bytes.len());
                     incoming.header.extend_from_slice(&bytes[..take]);
                 }
+                if incoming.format == DiscFormat::Rvz && incoming.header.len() >= 4 {
+                    ensure!(
+                        &incoming.header[..4] == b"RVZ\x01",
+                        "Incoming image is not RVZ"
+                    );
+                }
                 incoming.temporary.write_all(&bytes)?;
                 incoming.sha.update(&bytes);
-                incoming.official.update(&bytes);
+                if incoming.format == DiscFormat::Iso {
+                    incoming.official.update(&bytes);
+                }
                 incoming.last_chunk = Instant::now();
                 self.transfer = format!(
-                    "Receiving ISO: {:.1}%",
+                    "Receiving {}: {:.1}%",
+                    incoming.format.label(),
                     incoming.received as f64 * 100.0 / incoming.size as f64
                 );
             }
             Event::IsoDone { id } => self.finish_iso(&id)?,
             Event::IsoReceived { id } => {
-                let outgoing = self.outgoing_iso.as_ref().context("No outgoing ISO")?;
+                let outgoing = self
+                    .outgoing_iso
+                    .as_ref()
+                    .context("No outgoing disc image")?;
                 ensure!(
                     outgoing.id == id && outgoing.started,
-                    "Unexpected ISO receipt"
+                    "Unexpected disc-image receipt"
                 );
                 self.audit.record(
                     "iso-acknowledged",
@@ -2423,7 +2541,7 @@ impl Engine {
                     "Peer verified official disc hash and SHA-256 before committing",
                 )?;
                 self.outgoing_iso = None;
-                self.transfer = "ISO synced and verified on the other device.".into();
+                self.transfer = "Disc image synced and verified on the other device.".into();
             }
             _ => bail!("Unexpected twilightProto event in the paired state"),
         }
@@ -2932,6 +3050,13 @@ impl Engine {
             self.disconnect("Pairing or heartbeat timed out; play locks were preserved");
         }
         if self
+            .iso_verifying
+            .as_ref()
+            .is_some_and(|job| job.deadline < Instant::now())
+        {
+            self.disconnect("Disc verification timed out; staged data was discarded");
+        }
+        if self
             .pending_save
             .as_ref()
             .is_some_and(|p| p.deadline < Instant::now())
@@ -3147,29 +3272,66 @@ impl Engine {
         Ok(())
     }
 
+    fn receive_disc_offer(
+        &mut self,
+        format: DiscFormat,
+        id: String,
+        hash: String,
+        size: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.settings.iso_enabled,
+            "Disc-image transfer is disabled locally"
+        );
+        self.require_idle()?;
+        ensure!(self.no_transfer(), "A transfer is already active");
+        ensure!(
+            valid_hash(&id) && valid_hash(&hash),
+            "Invalid disc offer identity or hash"
+        );
+        format.validate_size(size)?;
+        self.iso_offer = Some(IsoOffer {
+            id,
+            hash,
+            size,
+            format,
+            deadline: Instant::now() + Duration::from_secs(120),
+        });
+        self.message = format!(
+            "Your partner offers a verified {} image. Accept only if you own this game.",
+            format.label()
+        );
+        Ok(())
+    }
+
     fn accept_iso(&mut self, destination: Option<PathBuf>) -> Result<()> {
-        let offer = self.iso_offer.take().context("No incoming ISO offer")?;
+        let offer = self
+            .iso_offer
+            .take()
+            .context("No incoming disc-image offer")?;
         if let Some(destination) = destination {
             self.require_idle()?;
             ensure!(
                 self.settings.iso_enabled && offer.deadline > Instant::now(),
-                "ISO permission or offer expired"
+                "Disc-image permission or offer expired"
             );
             ensure_safe_path(&destination)?;
             ensure!(
-                !destination.try_exists()?
-                    && destination
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("iso")),
-                "Choose a new .iso destination; existing images are never overwritten"
+                !destination.try_exists()?,
+                "Choose a new destination; existing disc images are never overwritten"
+            );
+            ensure!(
+                DiscFormat::from_path(&destination)? == offer.format,
+                "The destination extension must match the offered {} image",
+                offer.format.label()
             );
             let parent = destination
                 .parent()
                 .context("Destination has no directory")?;
-            ensure!(parent.is_dir(), "ISO directory does not exist");
+            ensure!(parent.is_dir(), "Disc-image directory does not exist");
             ensure!(
                 fs2::available_space(parent)? > offer.size + 64 * 1024 * 1024,
-                "Insufficient disk space for a staged ISO"
+                "Insufficient disk space for a staged disc image"
             );
             let temporary = NamedTempFile::new_in(parent)?;
             let id = offer.id.clone();
@@ -3184,6 +3346,7 @@ impl Engine {
                 id: offer.id,
                 hash: offer.hash,
                 size: offer.size,
+                format: offer.format,
                 received: 0,
                 sha: Sha256::new(),
                 official: Xxh3::new(),
@@ -3195,7 +3358,7 @@ impl Engine {
             self.send(&Event::IsoAccept { id })?;
         } else {
             self.send(&Event::Error {
-                message: "ISO transfer declined by the other user".into(),
+                message: "Disc-image transfer declined by the other user".into(),
             })?;
         }
         Ok(())
@@ -3203,14 +3366,17 @@ impl Engine {
 
     fn stream_iso(&mut self, id: &str) -> Result<()> {
         self.require_idle()?;
-        ensure!(self.settings.iso_enabled, "ISO permission was revoked");
+        ensure!(
+            self.settings.iso_enabled,
+            "Disc-image permission was revoked"
+        );
         let outgoing = self
             .outgoing_iso
             .as_mut()
-            .context("No outgoing ISO offer")?;
+            .context("No outgoing disc-image offer")?;
         ensure!(
             outgoing.id == id && !outgoing.started && outgoing.deadline > Instant::now(),
-            "Unexpected ISO acceptance"
+            "Unexpected disc-image acceptance"
         );
         outgoing.started = true;
         let path = outgoing.path.clone();
@@ -3222,14 +3388,14 @@ impl Engine {
         let writer = link.writer.clone();
         let sender = self.sender.clone();
         let cancel = self.cancel_transfer.clone();
-        self.transfer = "Streaming approved ISO in bounded 32 KiB chunks...".into();
+        self.transfer = "Streaming approved disc image in bounded 32 KiB chunks...".into();
         thread::spawn(move || {
             let result = (|| -> Result<()> {
                 ensure_safe_path(&path)?;
                 let mut file = File::open(&path)?;
                 ensure!(
                     file.metadata()?.len() == size,
-                    "ISO changed since verification"
+                    "Disc image changed since verification"
                 );
                 let mut buffer = [0; CHUNK_SIZE];
                 let mut sha = Sha256::new();
@@ -3237,14 +3403,14 @@ impl Engine {
                 loop {
                     ensure!(
                         !cancel.load(Ordering::Acquire),
-                        "ISO transfer was cancelled"
+                        "Disc-image transfer was cancelled"
                     );
                     let count = file.read(&mut buffer)?;
                     if count == 0 {
                         break;
                     }
                     total += count as u64;
-                    ensure!(total <= size, "ISO grew during transfer");
+                    ensure!(total <= size, "Disc image grew during transfer");
                     sha.update(&buffer[..count]);
                     writer
                         .lock()
@@ -3256,7 +3422,7 @@ impl Engine {
                 }
                 ensure!(
                     total == size && hex::encode(sha.finalize()) == expected,
-                    "ISO changed during transfer"
+                    "Disc image changed during transfer"
                 );
                 writer
                     .lock()
@@ -3265,33 +3431,82 @@ impl Engine {
                 Ok(())
             })();
             if sender.send(Input::IsoSent { id, result }).is_err() {
-                eprintln!("Twilight Sync stopped while the ISO sender was finishing");
+                eprintln!("Twilight Sync stopped while the disc sender was finishing");
             }
         });
         Ok(())
     }
 
     fn finish_iso(&mut self, id: &str) -> Result<()> {
-        let incoming = self.incoming_iso.take().context("No incoming ISO")?;
+        let incoming = self.incoming_iso.take().context("No incoming disc image")?;
         ensure!(
             incoming.id == id && incoming.received == incoming.size,
-            "ISO is incomplete"
+            "Disc image is incomplete"
         );
         ensure!(
             !self.process.game_running(),
-            "A game started while receiving the ISO"
+            "A game started while receiving the disc image"
         );
         ensure!(
-            hex::encode(incoming.sha.finalize()) == incoming.hash,
-            "Received ISO SHA-256 mismatch"
+            hex::encode(incoming.sha.clone().finalize()) == incoming.hash,
+            "Received disc SHA-256 mismatch"
         );
-        let expected = files::validate_iso_header(&incoming.header, incoming.size)?;
+        if incoming.format == DiscFormat::Iso {
+            let expected = files::validate_iso_header(&incoming.header, incoming.size)?;
+            ensure!(
+                format!("{:032x}", incoming.official.digest128()) == expected,
+                "Received ISO is not an unmodified official disc"
+            );
+        }
+        incoming.temporary.as_file().sync_all()?;
+        let pending = PendingDisc {
+            id: incoming.id,
+            hash: incoming.hash,
+            size: incoming.size,
+            format: incoming.format,
+            destination: incoming.destination,
+            temporary: incoming.temporary.into_temp_path(),
+        };
+        if pending.format == DiscFormat::Iso {
+            return self.commit_disc(pending);
+        }
+        let channel = self
+            .link
+            .as_ref()
+            .context("Missing RVZ verification channel")?
+            .id;
+        self.iso_verifying = Some(DiscVerification {
+            channel,
+            id: pending.id.clone(),
+            deadline: Instant::now() + disc::VERIFY_TIMEOUT,
+        });
+        self.transfer = "RVZ received; verifying the reconstructed original disc...".into();
+        let sender = self.sender.clone();
+        let cancel = self.cancel_transfer.clone();
+        std::thread::spawn(move || {
+            let result = disc::verify_rvz(&pending.temporary, cancel);
+            if sender
+                .send(Input::IsoVerified {
+                    channel,
+                    pending: Box::new(pending),
+                    result,
+                })
+                .is_err()
+            {
+                eprintln!("Twilight Sync stopped during RVZ verification; staging was discarded");
+            }
+        });
+        Ok(())
+    }
+
+    fn commit_disc(&mut self, incoming: PendingDisc) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
         ensure!(
-            format!("{:032x}", incoming.official.digest128()) == expected,
-            "Received ISO is not an unmodified official disc"
+            self.ready() && self.trusted_network() && self.settings.iso_enabled,
+            "Disc permission or the trusted channel changed before commit"
         );
         ensure_safe_path(&incoming.destination)?;
-        incoming.temporary.as_file().sync_all()?;
         incoming
             .temporary
             .persist_noclobber(&incoming.destination)
@@ -3301,11 +3516,17 @@ impl Engine {
             Some(&incoming.destination),
             Some(&incoming.hash),
             Some(&self.peer_key()?),
-            "Official XXH3-128 and transfer SHA-256 both verified; never executed",
+            &format!(
+                "{}: reconstructed official XXH3-128 and transfer SHA-256 verified; never executed",
+                incoming.format.label()
+            ),
         )?;
         self.store(|s| s.iso_file = Some(incoming.destination))?;
-        self.send(&Event::IsoReceived { id: id.into() })?;
-        self.transfer = "ISO received, verified, and committed.".into();
+        self.send(&Event::IsoReceived { id: incoming.id })?;
+        self.transfer = format!(
+            "{} received, verified, and committed.",
+            incoming.format.label()
+        );
         Ok(())
     }
 
@@ -3331,6 +3552,7 @@ impl Engine {
             remote_game: self.remote.as_ref().is_some_and(|r| r.game),
             pending_save: self.pending_save.is_some(),
             pending_iso: self.iso_offer.is_some(),
+            pending_disc_format: self.iso_offer.as_ref().map(|offer| offer.format),
             pending_recovery: self.pending_recovery.is_some(),
             transfer: self.transfer.clone(),
             install_busy: self.install_busy,
@@ -3360,7 +3582,7 @@ impl Engine {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::files::fixture_save;
+    use crate::files::{ISO_SIZE, fixture_save};
     use std::fs;
 
     struct Harness {
@@ -3936,6 +4158,395 @@ mod tests {
                 .is_err()
         );
         assert!(h.right.iso_offer.is_none() && h.right.incoming_iso.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn rvz_requires_its_own_valid_offer_consent_and_matching_destination() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+        h.pair()?;
+        assert!(
+            h.right
+                .event(Event::RvzOffer {
+                    id: token(),
+                    hash: "a".repeat(64),
+                    size: 512
+                })
+                .is_err()
+        );
+        h.right.command(Command::SetIsoEnabled(true))?;
+        for size in [0, 0x147, disc::MAX_IMAGE_SIZE + 1, u64::MAX] {
+            assert!(
+                h.right
+                    .event(Event::RvzOffer {
+                        id: token(),
+                        hash: "a".repeat(64),
+                        size
+                    })
+                    .is_err()
+            );
+            assert!(h.right.iso_offer.is_none());
+        }
+        h.right.event(Event::RvzOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+        })?;
+        h.right.publish();
+        assert_eq!(
+            h.right
+                .view
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Snapshot lock poisoned"))?
+                .pending_disc_format,
+            Some(DiscFormat::Rvz)
+        );
+        assert!(h.right.incoming_iso.is_none());
+        let wrong = h.right.root.join("wrong.iso");
+        assert!(h.right.accept_iso(Some(wrong.clone())).is_err());
+        assert!(!wrong.exists() && h.right.incoming_iso.is_none());
+        h.right.event(Event::RvzOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+        })?;
+        let destination = h.right.root.join("received.RVZ");
+        h.right.accept_iso(Some(destination.clone()))?;
+        let staged = h
+            .right
+            .incoming_iso
+            .as_ref()
+            .context("Missing staged RVZ")?
+            .temporary
+            .path()
+            .to_path_buf();
+        assert!(staged.is_file() && !destination.exists() && !h.right.no_transfer());
+        assert_eq!(
+            h.right.incoming_iso.as_ref().map(|image| image.format),
+            Some(DiscFormat::Rvz)
+        );
+        h.right.disconnect("Testing interrupted RVZ");
+        assert!(!staged.exists() && !destination.exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encrypted_rvz_receiver_remains_responsive_and_independently_rejects_modified_discs()
+    -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+        h.pair()?;
+        h.left.command(Command::SetIsoEnabled(true))?;
+        h.right.command(Command::SetIsoEnabled(true))?;
+        let (bytes, _) = disc::tests::fixture(ISO_SIZE, true)?;
+        let source = h.left.root.join("modified.rvz");
+        fs::write(&source, &bytes)?;
+        let verified = VerifiedDisc {
+            format: DiscFormat::Rvz,
+            sha256: files::sha256(&bytes),
+            size: bytes.len() as u64,
+        };
+        // A paired malicious sender can lie about validation; the receiver must verify independently.
+        h.left.input(Input::IsoPrepared {
+            id: h.left.link.as_ref().context("Missing source channel")?.id,
+            path: source,
+            result: Ok(verified),
+        })?;
+        h.pump_until(|h| h.right.iso_offer.is_some())?;
+        let destination = h.right.root.join("must-not-commit.rvz");
+        h.right.accept_iso(Some(destination.clone()))?;
+        h.pump_until(|h| {
+            h.right.iso_verifying.is_some()
+                && h.left.outgoing_iso.as_ref().is_some_and(|image| image.sent)
+        })?;
+        assert!(!destination.exists());
+        let last_seen = h
+            .right
+            .link
+            .as_ref()
+            .context("Missing receiver channel")?
+            .last_seen;
+        h.left.send(&Event::Ping)?;
+        h.pump_until(|h| {
+            h.right
+                .link
+                .as_ref()
+                .is_some_and(|link| link.last_seen > last_seen)
+        })?;
+        assert!(
+            h.right.iso_verifying.is_some(),
+            "Verifier finished before the responsiveness check"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let input = h
+                .right_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+            if matches!(&input, Input::IsoVerified { .. }) {
+                let error = h
+                    .right
+                    .input(input)
+                    .err()
+                    .context("Modified disc passed receiver verification")?;
+                assert!(
+                    format!("{error:#}").contains("official unmodified disc"),
+                    "{error:#}"
+                );
+                break;
+            }
+            h.right.input(input)?;
+        }
+        h.pump_until(|h| h.left.outgoing_iso.is_none())?;
+        assert!(!destination.exists() && h.right.incoming_iso.is_none());
+        assert!(h.right.iso_verifying.is_none());
+        Ok(())
+    }
+
+    // Inject worker results here to isolate actor commit gates; disc::tests exercises the real decoder.
+    fn staged_rvz(
+        engine: &mut Engine,
+        name: &str,
+    ) -> Result<(u64, Box<PendingDisc>, VerifiedDisc)> {
+        let mut bytes = vec![0_u8; 512];
+        bytes[..4].copy_from_slice(b"RVZ\x01");
+        let destination = engine.root.join(name);
+        let mut temporary = NamedTempFile::new_in(&engine.root)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        let verified = VerifiedDisc {
+            format: DiscFormat::Rvz,
+            sha256: files::sha256(&bytes),
+            size: bytes.len() as u64,
+        };
+        let pending = Box::new(PendingDisc {
+            id: token(),
+            hash: verified.sha256.clone(),
+            size: verified.size,
+            format: verified.format,
+            temporary: temporary.into_temp_path(),
+            destination,
+        });
+        let channel = engine.link.as_ref().context("Missing test channel")?.id;
+        engine.iso_verifying = Some(DiscVerification {
+            channel,
+            id: pending.id.clone(),
+            deadline: Instant::now() + disc::VERIFY_TIMEOUT,
+        });
+        engine.transfer = "Verifying RVZ".into();
+        assert!(!engine.no_transfer());
+        Ok((channel, pending, verified))
+    }
+
+    #[test]
+    fn verified_rvz_commits_compressed_bytes_and_never_clobbers_a_destination() -> Result<()> {
+        for existing in [false, true] {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.right.command(Command::SetIsoEnabled(true))?;
+            let (channel, pending, verified) = staged_rvz(&mut h.right, "received.rvz")?;
+            let destination = pending.destination.clone();
+            let staged = pending.temporary.to_path_buf();
+            let hash = verified.sha256.clone();
+            if existing {
+                fs::write(&destination, b"keep my original image")?;
+            }
+            let result = h.right.input(Input::IsoVerified {
+                channel,
+                pending,
+                result: Ok(verified),
+            });
+            assert!(!staged.exists() && h.right.iso_verifying.is_none());
+            if existing {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&destination)?, b"keep my original image");
+                assert!(h.right.settings.iso_file.is_none());
+            } else {
+                result?;
+                assert_eq!(files::sha256(&fs::read(&destination)?), hash);
+                assert_eq!(h.right.settings.iso_file.as_ref(), Some(&destination));
+                assert!(
+                    h.right
+                        .transfer
+                        .contains("RVZ received, verified, and committed")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rvz_worker_failure_or_result_mismatch_discards_staging() -> Result<()> {
+        for mismatch in 0..4 {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.right.command(Command::SetIsoEnabled(true))?;
+            let (channel, pending, mut verified) = staged_rvz(&mut h.right, "rejected.rvz")?;
+            let destination = pending.destination.clone();
+            let staged = pending.temporary.to_path_buf();
+            let result = match mismatch {
+                0 => Err(anyhow::anyhow!("Synthetic decoder rejection")),
+                1 => {
+                    verified.sha256 = "f".repeat(64);
+                    Ok(verified)
+                }
+                2 => {
+                    verified.size += 1;
+                    Ok(verified)
+                }
+                _ => {
+                    verified.format = DiscFormat::Iso;
+                    Ok(verified)
+                }
+            };
+            assert!(
+                h.right
+                    .input(Input::IsoVerified {
+                        channel,
+                        pending,
+                        result
+                    })
+                    .is_err()
+            );
+            assert!(!staged.exists() && !destination.exists());
+            assert!(h.right.iso_verifying.is_none() && h.right.transfer.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rvz_commit_rechecks_game_locks_router_permission_and_management() -> Result<()> {
+        for change in 0..6 {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.right.command(Command::SetIsoEnabled(true))?;
+            let (channel, pending, verified) = staged_rvz(&mut h.right, "blocked.rvz")?;
+            let destination = pending.destination.clone();
+            let staged = pending.temporary.to_path_buf();
+            match change {
+                0 => h.right.process = ProcessMonitor::for_test(true),
+                1 => {
+                    h.right.settings.play_lock = Some(PlayLock {
+                        owner: h.right.identity.public.clone(),
+                        token: token(),
+                    })
+                }
+                2 => {
+                    h.right
+                        .remote
+                        .as_mut()
+                        .context("Missing remote state")?
+                        .game = true
+                }
+                3 => h.right.last_verified = Instant::now() - Duration::from_secs(13),
+                4 => h.right.settings.iso_enabled = false,
+                _ => h.right.install_busy = true,
+            }
+            assert!(
+                h.right
+                    .input(Input::IsoVerified {
+                        channel,
+                        pending,
+                        result: Ok(verified)
+                    })
+                    .is_err()
+            );
+            assert!(!staged.exists() && !destination.exists());
+            assert!(h.right.iso_verifying.is_none() && h.right.link.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn peer_reported_error_cancels_rvz_verification_without_dropping_the_pairing() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+        h.pair()?;
+        h.right.command(Command::SetIsoEnabled(true))?;
+        h.right.event(Event::RvzOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+        })?;
+        h.right.event(Event::Error {
+            message: "Offer withdrawn".into(),
+        })?;
+        assert!(h.right.iso_offer.is_none() && h.right.ready());
+        h.right.event(Event::RvzOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+        })?;
+        let interrupted = h.right.root.join("interrupted.rvz");
+        h.right.accept_iso(Some(interrupted.clone()))?;
+        let partial = h
+            .right
+            .incoming_iso
+            .as_ref()
+            .context("Missing RVZ staging")?
+            .temporary
+            .path()
+            .to_path_buf();
+        h.right.event(Event::Error {
+            message: "Sender stopped".into(),
+        })?;
+        assert!(h.right.incoming_iso.is_none() && !partial.exists() && !interrupted.exists());
+        assert!(h.right.no_transfer() && h.right.ready());
+        let (channel, pending, verified) = staged_rvz(&mut h.right, "cancelled-by-partner.rvz")?;
+        let destination = pending.destination.clone();
+        let staged = pending.temporary.to_path_buf();
+        let cancelled = h.right.cancel_transfer.clone();
+        h.right.event(Event::Error {
+            message: "Disc transfer was cancelled".into(),
+        })?;
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!h.right.cancel_transfer.load(Ordering::Acquire));
+        assert!(h.right.iso_verifying.is_none() && h.right.no_transfer() && h.right.ready());
+        h.right.input(Input::IsoVerified {
+            channel,
+            pending,
+            result: Ok(verified),
+        })?;
+        assert!(!staged.exists() && !destination.exists());
+        assert!(h.right.ready());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_rvz_results_do_not_commit_or_clear_a_newer_job() -> Result<()> {
+        for disconnected in [false, true] {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.right.command(Command::SetIsoEnabled(true))?;
+            let (channel, pending, verified) = staged_rvz(&mut h.right, "stale.rvz")?;
+            let destination = pending.destination.clone();
+            let staged = pending.temporary.to_path_buf();
+            let newer_id = token();
+            if disconnected {
+                h.right.disconnect("Cancelling verification");
+                assert!(h.right.cancel_transfer.load(Ordering::Acquire));
+            } else {
+                h.right
+                    .iso_verifying
+                    .as_mut()
+                    .context("Missing verification")?
+                    .id = newer_id.clone();
+                h.right.transfer = "Newer verification".into();
+            }
+            h.right.input(Input::IsoVerified {
+                channel,
+                pending,
+                result: Ok(verified),
+            })?;
+            assert!(!staged.exists() && !destination.exists());
+            if disconnected {
+                assert!(h.right.iso_verifying.is_none());
+            } else {
+                assert_eq!(
+                    h.right.iso_verifying.as_ref().map(|job| &job.id),
+                    Some(&newer_id)
+                );
+                assert_eq!(h.right.transfer, "Newer verification");
+            }
+        }
         Ok(())
     }
 

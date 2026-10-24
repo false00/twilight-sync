@@ -91,6 +91,12 @@ pub enum Event {
         message: String,
     },
     Ping,
+    // New variants stay at the end so existing twilightProto/1 event indexes do not change.
+    RvzOffer {
+        id: String,
+        hash: String,
+        size: u64,
+    },
 }
 
 fn bounded_bytes<'de, D: de::Deserializer<'de>>(
@@ -424,6 +430,61 @@ mod tests {
         assert!(right.read_message(&tampered, &mut out).is_err());
         right.read_message(&buffer[..count], &mut out)?;
         assert!(right.read_message(&buffer[..count], &mut out).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rvz_appends_an_event_without_changing_legacy_disc_frames() -> Result<()> {
+        let id = "a".repeat(64);
+        let hash = "b".repeat(64);
+        for (index, event) in [
+            (
+                13,
+                Event::IsoOffer {
+                    id: id.clone(),
+                    hash: hash.clone(),
+                    size: crate::files::ISO_SIZE,
+                },
+            ),
+            (14, Event::IsoAccept { id: id.clone() }),
+            (
+                15,
+                Event::IsoChunk {
+                    id: id.clone(),
+                    bytes: vec![7; 32 * 1024],
+                },
+            ),
+            (16, Event::IsoDone { id: id.clone() }),
+            (17, Event::IsoReceived { id: id.clone() }),
+            (
+                18,
+                Event::Error {
+                    message: "declined".into(),
+                },
+            ),
+            (19, Event::Ping),
+            (
+                20,
+                Event::RvzOffer {
+                    id: id.clone(),
+                    hash: hash.clone(),
+                    size: 1024,
+                },
+            ),
+        ] {
+            let bytes = postcard::to_allocvec(&event)?;
+            assert_eq!(bytes[0], index);
+            let restored: Event = postcard::from_bytes(&bytes)?;
+            assert_eq!(
+                std::mem::discriminant(&event),
+                std::mem::discriminant(&restored)
+            );
+            if index == 20 {
+                assert!(
+                    matches!(restored, Event::RvzOffer { id: actual_id, hash: actual_hash, size: 1024 } if actual_id == id && actual_hash == hash)
+                );
+            }
+        }
         Ok(())
     }
 

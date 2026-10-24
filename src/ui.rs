@@ -12,6 +12,7 @@ const WINDOW_TITLE: &str = "Twilight Sync";
 
 mod background;
 mod design;
+mod icons;
 
 use design::{Appearance, AppearanceStore, Palette, semibold, symbol};
 
@@ -105,22 +106,8 @@ struct Dashboard {
     shown_pairing_code: Option<String>,
 }
 
-fn icon_pixels() -> Vec<u8> {
-    let mut pixels = vec![0; 32 * 32 * 4];
-    for y in 0_i32..32 {
-        for x in 0_i32..32 {
-            let outer = (x - 15).pow(2) + (y - 16).pow(2) < 13_i32.pow(2);
-            let cutout = (x - 21).pow(2) + (y - 11).pow(2) < 11_i32.pow(2);
-            if outer && !cutout {
-                let offset = ((y * 32 + x) * 4) as usize;
-                pixels[offset..offset + 4].copy_from_slice(&[240, 199, 117, 255]);
-            }
-        }
-    }
-    pixels
-}
-
 fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
+    let pixels = icons::tray()?;
     let menu = Menu::new();
     let status = MenuItem::new("Checking private LAN...", false, None);
     let show = MenuItem::new("Open Twilight Sync", true, None);
@@ -152,7 +139,7 @@ fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
     ])?;
     let icon = TrayIconBuilder::new()
         .with_tooltip("Twilight Sync - checking private LAN")
-        .with_icon(Icon::from_rgba(icon_pixels(), 32, 32)?)
+        .with_icon(Icon::from_rgba(pixels.rgba, pixels.width, pixels.height)?)
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()?;
@@ -226,17 +213,14 @@ fn run_page(
     scale: f32,
 ) -> Result<()> {
     let snapshot = backend.snapshot()?;
+    icons::set_application_identity()?;
     let tray = make_tray(snapshot.settings.startup, snapshot.self_updates.enabled)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 760.0])
             .with_min_inner_size([640.0, 460.0])
             .with_visible(!background)
-            .with_icon(Arc::new(egui::IconData {
-                rgba: icon_pixels(),
-                width: 32,
-                height: 32,
-            })),
+            .with_icon(Arc::new(icons::window()?)),
         ..Default::default()
     };
     eframe::run_native(
@@ -1109,7 +1093,7 @@ impl Dashboard {
             Self::section_title(ui, "Disc image (optional)");
             Self::secondary(
                 ui,
-                "Use your own unmodified, full-size Twilight Princess GameCube .iso. Game downloads, Wii images, RVZ, and archives are not supported.",
+                "Use your own Twilight Princess GameCube ISO or RVZ. RVZ must reconstruct a supported, full-size unmodified disc. Wii images and game downloads are not supported.",
             );
             let mut enabled = snapshot.settings.iso_enabled;
             if ui
@@ -1126,10 +1110,10 @@ impl Dashboard {
             }
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(available, egui::Button::new("Choose my ISO..."))
+                    .add_enabled(available, egui::Button::new("Choose ISO / RVZ..."))
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Your GameCube disc dump", &["iso"])
+                        .add_filter("Your GameCube disc dump", &["iso", "rvz"])
                         .pick_file()
                 {
                     self.dispatch(Command::SetIso(path));
@@ -1137,7 +1121,7 @@ impl Dashboard {
                 if ui
                     .add_enabled(
                         snapshot.ready && snapshot.settings.iso_enabled && available,
-                        egui::Button::new("Offer verified ISO to partner"),
+                        egui::Button::new("Offer verified disc image"),
                     )
                     .clicked()
                 {
@@ -1147,6 +1131,10 @@ impl Dashboard {
             Self::secondary(
                 ui,
                 "The receiver must opt in and approve each transfer. Existing disc images are never overwritten.",
+            );
+            Self::secondary(
+                ui,
+                "RVZ stays compressed during transfer. Both managers need v0.5.0 or later; verification runs separately without blocking sync heartbeats.",
             );
         });
     }
@@ -1633,17 +1621,30 @@ impl Dashboard {
                         .font(semibold(16.0)),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("I own this game - choose a new ISO destination")
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("GameCube ISO", &["iso"])
-                            .set_file_name("Twilight Princess.iso")
-                            .save_file()
-                    {
-                        self.dispatch(Command::AcceptIso(Some(path)));
+                    if let Some(format) = snapshot.pending_disc_format {
+                        if ui
+                            .button(format!(
+                                "I own this game - choose a new {} destination",
+                                format.label()
+                            ))
+                            .clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter(
+                                    format!("GameCube {}", format.label()),
+                                    &[format.extension()],
+                                )
+                                .set_file_name(format!("Twilight Princess.{}", format.extension()))
+                                .save_file()
+                        {
+                            self.dispatch(Command::AcceptIso(Some(path)));
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Image format missing; decline and request a new offer.")
+                                .color(p.error),
+                        );
                     }
-                    if ui.button("Decline ISO").clicked() {
+                    if ui.button("Decline image").clicked() {
                         self.dispatch(Command::AcceptIso(None));
                     }
                 });

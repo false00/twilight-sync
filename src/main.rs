@@ -36,6 +36,16 @@ fn run() -> Result<()> {
     let first = arguments.next();
     if first
         .as_deref()
+        .is_some_and(|argument| argument == "--verify-rvz-worker")
+    {
+        let path = PathBuf::from(arguments.next().context("Missing RVZ verifier path")?);
+        if arguments.next().is_some() {
+            bail!("Unexpected RVZ verifier arguments");
+        }
+        return twilight_sync::disc::worker_entry(&path);
+    }
+    if first
+        .as_deref()
         .is_some_and(|argument| argument == "--apply-update")
     {
         let plan = PathBuf::from(arguments.next().context("Missing private update plan")?);
@@ -46,7 +56,7 @@ fn run() -> Result<()> {
     }
     if first.as_deref().is_some_and(|a| a == "--help" || a == "-h") {
         println!(
-            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
+            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
         return Ok(());
     }
@@ -174,8 +184,13 @@ fn run() -> Result<()> {
         if arguments.next().is_some() {
             bail!("Unexpected extra arguments");
         }
-        let (hash, size) = twilight_sync::files::verify_iso(&path)?;
-        println!("VERIFIED GAMECUBE ISO\nSize: {size}\nSHA-256: {hash}");
+        let verified = twilight_sync::disc::verify(&path)?;
+        println!(
+            "VERIFIED GAMECUBE {}\nSize: {}\nSHA-256: {}",
+            verified.format.label(),
+            verified.size,
+            verified.sha256
+        );
         return Ok(());
     }
     if first.as_deref().is_some_and(|a| a == "--check-save") {
