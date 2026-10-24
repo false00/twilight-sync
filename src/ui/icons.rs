@@ -60,15 +60,13 @@ mod tests {
         for (icon, size) in [(tray()?, 32), (window()?, 256)] {
             assert_eq!((icon.width, icon.height), (size, size));
             assert_eq!(icon.rgba.len(), size as usize * size as usize * 4);
-            let visible = icon
-                .rgba
-                .chunks_exact(4)
-                .filter(|pixel| pixel[3] > 200)
-                .count();
+            let (pixels, remainder) = icon.rgba.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            let visible = pixels.iter().filter(|pixel| pixel[3] > 200).count();
             assert!(visible > size as usize * size as usize / 2);
             assert!(
-                icon.rgba
-                    .chunks_exact(4)
+                pixels
+                    .iter()
                     .any(|pixel| pixel[..3] == [255, 255, 255] && pixel[3] == 255)
             );
         }
@@ -79,10 +77,9 @@ mod tests {
     fn executable_icon_contains_all_windows_dpi_sizes() -> Result<()> {
         let bytes = include_bytes!(r"..\..\assets\twilight-sync.ico");
         assert_eq!(&bytes[..6], &[0, 0, 1, 0, 7, 0]);
-        for (entry, expected) in bytes[6..118]
-            .chunks_exact(16)
-            .zip([16, 24, 32, 48, 64, 128, 256])
-        {
+        let (entries, remainder) = bytes[6..118].as_chunks::<16>();
+        assert!(remainder.is_empty());
+        for (entry, expected) in entries.iter().zip([16, 24, 32, 48, 64, 128, 256]) {
             let size = if entry[0] == 0 {
                 256
             } else {
