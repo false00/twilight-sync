@@ -58,6 +58,12 @@ The app is currently unsigned, so Windows may display an unfamiliar-publisher
 warning. Verify the source and checksum before deciding to run it. Twilight Sync
 does not disable SmartScreen, antivirus, or PowerShell security settings.
 
+**Application Control:** some Windows policies block unsigned applications
+entirely, including with error **4551**. A valid checksum does not satisfy a
+code-signing policy. Such devices need a build signed by a publisher trusted by
+their policy; do not replace a working installation with an unsigned build that
+your device cannot run. Twilight Sync does not bypass or change these controls.
+
 ## Set up your first sync
 
 Do these steps on **both PCs**:
