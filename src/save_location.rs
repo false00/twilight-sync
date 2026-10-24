@@ -13,6 +13,37 @@ const GAMES: [&str; 6] = ["GZ2E", "GZ2J", "GZ2P", "RZDE", "RZDJ", "RZDP"];
 const DESCRIPTOR_LIMIT: u64 = 16 * 1024;
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Storage {
+    Gci,
+    Raw,
+}
+
+pub fn storage(profile: &Path) -> Result<Storage> {
+    let config = read_json(&profile.join("config.json"), CONFIG_LIMIT)?;
+    match config
+        .as_ref()
+        .and_then(|config| config.get("backend.cardFileType"))
+    {
+        None => Ok(Storage::Gci),
+        Some(value) if value.as_u64() == Some(1) => Ok(Storage::Gci),
+        Some(value) if value.as_u64() == Some(0) => Ok(Storage::Raw),
+        _ => bail!("Dusklight has an unsupported memory-card storage setting"),
+    }
+}
+
+pub fn storage_for_path(path: &Path) -> Storage {
+    if files::is_raw(path) {
+        Storage::Raw
+    } else {
+        Storage::Gci
+    }
+}
+
+pub fn binding_is_current(profile: &Path, path: &Path) -> Result<bool> {
+    Ok(storage(profile)? == storage_for_path(path))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Mode {
@@ -142,18 +173,19 @@ pub fn profile(default: &Path, executable: Option<&Path>) -> Result<PathBuf> {
             "Dusklight's active profile is not a directory"
         );
     }
-    if let Some(config) = read_json(&active.join("config.json"), CONFIG_LIMIT)?
-        && let Some(kind) = config.get("backend.cardFileType")
-    {
-        ensure!(
-            kind.as_u64() == Some(1),
-            "Dusklight is using raw memory-card storage. Automatic sync requires its standard GCI-folder storage; no raw card or existing save was changed"
-        );
-    }
+    storage(&active)?;
     Ok(active)
 }
 
 pub fn path_for_identity(profile: &Path, identity: &SaveIdentity) -> Result<PathBuf> {
+    path_for_storage(profile, identity, storage(profile)?)
+}
+
+pub fn path_for_storage(
+    profile: &Path,
+    identity: &SaveIdentity,
+    storage: Storage,
+) -> Result<PathBuf> {
     ensure!(
         identity.name == SAVE_NAME && GAMES.contains(&identity.game.as_str()),
         "Automatic sync uses Dusklight's standard gczelda2 save, not an alternate named save"
@@ -164,25 +196,45 @@ pub fn path_for_identity(profile: &Path, identity: &SaveIdentity) -> Result<Path
         b'P' => "EUR",
         _ => bail!("Unsupported Dusklight save region"),
     };
-    let path = profile
-        .join(region)
-        .join("Card A")
-        .join(format!("01-{}-{SAVE_NAME}.gci", identity.game));
+    let path = match storage {
+        Storage::Gci => profile
+            .join(region)
+            .join("Card A")
+            .join(format!("01-{}-{SAVE_NAME}.gci", identity.game)),
+        Storage::Raw => profile.join(format!("MemoryCardA.{region}.raw")),
+    };
     ensure_safe_path(&path)?;
     Ok(path)
 }
 
 pub fn discover(profile: &Path) -> Result<PathBuf> {
+    discover_with_storage(profile, storage(profile)?)
+}
+
+pub fn discover_with_storage(profile: &Path, storage: Storage) -> Result<PathBuf> {
     let mut found = None;
+    let mut empty = None;
+    let mut checked = Vec::new();
     for game in GAMES {
-        let path = path_for_identity(
+        let path = path_for_storage(
             profile,
             &SaveIdentity {
                 game: game.into(),
                 name: SAVE_NAME.into(),
             },
+            storage,
         )?;
+        if checked.contains(&path) {
+            continue;
+        }
+        checked.push(path.clone());
         if path.try_exists()? {
+            if storage == Storage::Raw && files::read_optional_save(&path)?.is_none() {
+                if empty.is_none() {
+                    empty = Some(path);
+                }
+                continue;
+            }
             ensure!(
                 path.is_file(),
                 "Dusklight's default save is not a regular file"
@@ -196,12 +248,14 @@ pub fn discover(profile: &Path) -> Result<PathBuf> {
     }
     match found {
         Some(path) => Ok(path),
-        None => path_for_identity(
+        None if empty.is_some() => empty.context("Missing empty memory card"),
+        None => path_for_storage(
             profile,
             &SaveIdentity {
                 game: "GZ2E".into(),
                 name: SAVE_NAME.into(),
             },
+            storage,
         ),
     }
 }
@@ -210,15 +264,25 @@ fn unmigrated_saves(source: &Path, target: &Path) -> Result<bool> {
     if source == target {
         return Ok(false);
     }
+    let mut checked = Vec::new();
     for game in GAMES {
         let identity = SaveIdentity {
             game: game.into(),
             name: SAVE_NAME.into(),
         };
-        if path_for_identity(source, &identity)?.try_exists()?
-            && !path_for_identity(target, &identity)?.try_exists()?
-        {
-            return Ok(true);
+        for source_storage in [Storage::Gci, Storage::Raw] {
+            let path = path_for_storage(source, &identity, source_storage)?;
+            if checked.contains(&path) {
+                continue;
+            }
+            checked.push(path.clone());
+            if let Some(bytes) = files::read_optional_save(&path)? {
+                let actual = files::validate_save(&bytes)?;
+                let destination = path_for_identity(target, &actual)?;
+                if files::read_optional_save(&destination)?.is_none() {
+                    return Ok(true);
+                }
+            }
         }
     }
     Ok(false)
@@ -229,7 +293,7 @@ pub fn prepare(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("Automatic save has no parent directory")?;
-    fs::create_dir_all(parent).context("Creating Dusklight's standard Card A directory")?;
+    fs::create_dir_all(parent).context("Creating Dusklight's save directory")?;
     ensure_safe_path(path)?;
     Ok(())
 }
@@ -237,7 +301,7 @@ pub fn prepare(path: &Path) -> Result<()> {
 pub fn validate_at_path(profile: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     let identity = files::validate_save(bytes)?;
     ensure!(
-        path_for_identity(profile, &identity)? == path,
+        path_for_storage(profile, &identity, storage_for_path(path))? == path,
         "Save identity does not match Dusklight's automatically resolved default filename"
     );
     Ok(())
@@ -252,7 +316,9 @@ pub fn hash(profile: &Path, path: &Path) -> Result<Option<String>> {
         path.parent().is_some_and(|parent| parent.is_dir()),
         "Automatic save directory is unavailable"
     );
-    let bytes = files::read_save(path)?;
+    let Some(bytes) = files::read_optional_save(path)? else {
+        return Ok(None);
+    };
     validate_at_path(profile, path, &bytes)?;
     Ok(Some(files::sha256(&bytes)))
 }
@@ -374,9 +440,28 @@ pub(crate) mod tests {
         )?;
         write_json(
             &default.join("config.json"),
-            json!({"backend.cardFileType":0}),
+            json!({"backend.cardFileType":2}),
         )?;
         assert!(profile(&default, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_storage_uses_native_card_paths_and_distinguishes_empty_cards_from_saves() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        write_json(
+            &root.path().join("config.json"),
+            json!({"backend.cardFileType":0}),
+        )?;
+        assert_eq!(profile(root.path(), None)?, root.path());
+        let path = root.path().join("MemoryCardA.USA.raw");
+        assert_eq!(discover(root.path())?, path);
+        fs::write(&path, crate::raw_card::tests::empty())?;
+        assert_eq!(hash(root.path(), &path)?, None);
+        let bytes = stock_save("GZ2E");
+        files::write_save(&path, &bytes, None)?;
+        assert_eq!(discover(root.path())?, path);
+        assert_eq!(hash(root.path(), &path)?, Some(files::sha256(&bytes)));
         Ok(())
     }
 

@@ -733,12 +733,17 @@ impl Dashboard {
                     self.page = Page::History;
                 }
             });
-            Self::secondary(
-                ui,
-                "A PC without a save is prepared automatically. Old manual selections are ignored; existing files are not moved or deleted.",
-            );
+            Self::secondary(ui, "A PC without a save is ready to receive automatically.");
             ui.collapsing("Save details", |ui| {
                 if let Some(path) = &snapshot.settings.save_file {
+                    Self::secondary(
+                        ui,
+                        if crate::files::is_raw(path) {
+                            "Storage: Raw memory card"
+                        } else {
+                            "Storage: GCI folder"
+                        },
+                    );
                     Self::path(ui, path);
                 }
                 if let Some(hash) = &snapshot.local_hash {
@@ -1579,7 +1584,7 @@ impl Dashboard {
                 ),
                 (
                     "Data, never a peer executable",
-                    "Save traffic accepts only a strict GCI structure with both sector checksums, all six quest checksums, and bounded player/horse names. No mod scripts, raw cards, ZIP saves, or executable attachments.",
+                    "GCI folders and raw memory cards are supported. Only the validated Twilight Princess save crosses the LAN; other card contents stay local. Sector and quest checksums are verified. No mod scripts, ZIP saves, or executable attachments.",
                 ),
                 (
                     "Honest limitations",

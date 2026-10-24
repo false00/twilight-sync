@@ -84,11 +84,6 @@ Do these steps on **both PCs**:
 7. Use **Play Dusklight**. After you stop playing, the final save syncs before
    the other PC can start a protected session.
 
-Previous manual save selections in Sync are ignored. Existing files are not
-moved, deleted, or imported from those old locations. Dusklight's own profile
-settings and texture choices are preserved, including its portable/custom
-profile when configured.
-
 Installing or updating Dusklight through the app also creates or refreshes
 **Dusklight (Twilight Sync)** on your Windows desktop. It opens the manager's
 protected Play controls, reusing the running manager if necessary; it never
@@ -235,8 +230,9 @@ Start with copies of your saves.
 - Windows x64 is the initial downloadable platform; macOS/Linux desktop builds
   and native Windows ARM64 releases are not currently published.
 - One trusted partner per device; no multi-device mesh or Internet save relay.
-- Save sync accepts individual four-block, version-6 GCI saves, not raw memory
-  cards, mod scripts, save archives, or whole directories.
+- GCI folders and raw memory cards are supported. Only the validated
+  Twilight Princess save is transferred; other card contents stay local.
+  Mod scripts, save archives, and whole-directory transfers are not supported.
 - Router fingerprints are spoofable policy checks, not proof of physical
   proximity. Pairing and pinned keys are separate security layers.
 - File validation cannot prove the absence of every game-engine exploit.

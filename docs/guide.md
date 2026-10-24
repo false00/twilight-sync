@@ -106,8 +106,14 @@ GameCube save is:
 %APPDATA%\TwilitRealm\Dusklight\USA\Card A\01-GZ2E-gczelda2.gci
 ```
 
+When Dusklight uses raw-card storage, the US card is:
+
+```text
+%APPDATA%\TwilitRealm\Dusklight\MemoryCardA.USA.raw
+```
+
 The stock internal save name is **`gczelda2`**, not `zeldaTp.dat`. Supported
-GameCube/Wii IDs select `USA`, `JAP`, or `EUR` and their matching GCI filename.
+GameCube/Wii IDs select `USA`, `JAP`, or `EUR` and their matching GCI or raw-card location.
 Detection examines only these known standard Card A locations, not arbitrary
 directories or the whole home folder.
 
@@ -119,29 +125,41 @@ those descriptors, force a different game profile, reset game settings/textures,
 or move existing saves. Dusklight remains responsible for its own migrations.
 Pending game migrations are reported rather than treated as an empty save.
 
-Old manually chosen Sync saves and receive destinations are ignored without
-opening or importing their files. The existing `save_file` settings value is now
-derived metadata, not a directory override; it is recomputed on startup. A
+The `save_file` settings value is derived metadata, not a directory override;
+it is recomputed on startup. A
 location change clears the old common-sync base while preserving pairing and
 durable play locks. Profile binding stays pinned during gameplay and transfers;
 the profile is checked again before a protected launch.
 
-Malformed or oversized profile metadata, raw-card storage, unsafe paths,
+Malformed or oversized profile metadata, unsafe paths,
 corrupt saves, alternate named saves, and multiple standard regional saves
-produce explicit errors. The app will not guess a winner or silently fall back
-to an old manual path.
+produce explicit errors. The app will not guess which save to replace.
 
 These conventions are verified against released Dusklight v2.0.3 and its pinned
 platform libraries: [profile policy](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/dusk/data.cpp),
 [stock save name](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/m_Do/m_Do_MemCard.cpp),
 and [regional Card A layout](https://github.com/encounter/aurora/blob/3227d76c60e1e782ca576610bce61c9e7744d8be/lib/dolphin/card.cpp).
 
-Dusklight supports several storage formats, but this release intentionally syncs
-**only individual four-block GCI saves** with data version 6. It does not sync raw
-memory-card images, `.dusksave` ZIP containers, mod sidecars, scripts, settings, or
-entire directories. Use Dusklight's standard GCI-directory storage and stock save.
-The manager computes the local filename from the validated supported identity;
-a peer never supplies a directory or arbitrary destination filename.
+Both **GCI-directory and raw memory-card storage** work directly, including a
+raw-card device paired with a GCI-folder device. Only the individual four-block
+Twilight Princess save crosses the encrypted connection, using a bounded GCI
+payload. The rest of the raw card stays local. `.dusksave` ZIP containers, mod
+sidecars, scripts, settings, and entire directories are not transferred.
+
+Raw cards must be standard 512 KiB through 16 MiB GameCube images. The manager
+checks the native header, redundant directory/allocation checksums and wrapping
+update counters, every allocation chain, block ownership, and free-block count.
+It extracts the stock save, validates it, and updates only that save. Other
+games, the card header/serial, and unrelated data blocks are preserved. Inserting
+a save into an existing empty card requires four free blocks and a directory
+slot. Dusklight creates/formats raw cards; open it once if a new raw card does not
+exist yet. Sync never reformats an existing card.
+
+Before a raw-card commit, an exclusive file-range lock prevents concurrent card
+access. File identity and the expected save hash are checked, a complete image
+is staged and flushed, and Windows `ReplaceFileW` atomically replaces the card
+while preserving its permissions. The committed save is re-read and verified.
+Snapshot history stores only the extracted save, not a full card copy.
 
 ### Network compatibility
 
@@ -285,7 +303,9 @@ Both sending and receiving validate the actual save:
 2. Explicit Twilight Princess game/region IDs and Nintendo maker ID `01`.
 3. A bounded, terminated, conservative ASCII GCI save name; expected icon/comment
    offsets. Unknown formats are rejected, not renamed into acceptance.
-4. Save data version 6 in **both** redundant sectors.
+4. Save data version 6 in **both** redundant sectors: original big-endian or
+   Dusklight PC's native little-endian sector envelope. Quest data and its
+   checksums remain big-endian in both cases. Mixed/unknown formats are rejected.
 5. Both sector checksums, plus all **six** quest-slot checksums.
 6. NUL termination inside each 17-byte player and horse name field.
 7. Transfer SHA-256 and the locally expected destination hash.
@@ -298,7 +318,9 @@ Windows device names, and ambiguous Windows components are refused.
 
 The old valid save is captured in content-addressed history. The incoming save is
 staged in the destination directory, flushed, atomically persisted, and re-read.
-A changed destination hash aborts replacement. Unsynced divergent changes need
+A changed destination hash aborts replacement. Storage-only raw allocation
+pointers are normalized for cross-device hashing, so identical saves do not
+conflict merely because their card blocks differ. Unsynced divergent changes need
 explicit receiver consent even when the sender presses **Send this save**.
 Corrupt or incompatible existing destinations are not silently overwritten.
 The oldest history commits are pruned to keep the managed store within its
@@ -668,7 +690,7 @@ cargo run --locked -- --check-updates
 cargo run --locked -- --check-app-updates
 ```
 
-An unsupported/corrupt input exits with an error. Do not treat a `VALID GCI`
+An unsupported/corrupt input exits with an error. Do not treat a `VALID DUSKLIGHT SAVE`
 result as an exploit-free certificate.
 
 ```powershell

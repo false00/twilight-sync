@@ -56,7 +56,7 @@ fn run() -> Result<()> {
     }
     if first.as_deref().is_some_and(|a| a == "--help" || a == "-h") {
         println!(
-            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save-location\n                                Show the automatically detected Dusklight save\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
+            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save-location\n                                Show the automatically detected Dusklight save\n  twilight-sync --check-save PATH\n                                Validate a GCI or raw-card save without changes\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
         return Ok(());
     }
@@ -191,11 +191,11 @@ fn run() -> Result<()> {
         let path = twilight_sync::save_location::discover(&profile)?;
         let hash = twilight_sync::save_location::hash(&profile, &path)?;
         println!(
-            "AUTOMATIC DUSKLIGHT SAVE\nProfile: {}\nSave: {}\nState: {}\nSHA-256: {}\nOld manual Sync paths were ignored. No files or settings were changed.",
+            "AUTOMATIC DUSKLIGHT SAVE\nProfile: {}\nSave: {}\nState: {}\nSHA-256: {}\nNo files or settings were changed.",
             profile.display(),
             path.display(),
             if hash.is_some() {
-                "Valid standard save"
+                "Valid Dusklight save"
             } else {
                 "No save yet; automatic receive destination ready"
             },
@@ -220,7 +220,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if first.as_deref().is_some_and(|a| a == "--check-save") {
-        let path = PathBuf::from(arguments.next().context("Missing GCI file path")?);
+        let path = PathBuf::from(
+            arguments
+                .next()
+                .context("Missing GCI or raw-card file path")?,
+        );
         if arguments.next().is_some() {
             bail!("Unexpected extra arguments");
         }
@@ -228,7 +232,7 @@ fn run() -> Result<()> {
         let bytes = twilight_sync::files::read_save(&path)?;
         let identity = twilight_sync::files::validate_save(&bytes)?;
         println!(
-            "VALID GCI\nGame: {}\nSave: {}\nSHA-256: {}",
+            "VALID DUSKLIGHT SAVE\nGame: {}\nSave: {}\nSHA-256: {}",
             identity.game,
             identity.name,
             twilight_sync::files::sha256(&bytes)

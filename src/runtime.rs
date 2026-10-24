@@ -2352,6 +2352,18 @@ impl Engine {
                         )?),
                     "Dusklight's profile changed while waiting for play approval; retry after automatic detection completes"
                 );
+                ensure!(
+                    save_location::binding_is_current(
+                        self.save_profile
+                            .as_deref()
+                            .context("Missing save profile")?,
+                        self.settings
+                            .save_file
+                            .as_deref()
+                            .context("Missing save location")?,
+                    )?,
+                    "Dusklight's memory-card format changed while waiting for play approval"
+                );
                 self.managed_token = Some(token);
                 let child = play::launch(executable)?;
                 self.child = Some(child);
@@ -2572,12 +2584,16 @@ impl Engine {
             .clone()
             .context("Dusklight's automatic save profile is unavailable")?;
         let identity = files::validate_save(bytes)?;
-        let target = save_location::path_for_identity(&profile, &identity)?;
         let current = self
             .settings
             .save_file
             .as_ref()
             .context("Dusklight's automatic save location is unavailable")?;
+        let target = save_location::path_for_storage(
+            &profile,
+            &identity,
+            save_location::storage_for_path(current),
+        )?;
         if current != &target {
             ensure!(
                 self.current_hash()?.is_none(),
@@ -2585,7 +2601,8 @@ impl Engine {
             );
             let discovered = save_location::discover(&profile)?;
             ensure!(
-                !discovered.try_exists()? && !target.try_exists()?,
+                files::read_optional_save(&discovered)?.is_none()
+                    && files::read_optional_save(&target)?.is_none(),
                 "A default save appeared after approval; refresh and retry rather than overwriting it"
             );
             self.apply_automatic_save_location(profile, target.clone())?;
@@ -2620,6 +2637,18 @@ impl Engine {
                         self.settings.game_exe.as_deref(),
                     )?),
                 "Dusklight's active profile changed after the save offer; retry after automatic detection completes"
+            );
+            ensure!(
+                save_location::binding_is_current(
+                    self.save_profile
+                        .as_deref()
+                        .context("Missing save profile")?,
+                    self.settings
+                        .save_file
+                        .as_deref()
+                        .context("Missing save location")?,
+                )?,
+                "Dusklight's memory-card format changed after the save offer; retry after detection completes"
             );
         }
         let path = self.save_destination(&pending.bytes)?;
@@ -2870,10 +2899,14 @@ impl Engine {
             if !self.no_transfer() {
                 return Ok(());
             }
-            if let Some(path) = &self.settings.save_file
-                && path.try_exists()?
-            {
-                return Ok(());
+            if let Some(path) = &self.settings.save_file {
+                if files::is_raw(path) {
+                    if self.game_running || self.current_hash()?.is_some() {
+                        return Ok(());
+                    }
+                } else if path.try_exists()? {
+                    return Ok(());
+                }
             }
             self.save_profile
                 .clone()
@@ -2881,7 +2914,19 @@ impl Engine {
         } else {
             save_location::profile(&self.default_profile, self.settings.game_exe.as_deref())?
         };
-        let path = save_location::discover(&profile)?;
+        let path = if pinned {
+            save_location::discover_with_storage(
+                &profile,
+                save_location::storage_for_path(
+                    self.settings
+                        .save_file
+                        .as_deref()
+                        .context("Missing pinned save location")?,
+                ),
+            )?
+        } else {
+            save_location::discover(&profile)?
+        };
         self.apply_automatic_save_location(profile, path)
     }
 
@@ -2893,7 +2938,7 @@ impl Engine {
                 Some(&path),
                 None,
                 None,
-                "Resolved from Dusklight's active profile; legacy manual selections ignored without moving files",
+                "Automatically resolved from Dusklight's active profile",
             )?;
         }
         if changed {
@@ -3076,17 +3121,23 @@ impl Engine {
             self.history_candidate = None;
             return Ok(());
         }
-        let bytes = match files::read_save(&path).and_then(|bytes| {
-            save_location::validate_at_path(
-                self.save_profile
-                    .as_deref()
-                    .context("Automatic save profile is unavailable")?,
-                &path,
-                &bytes,
-            )?;
+        let bytes = match files::read_optional_save(&path).and_then(|bytes| {
+            if let Some(bytes) = &bytes {
+                save_location::validate_at_path(
+                    self.save_profile
+                        .as_deref()
+                        .context("Automatic save profile is unavailable")?,
+                    &path,
+                    bytes,
+                )?;
+            }
             Ok(bytes)
         }) {
-            Ok(bytes) => bytes,
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                self.history_candidate = None;
+                return Ok(());
+            }
             Err(error) if self.game_running => {
                 let notice = format!("Waiting for a complete valid in-game save: {error:#}");
                 if self.history_page.notice.as_deref() != Some(&notice) {
@@ -3745,6 +3796,33 @@ mod tests {
         bytes
     }
 
+    fn native_variant(marker: u8) -> Vec<u8> {
+        let mut bytes = files::fixture_native_save();
+        bytes[8..40].fill(0);
+        bytes[8..16].copy_from_slice(b"gczelda2");
+        bytes[0x100] = marker;
+        bytes
+    }
+
+    fn use_raw_card(engine: &mut Engine, save: Option<&[u8]>) -> Result<PathBuf> {
+        fs::create_dir_all(&engine.default_profile)?;
+        let path = engine.default_profile.join("MemoryCardA.USA.raw");
+        fs::write(&path, crate::raw_card::tests::empty())?;
+        if let Some(bytes) = save {
+            files::write_save(&path, bytes, None)?;
+        }
+        files::atomic_write(
+            &engine.default_profile.join("config.json"),
+            &serde_json::to_vec(
+                &serde_json::json!({"backend.cardFileType":0,"video.enableVsync":false}),
+            )?,
+        )?;
+        engine.refresh_save()?;
+        engine.stable_since = Instant::now() - Duration::from_secs(2);
+        engine.refresh_save()?;
+        Ok(path)
+    }
+
     impl Harness {
         fn new(left_save: Option<Vec<u8>>, right_save: Option<Vec<u8>>) -> Result<Self> {
             let directory = tempfile::tempdir()?;
@@ -4192,8 +4270,10 @@ mod tests {
         files::atomic_write(&path, &variant(1))?;
         for _ in 0..20 {
             h.left.refresh_save()?;
+            if h.left.stable_since.elapsed() < Duration::from_secs(2) {
+                assert_eq!(h.left.stable, 0);
+            }
         }
-        assert_eq!(h.left.stable, 0);
         h.left.stable_since = Instant::now() - Duration::from_secs(2);
         h.left.refresh_save()?;
         assert_eq!(h.left.stable, 2);
@@ -4776,6 +4856,130 @@ mod tests {
             )?,
             variant(1)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_saves_sync_between_raw_and_gci_storage_in_both_directions() -> Result<()> {
+        for (left_raw, right_raw) in [(true, false), (false, true), (true, true)] {
+            let first = native_variant(1);
+            let old = native_variant(0);
+            let mut h = Harness::new(Some(first.clone()), Some(old.clone()))?;
+            if left_raw {
+                use_raw_card(&mut h.left, Some(&first))?;
+            }
+            let raw_path = if right_raw {
+                Some(use_raw_card(&mut h.right, Some(&old))?)
+            } else {
+                None
+            };
+            h.pair()?;
+            h.left.command(Command::SendSave)?;
+            h.pump_until(|h| h.right.pending_save.is_some())?;
+            h.right.command(Command::AcceptSave(true))?;
+            let expected = files::sha256(&first);
+            h.pump_until(|h| {
+                h.left.sent_save.is_none() && h.right.local_hash.as_ref() == Some(&expected)
+            })?;
+            assert_eq!(
+                files::read_save(
+                    h.right
+                        .settings
+                        .save_file
+                        .as_ref()
+                        .context("Missing save")?
+                )?,
+                first
+            );
+            let previous = h
+                .right
+                .history
+                .as_ref()
+                .context("Missing history")?
+                .page(None)?
+                .entries
+                .into_iter()
+                .find(|entry| entry.hash == files::sha256(&old))
+                .context("Previous save was not retained")?;
+            h.right.command(Command::RestoreSnapshot {
+                id: previous.id,
+                expected: Some(expected),
+            })?;
+            assert_eq!(
+                files::read_save(
+                    h.right
+                        .settings
+                        .save_file
+                        .as_ref()
+                        .context("Missing save")?
+                )?,
+                old
+            );
+            if let Some(path) = raw_path {
+                assert_eq!(
+                    fs::metadata(path)?.len(),
+                    crate::raw_card::tests::empty().len() as u64
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_formatted_raw_card_receives_and_snapshots_only_the_game_save() -> Result<()> {
+        let bytes = native_variant(1);
+        let mut h = Harness::new(Some(bytes.clone()), None)?;
+        let path = use_raw_card(&mut h.right, None)?;
+        let original = fs::read(&path)?;
+        assert!(h.right.save_valid && h.right.local_hash.is_none());
+        h.right.snapshot_tick()?;
+        h.pair()?;
+        h.left.command(Command::SendSave)?;
+        let expected = files::sha256(&bytes);
+        h.pump_until(|h| {
+            h.left.sent_save.is_none() && h.right.local_hash.as_ref() == Some(&expected)
+        })?;
+        assert_eq!(files::read_save(&path)?, bytes);
+        assert_eq!(
+            &fs::read(&path)?[..crate::raw_card::BLOCK],
+            &original[..crate::raw_card::BLOCK]
+        );
+        let stats = h
+            .right
+            .history
+            .as_ref()
+            .context("Missing history")?
+            .stats()?;
+        assert_eq!(stats.logical_bytes, files::SAVE_SIZE as u64);
+        assert!(stats.stored_bytes < 64 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_format_changes_cancel_a_pending_save_without_converting_or_touching_files()
+    -> Result<()> {
+        let mut h = Harness::new(Some(native_variant(1)), Some(native_variant(0)))?;
+        h.pair()?;
+        h.left.command(Command::SendSave)?;
+        h.pump_until(|h| h.right.pending_save.is_some())?;
+        let original = h
+            .right
+            .settings
+            .save_file
+            .clone()
+            .context("Missing GCI path")?;
+        files::atomic_write(
+            &h.right.default_profile.join("config.json"),
+            br#"{"backend.cardFileType":0}"#,
+        )?;
+        let error = h
+            .right
+            .command(Command::AcceptSave(true))
+            .err()
+            .context("Changed storage accepted the save")?;
+        assert!(format!("{error:#}").contains("memory-card format changed"));
+        assert_eq!(files::read_save(&original)?, native_variant(0));
+        assert!(!h.right.default_profile.join("MemoryCardA.USA.raw").exists());
         Ok(())
     }
 

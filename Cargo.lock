@@ -1413,6 +1413,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gc-memcard"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3044e120e8c48fe90989d3bd7205fb98ef66ef40feb57d0f4050efa73bbc0d1"
+
+[[package]]
 name = "gdk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4234,7 +4240,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "twilight-sync"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -4243,6 +4249,7 @@ dependencies = [
  "eframe",
  "flate2",
  "fs2",
+ "gc-memcard",
  "hex",
  "nod",
  "postcard",

@@ -8,6 +8,7 @@ pub mod install;
 pub mod lan;
 pub mod play;
 pub mod protocol;
+pub mod raw_card;
 pub mod runtime;
 pub mod save_location;
 pub mod self_update;

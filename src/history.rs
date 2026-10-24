@@ -592,13 +592,14 @@ impl History {
         peer: Option<&str>,
         restored_from: Option<&str>,
     ) -> Result<(String, Capture)> {
+        let normalized = files::normalize_save(bytes)?;
+        let bytes = normalized.as_slice();
         let identity = files::validate_save(bytes)?;
         ensure!(
             files::save_hash(path)?.as_deref() == expected,
             "Save changed before snapshot-protected replacement"
         );
-        if path.try_exists()? {
-            let previous = files::read_save(path)?;
+        if let Some(previous) = files::read_optional_save(path)? {
             ensure!(
                 files::validate_save(&previous)? == identity,
                 "Snapshot belongs to another game region or save"
@@ -623,7 +624,7 @@ impl History {
             files::save_hash(path)?.as_deref() == expected,
             "Save changed while preparing its snapshot"
         );
-        files::atomic_write(path, bytes)?;
+        files::write_save(path, bytes, expected)?;
         let hash = sha256(bytes);
         ensure!(
             files::save_hash(path)?.as_deref() == Some(hash.as_str()),

@@ -30,13 +30,32 @@ cargo test --lib --locked -- save_location::tests runtime::tests ui::tests
 ```
 
 Profile tests use isolated directories and the exact released Dusklight
-descriptor/default-path conventions. Runtime tests cover ignored legacy manual
-selections, first receive/restore into the correct region, empty profiles without
+descriptor/default-path conventions. Runtime tests cover automatic detection,
+first receive/restore into the correct region, empty profiles without
 placeholder files, pending native migrations, and profile pinning/revalidation.
 Discovery is read-only; only an approved receive/restore prepares save folders.
 The normal game launch is retained so Dusklight can handle its own profile
 migrations and preferences. The read-only `--check-save-location` diagnostic
 accepts no custom directory and does not initialize startup or write settings.
+
+### Raw memory cards
+
+```powershell
+cargo test --lib --locked -- raw_card::tests files::tests runtime::tests
+```
+
+Synthetic native-format fixtures cover fragmented chains, unrelated game saves,
+redundant metadata, wrapping counters, corruption, full/busy cards, atomic
+replacement, canonical GCI hashing, and mixed raw/GCI sync/restore. A separate
+`gc-memcard` parser is a test-only interoperability oracle; the production
+adapter never rebuilds or repacks unrelated saves. Both native PC and original
+console save-envelope checksums are tested.
+
+The ignored `authorized_native_card_copy_round_trip` test accepts
+`TWILIGHT_RAW_TEST_PATH` only when explicitly invoked. It reads that input,
+performs write/restore checks in temporary copies, checks an independent parser,
+and verifies the supplied input did not change. Never point automatic CI tests
+at real profiles or modify a live card for validation.
 
 ### Disc-image and Windows icon checks
 
@@ -68,7 +87,7 @@ The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.6.0
+.\scripts\Package-Release.ps1 -Version v0.7.0
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
@@ -85,7 +104,7 @@ Checksums cover both the executable and the bootstrap script.
 1. Update the Cargo package version and lockfile, refresh dependency notices,
    validate the code, and commit.
 2. Push `main` and wait for CI on that exact commit to pass.
-3. Create and push the matching fresh stable tag, such as `v0.6.1`.
+3. Create and push the matching fresh stable tag, such as `v0.7.1`.
 4. The release workflow builds and tests on Windows, creates a draft release,
    uploads all assets, then publishes it as latest.
 5. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`

@@ -63,13 +63,20 @@ pub fn validate_save(bytes: &[u8]) -> Result<SaveIdentity> {
         u32::from_be_bytes(bytes[0x3c..0x40].try_into()?) == 0x2400,
         "Invalid GCI comment address"
     );
-    // Both redundant sectors must be valid: do not propagate partially written saves.
+    let native_little_endian = match &bytes[0x4044..0x4048] {
+        [0, 0, 0, 6] => false,
+        [6, 0, 0, 0] => true,
+        _ => bail!("Unsupported save data version"),
+    };
+    // PC Dusklight writes the sector envelope as native integers; quest data stays big-endian.
     for offset in [0x4040, 0x6040] {
         let sector = &bytes[offset..offset + 0x2000];
-        ensure!(
-            u32::from_be_bytes(sector[4..8].try_into()?) == 6,
-            "Unsupported save data version"
-        );
+        let version = if native_little_endian {
+            u32::from_le_bytes(sector[4..8].try_into()?)
+        } else {
+            u32::from_be_bytes(sector[4..8].try_into()?)
+        };
+        ensure!(version == 6, "Unsupported save data version");
         let (mut high, mut low) = (0_u16, 0_u16);
         for word in sector[..0x1ffc].as_chunks::<2>().0 {
             let word = u16::from_be_bytes([word[0], word[1]]);
@@ -77,10 +84,12 @@ pub fn validate_save(bytes: &[u8]) -> Result<SaveIdentity> {
             low = low.wrapping_add(!word);
         }
         let checksum = (u32::from(high) << 16) | u32::from(low);
-        ensure!(
-            u32::from_be_bytes(sector[0x1ffc..].try_into()?) == checksum,
-            "Invalid sector checksum"
-        );
+        let stored = if native_little_endian {
+            u32::from_le_bytes(sector[0x1ffc..].try_into()?)
+        } else {
+            u32::from_be_bytes(sector[0x1ffc..].try_into()?)
+        };
+        ensure!(stored == checksum, "Invalid sector checksum");
         for slot in 0..3 {
             let quest = &sector[8 + slot * QUEST_SIZE..8 + (slot + 1) * QUEST_SIZE];
             let (mut high, mut low) = (0_u32, 0_u32);
@@ -172,36 +181,71 @@ pub fn ensure_safe_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn read_save(path: &Path) -> Result<Vec<u8>> {
+pub fn is_raw(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("raw"))
+}
+
+pub fn normalize_save(bytes: &[u8]) -> Result<Vec<u8>> {
+    validate_save(bytes)?;
+    let mut normalized = bytes.to_vec();
+    // An on-card allocation pointer is not part of the save's cross-device identity.
+    normalized[0x36..0x38].fill(0);
+    Ok(normalized)
+}
+
+pub fn read_optional_save(path: &Path) -> Result<Option<Vec<u8>>> {
     ensure_safe_path(path)?;
+    if is_raw(path) {
+        return crate::raw_card::read(path);
+    }
     ensure!(
         path.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("gci")),
-        "Only .gci saves are allowed"
+        "Only GCI saves or raw memory cards are supported"
     );
-    let file = File::open(path).context("Opening selected save")?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Opening Dusklight save"),
+    };
     ensure!(file.metadata()?.is_file(), "Save must be a regular file");
     let mut bytes = Vec::with_capacity(SAVE_SIZE);
     file.take((SAVE_SIZE + 1) as u64).read_to_end(&mut bytes)?;
-    validate_save(&bytes)?;
-    Ok(bytes)
+    Ok(Some(normalize_save(&bytes)?))
+}
+
+pub fn read_save(path: &Path) -> Result<Vec<u8>> {
+    read_optional_save(path)?.context("No Twilight Princess save exists yet")
 }
 
 pub fn save_hash(path: &Path) -> Result<Option<String>> {
     ensure_safe_path(path)?;
     ensure!(
-        path.extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gci")),
-        "Save destination must be a .gci"
+        is_raw(path)
+            || path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gci")),
+        "Save destination must be GCI or a raw memory card"
     );
     ensure!(
         path.parent().is_some_and(|p| p.is_dir()),
         "Save directory does not exist"
     );
-    if !path.try_exists()? {
-        return Ok(None);
+    Ok(read_optional_save(path)?.as_deref().map(sha256))
+}
+
+pub fn write_save(path: &Path, bytes: &[u8], expected: Option<&str>) -> Result<()> {
+    let bytes = normalize_save(bytes)?;
+    if is_raw(path) {
+        crate::raw_card::write(path, &bytes, expected)
+    } else {
+        ensure!(
+            save_hash(path)?.as_deref() == expected,
+            "Save changed before atomic replacement"
+        );
+        atomic_write(path, &bytes)
     }
-    Ok(Some(sha256(&read_save(path)?)))
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -305,6 +349,23 @@ pub fn fixture_save() -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_native_save() -> Vec<u8> {
+    let mut bytes = fixture_save();
+    for offset in [0x4040, 0x6040] {
+        let sector = &mut bytes[offset..offset + 0x2000];
+        sector[4..8].copy_from_slice(&6_u32.to_le_bytes());
+        let (mut high, mut low) = (0_u16, 0_u16);
+        for word in sector[..0x1ffc].as_chunks::<2>().0 {
+            let value = u16::from_be_bytes(*word);
+            high = high.wrapping_add(value);
+            low = low.wrapping_add(!value);
+        }
+        sector[0x1ffc..].copy_from_slice(&((u32::from(high) << 16) | u32::from(low)).to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -324,6 +385,24 @@ mod tests {
         let mut oversized = valid;
         oversized.push(0);
         assert!(validate_save(&oversized).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_pc_envelopes_keep_all_sector_and_quest_checks_strict() -> Result<()> {
+        let valid = fixture_native_save();
+        validate_save(&valid)?;
+        for offset in [0x4044, 0x6044, 0x4050, 0x6050, 0x603f, 0x803f] {
+            let mut bad = valid.clone();
+            bad[offset] ^= 1;
+            assert!(
+                validate_save(&bad).is_err(),
+                "Accepted native mutation {offset:x}"
+            );
+        }
+        let mut mixed = valid;
+        mixed[0x6040..].copy_from_slice(&fixture_save()[0x6040..]);
+        assert!(validate_save(&mixed).is_err());
         Ok(())
     }
 
