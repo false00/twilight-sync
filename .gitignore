@@ -1,0 +1,13 @@
+/target/
+*.log
+*.iso
+*.rvz
+*.gci
+*.raw
+*.dusksave
+*.key
+*.dpapi
+.twilight-sync/
+/dist/
+desktop.ini
+Thumbs.db

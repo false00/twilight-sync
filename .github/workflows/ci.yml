@@ -1,0 +1,40 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Validate Rust
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Installer tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\Test-Installer.ps1
+      - name: Installer tests (PowerShell 7)
+        shell: pwsh
+        run: .\scripts\Test-Installer.ps1
+      - name: Build Windows x64
+        shell: pwsh
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
