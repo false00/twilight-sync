@@ -207,6 +207,8 @@ impl Pump {
             "Checking / updating official Dusklight"
         } else if snapshot.self_updates.available() {
             "Twilight Sync update available - open tray"
+        } else if snapshot.connecting {
+            "Connecting to your local device"
         } else if snapshot.ready {
             "Secure partner connected"
         } else {

@@ -43,6 +43,7 @@ pub struct Snapshot {
     pub local_approved: bool,
     pub remote_approved: bool,
     pub ready: bool,
+    pub connecting: bool,
     pub pairing_open: bool,
     pub local_hash: Option<String>,
     pub remote_hash: Option<String>,
@@ -362,8 +363,15 @@ pub fn start() -> Result<Backend> {
     Ok(Backend { sender, view })
 }
 
-#[cfg(debug_assertions)]
-pub fn ui_smoke_backend() -> Backend {
+#[cfg(any(debug_assertions, test))]
+pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
+    ensure!(
+        matches!(
+            scenario,
+            "offline" | "ready" | "pairing" | "connecting" | "attention"
+        ),
+        "Unknown UI smoke scenario"
+    );
     let settings = Settings {
         startup: false,
         name: "UI smoke test".into(),
@@ -371,7 +379,81 @@ pub fn ui_smoke_backend() -> Backend {
     };
     let mut snapshot = initial_snapshot(&settings, &"0".repeat(64));
     snapshot.message =
-        "UI smoke test: no keys, settings, startup entries, or network sockets are created.".into();
+        "Approve your home network, then pair your other PC to start syncing.".into();
+    if scenario != "offline" {
+        let network = Network::from_parts(
+            "192.168.10.20".parse()?,
+            24,
+            "192.168.10.1".parse()?,
+            "02-AA-BB-CC-DD-EE",
+            "Wi-Fi".into(),
+        )?;
+        snapshot.settings.network = Some(network.fingerprint.clone());
+        snapshot.network = Some(network);
+        snapshot.settings.save_file = Some(PathBuf::from(
+            r"C:\Games\Dusklight\Card A\01-GZ2E-zeldaTp.dat.gci",
+        ));
+        snapshot.settings.game_exe = Some(PathBuf::from(r"C:\Games\Dusklight\dusklight.exe"));
+        snapshot.settings.texture_profile =
+            Some(PathBuf::from(r"C:\Users\Player\AppData\Roaming\Dusklight"));
+        snapshot.selected_release = Some("v2.0.3".into());
+        snapshot.local_hash = Some("a".repeat(64));
+        snapshot.history.stats.commits = 12;
+        snapshot.history.stats.blocks = 24;
+        snapshot.history.stats.stored_bytes = 104_256;
+        snapshot.history.stats.logical_bytes = 12 * files::SAVE_SIZE as u64;
+        for sequence in (10..=12).rev() {
+            snapshot.history.entries.push(history::Entry {
+                id: format!("{sequence:064x}"),
+                sequence,
+                parent: Some(format!("{:064x}", sequence - 1)),
+                game: "GZ2E".into(),
+                name: "Adventure".into(),
+                hash: if sequence == 12 {
+                    "a".repeat(64)
+                } else {
+                    format!("{sequence:064x}")
+                },
+                timestamp: format!("2026-10-20T14:{sequence:02}:00Z"),
+                username: "Player".into(),
+                reason: history::Reason::Observed,
+                restored_from: None,
+            });
+        }
+        snapshot.textures.packs.push(Pack {
+            id: "c".repeat(64),
+            source: "tp-definitive-edition-plus".into(),
+            version: "1.2.0".into(),
+            imported: "2026-10-20T12:00:00Z".into(),
+            files: 4200,
+            bytes: 512 * 1024 * 1024,
+            skipped: 2,
+        });
+        snapshot.textures.active = Some("c".repeat(64));
+        if matches!(scenario, "ready" | "attention") {
+            snapshot.settings.peer = Some(Peer {
+                name: "Legion Go".into(),
+                public_key: "b".repeat(64),
+            });
+            snapshot.peer_name = Some("Legion Go".into());
+            snapshot.ready = true;
+            snapshot.remote_hash = snapshot.local_hash.clone();
+            snapshot.message = "Save copies match. Protected play is available.".into();
+        } else if scenario == "pairing" {
+            snapshot.peer_name = Some("Legion Go".into());
+            snapshot.comparison_code = Some("1234 5678".into());
+            snapshot.pairing_open = true;
+            snapshot.remote_approved = true;
+        } else if scenario == "connecting" {
+            snapshot.connecting = true;
+            snapshot.pairing_open = true;
+        }
+        if scenario == "attention" {
+            snapshot.pending_save = true;
+            snapshot.error =
+                Some("Preview: the two save copies differ. Choose which copy to keep.".into());
+        }
+    }
     let view = Arc::new(Mutex::new(snapshot));
     let (sender, receiver) = bounded(16);
     let worker_view = view.clone();
@@ -408,7 +490,7 @@ pub fn ui_smoke_backend() -> Backend {
             Err(error) => eprintln!("UI smoke state failure: {error}"),
         }
     });
-    Backend { sender, view }
+    Ok(Backend { sender, view })
 }
 
 fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
@@ -422,6 +504,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         local_approved: false,
         remote_approved: false,
         ready: false,
+        connecting: false,
         pairing_open: false,
         local_hash: None,
         remote_hash: None,
@@ -3240,6 +3323,7 @@ impl Engine {
             local_approved: link.is_some_and(|l| l.local_approved),
             remote_approved: link.is_some_and(|l| l.remote_approved),
             ready: self.ready(),
+            connecting: self.connecting.load(Ordering::Acquire),
             pairing_open: self.pairing_open(),
             local_hash: self.local_hash.clone(),
             remote_hash: self.remote.as_ref().and_then(|r| r.hash.clone()),

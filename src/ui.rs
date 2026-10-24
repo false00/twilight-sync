@@ -8,17 +8,14 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
 
-const BACKGROUND: Color32 = Color32::from_rgb(17, 18, 29);
-const PANEL: Color32 = Color32::from_rgb(27, 28, 44);
-const GOLD: Color32 = Color32::from_rgb(240, 199, 117);
-const TEAL: Color32 = Color32::from_rgb(115, 219, 196);
-const MUTED: Color32 = Color32::from_rgb(156, 159, 182);
-const RED: Color32 = Color32::from_rgb(255, 145, 153);
 const WINDOW_TITLE: &str = "Twilight Sync";
 
 mod background;
+mod design;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+use design::{Appearance, AppearanceStore, Palette, semibold, symbol};
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Overview,
     Devices,
@@ -26,6 +23,57 @@ enum Page {
     Textures,
     History,
     Security,
+}
+
+impl Page {
+    const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Devices,
+        Self::Library,
+        Self::Textures,
+        Self::History,
+        Self::Security,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Home",
+            Self::Devices => "Devices",
+            Self::Library => "Dusklight",
+            Self::Textures => "Texture packs",
+            Self::History => "Save history",
+            Self::Security => "Settings",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Overview => "Your connection, save files, and protected play.",
+            Self::Devices => "Approve your network and pair one trusted device.",
+            Self::Library => "Install the game, manage updates, and select your own disc image.",
+            Self::Textures => "Import authorized texture packs and choose the active version.",
+            Self::History => "Browse snapshots and safely restore an earlier save.",
+            Self::Security => "Appearance, startup, application updates, and privacy.",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Overview => "\u{e80f}",
+            Self::Devices => "\u{e772}",
+            Self::Library => "\u{e7fc}",
+            Self::Textures => "\u{e91b}",
+            Self::History => "\u{e81c}",
+            Self::Security => "\u{e713}",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Tone {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Clone)]
@@ -53,6 +101,8 @@ struct Dashboard {
     texture_source: String,
     texture_version: String,
     texture_permission: bool,
+    appearance: AppearanceStore,
+    shown_pairing_code: Option<String>,
 }
 
 fn icon_pixels() -> Vec<u8> {
@@ -121,7 +171,15 @@ fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
 }
 
 pub fn run(backend: Backend, background: bool) -> Result<()> {
-    run_page(backend, background, Page::Overview, WINDOW_TITLE)
+    let appearance = AppearanceStore::load(&crate::config::root_directory()?)?;
+    run_page(
+        backend,
+        background,
+        Page::Overview,
+        WINDOW_TITLE,
+        appearance,
+        1.0,
+    )
 }
 
 pub fn open_dusklight_controls() -> Result<bool> {
@@ -129,7 +187,13 @@ pub fn open_dusklight_controls() -> Result<bool> {
 }
 
 #[cfg(debug_assertions)]
-pub fn run_smoke(backend: Backend, background: bool, page: &str) -> Result<()> {
+pub fn run_smoke(
+    backend: Backend,
+    background: bool,
+    page: &str,
+    theme: &str,
+    scale: f32,
+) -> Result<()> {
     let page = match page {
         "overview" => Page::Overview,
         "devices" => Page::Devices,
@@ -139,16 +203,34 @@ pub fn run_smoke(backend: Backend, background: bool, page: &str) -> Result<()> {
         "security" => Page::Security,
         _ => anyhow::bail!("Unknown UI smoke page"),
     };
-    run_page(backend, background, page, "Twilight Sync - UI smoke")
+    anyhow::ensure!(
+        scale.is_finite() && (0.75..=2.0).contains(&scale),
+        "UI smoke scale must be between 0.75 and 2"
+    );
+    run_page(
+        backend,
+        background,
+        page,
+        "Twilight Sync - UI smoke",
+        AppearanceStore::preview(Appearance::parse(theme)?),
+        scale,
+    )
 }
 
-fn run_page(backend: Backend, background: bool, initial_page: Page, title: &str) -> Result<()> {
+fn run_page(
+    backend: Backend,
+    background: bool,
+    initial_page: Page,
+    title: &str,
+    appearance: AppearanceStore,
+    scale: f32,
+) -> Result<()> {
     let snapshot = backend.snapshot()?;
     let tray = make_tray(snapshot.settings.startup, snapshot.self_updates.enabled)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1060.0, 780.0])
-            .with_min_inner_size([860.0, 640.0])
+            .with_inner_size([1080.0, 760.0])
+            .with_min_inner_size([640.0, 460.0])
             .with_visible(!background)
             .with_icon(Arc::new(egui::IconData {
                 rgba: icon_pixels(),
@@ -165,25 +247,9 @@ fn run_page(backend: Backend, background: bool, initial_page: Page, title: &str)
                 return Err("The dashboard requires a Win32 window".into());
             };
             let window = window.hwnd;
-            let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = BACKGROUND;
-            visuals.window_fill = PANEL;
-            visuals.extreme_bg_color = Color32::from_rgb(12, 13, 22);
-            visuals.override_text_color = Some(Color32::from_rgb(234, 235, 245));
-            visuals.selection.bg_fill = Color32::from_rgb(68, 87, 91);
-            visuals.widgets.inactive.bg_fill = Color32::from_rgb(46, 47, 68);
-            visuals.widgets.hovered.bg_fill = Color32::from_rgb(68, 66, 88);
-            context.egui_ctx.set_visuals(visuals);
-            context.egui_ctx.style_mut(|style| {
-                style.spacing.item_spacing = Vec2::new(12.0, 10.0);
-                style.spacing.button_padding = Vec2::new(16.0, 10.0);
-                style
-                    .text_styles
-                    .insert(egui::TextStyle::Heading, egui::FontId::proportional(26.0));
-                style
-                    .text_styles
-                    .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-            });
+            design::install(&context.egui_ctx)?;
+            appearance.appearance.apply(&context.egui_ctx);
+            context.egui_ctx.set_zoom_factor(scale);
             let (events_sender, events) = crossbeam_channel::bounded(32);
             let menu_context = context.egui_ctx.clone();
             MenuEvent::set_event_handler(Some(move |event| {
@@ -217,6 +283,8 @@ fn run_page(backend: Backend, background: bool, initial_page: Page, title: &str)
                 texture_source: "henriko-4k".into(),
                 texture_version: format!("Imported {}", time::OffsetDateTime::now_utc().date()),
                 texture_permission: false,
+                appearance,
+                shown_pairing_code: None,
             }))
         }),
     )
@@ -281,18 +349,29 @@ impl Dashboard {
     }
 
     fn app_updates(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let p = Palette::of(ui);
         Self::card(ui, |ui| {
-            ui.label(RichText::new("Twilight Sync updates").strong().size(18.0));
-            ui.label(format!("Current app: v{}", env!("CARGO_PKG_VERSION")));
-            ui.label(&snapshot.self_updates.message);
+            Self::section_title(ui, "Twilight Sync updates");
+            Self::status(
+                ui,
+                "Installed",
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                p.text,
+            );
+            Self::secondary(ui, &snapshot.self_updates.message);
             if let Some(error) = &snapshot.self_updates.error {
-                ui.label(RichText::new(error).color(GOLD));
+                Self::notice(ui, Tone::Warning, "Update check needs attention", error);
             }
             if let Some(release) = &snapshot.self_updates.latest {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        RichText::new(format!("Published release: {}", release.tag))
-                            .color(if release.update_available { GOLD } else { TEAL }),
+                        RichText::new(format!("Latest release: {}", release.tag)).color(
+                            if release.update_available {
+                                p.accent
+                            } else {
+                                p.success
+                            },
+                        ),
                     );
                     ui.hyperlink_to("Release notes", &release.notes_url);
                 });
@@ -301,7 +380,7 @@ impl Dashboard {
                 ui.label(
                     RichText::new(format!("Last check: {checked}"))
                         .small()
-                        .color(MUTED),
+                        .color(p.secondary),
                 );
             }
             let mut enabled = snapshot.self_updates.enabled;
@@ -310,58 +389,57 @@ impl Dashboard {
                     !snapshot.self_updates.preparing,
                     egui::Checkbox::new(
                         &mut enabled,
-                        "Automatically check GitHub at startup and every six hours",
+                        "Check automatically at startup and every six hours",
                     ),
                 )
                 .changed()
             {
                 self.dispatch(Command::SetAutoUpdateChecks(enabled));
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if snapshot.self_updates.checking || snapshot.self_updates.preparing {
+                    ui.spinner();
+                }
                 if ui
                     .add_enabled(
                         !snapshot.self_updates.checking && !snapshot.self_updates.preparing,
-                        egui::Button::new("Check app updates now"),
+                        egui::Button::new("Check for updates"),
                     )
                     .clicked()
                 {
                     self.dispatch(Command::CheckSelfUpdate);
                 }
-                let safe = !snapshot.game_running
-                    && !snapshot.remote_game
-                    && snapshot.settings.play_lock.is_none()
-                    && !snapshot.texture_busy
-                    && !snapshot.install_busy
-                    && !snapshot.self_updates.preparing
-                    && !snapshot.self_updates.checking;
-                if ui
-                    .add_enabled(
-                        safe && snapshot.self_updates.available(),
-                        egui::Button::new("Update Twilight Sync..."),
-                    )
-                    .clicked()
+                let safe = Self::management_available(snapshot) && !snapshot.self_updates.checking;
+                if Self::primary(
+                    ui,
+                    safe && snapshot.self_updates.available(),
+                    "Update Twilight Sync...",
+                )
+                .clicked()
                 {
                     self.confirm_app_update();
                 }
             });
-            ui.label(RichText::new("Only version metadata is checked automatically. Downloading and restarting require a confirmation. This is separate from the Dusklight game updater.").small().color(MUTED));
+            Self::secondary(
+                ui,
+                "Automatic checks only read version metadata. Downloading and restarting always require confirmation.",
+            );
         });
     }
 
-    fn header(ui: &mut egui::Ui, eyebrow: &str, title: &str, description: &str) {
-        ui.label(RichText::new(eyebrow).color(GOLD).size(11.0).strong());
-        ui.add_space(4.0);
-        ui.heading(title);
-        ui.label(RichText::new(description).color(MUTED));
-        ui.add_space(16.0);
+    fn header(ui: &mut egui::Ui, page: Page) {
+        ui.heading(page.title());
+        ui.label(RichText::new(page.description()).color(Palette::of(ui).secondary));
+        ui.add_space(12.0);
     }
 
     fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+        let colors = Palette::of(ui);
         egui::Frame::new()
-            .fill(PANEL)
-            .corner_radius(14.0)
-            .inner_margin(20.0)
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(47, 48, 67)))
+            .fill(colors.surface)
+            .corner_radius(6.0)
+            .inner_margin(16.0)
+            .stroke(Stroke::new(1.0_f32, colors.border))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 content(ui);
@@ -369,220 +447,461 @@ impl Dashboard {
     }
 
     fn status(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(label).color(MUTED));
-            ui.label(RichText::new(value).color(color).strong());
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 18.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(label).color(Palette::of(ui).secondary));
+                ui.label(RichText::new(value).color(color).strong());
+            });
         });
+    }
+
+    fn section_title(ui: &mut egui::Ui, title: &str) {
+        ui.label(RichText::new(title).font(semibold(17.0)));
+    }
+
+    fn secondary(ui: &mut egui::Ui, text: impl Into<String>) {
+        ui.label(RichText::new(text).color(Palette::of(ui).secondary));
+    }
+
+    fn notice(ui: &mut egui::Ui, tone: Tone, title: &str, body: &str) {
+        let p = Palette::of(ui);
+        let (foreground, background, glyph) = match tone {
+            Tone::Info => (p.accent, p.info_background, "\u{e946}"),
+            Tone::Warning => (p.warning, p.warning_background, "\u{e7ba}"),
+            Tone::Error => (p.error, p.error_background, "\u{ea39}"),
+        };
+        egui::Frame::new()
+            .fill(background)
+            .corner_radius(4)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    ui.label(symbol(glyph, 18.0).color(foreground));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(title).font(semibold(14.0)).color(foreground));
+                        if !body.is_empty() {
+                            ui.label(RichText::new(body).color(p.text));
+                        }
+                    });
+                });
+            });
+    }
+
+    fn primary(ui: &mut egui::Ui, enabled: bool, title: &str) -> egui::Response {
+        let p = Palette::of(ui);
+        ui.scope(|ui| {
+            ui.visuals_mut().disabled_alpha = 1.0;
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(RichText::new(title).color(if enabled {
+                    p.on_accent
+                } else {
+                    p.secondary
+                }))
+                .fill(if enabled { p.accent } else { p.disabled })
+                .stroke(Stroke::new(1.0, if enabled { p.accent } else { p.border })),
+            )
+        })
+        .inner
+    }
+
+    fn path(ui: &mut egui::Ui, path: &std::path::Path) {
+        let text = path.display().to_string();
+        let width = ui.available_width();
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new((width - 42.0).max(40.0), 30.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&text)
+                                .monospace()
+                                .color(Palette::of(ui).secondary),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&text);
+                },
+            );
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = Vec2::splat(5.0);
+                if ui
+                    .add_sized([30.0, 30.0], egui::Button::new(symbol("\u{e8c8}", 14.0)))
+                    .on_hover_text("Copy path")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(text.clone());
+                }
+            });
+        });
+    }
+
+    fn management_available(snapshot: &Snapshot) -> bool {
+        !snapshot.game_running
+            && !snapshot.remote_game
+            && snapshot.settings.play_lock.is_none()
+            && !snapshot.install_busy
+            && !snapshot.texture_busy
+            && !snapshot.self_updates.preparing
+    }
+
+    fn can_launch(snapshot: &Snapshot) -> bool {
+        snapshot.ready
+            && Self::management_available(snapshot)
+            && !snapshot.textures.recovery_needed
+            && snapshot.settings.save_file.is_some()
+            && snapshot.settings.game_exe.is_some()
+            && !snapshot.pending_save
+            && !snapshot.pending_iso
+            && !snapshot.pending_recovery
+            && snapshot.transfer.is_empty()
+    }
+
+    fn setting_row(
+        ui: &mut egui::Ui,
+        title: &str,
+        description: &str,
+        controls: impl FnOnce(&mut egui::Ui),
+    ) {
+        let width = ui.available_width();
+        if width >= 520.0 {
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new((width - 240.0).max(260.0), 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.label(RichText::new(title).font(semibold(14.0)));
+                        Self::secondary(ui, description);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(220.0, 34.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    controls,
+                );
+            });
+        } else {
+            ui.label(RichText::new(title).font(semibold(14.0)));
+            Self::secondary(ui, description);
+            ui.horizontal_wrapped(controls);
+        }
+    }
+
+    fn choose_save(&mut self, destination: bool) {
+        let dialog = rfd::FileDialog::new().add_filter("Dusklight GCI save", &["gci"]);
+        let selected = if destination {
+            dialog.set_file_name("01-GZ2E-zeldaTp.dat.gci").save_file()
+        } else {
+            dialog.pick_file()
+        };
+        if let Some(path) = selected {
+            self.dispatch(Command::SetSave(path));
+        }
     }
 
     fn overview(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "YOUR ADVENTURE, IN STEP",
-            "A quiet guardian for your saves.",
-            "One local network. Two trusted devices. One adventure at a time.",
-        );
+        let p = Palette::of(ui);
         Self::card(ui, |ui| {
             let (label, color) = if snapshot.game_running {
-                ("Playing on this device", GOLD)
+                ("Dusklight is running on this PC", p.warning)
             } else if snapshot.remote_game {
-                ("Playing on your partner", GOLD)
+                ("Your partner is playing", p.warning)
             } else if snapshot.ready {
-                ("Secure partner connected", TEAL)
+                ("Connected securely", p.success)
+            } else if snapshot.settings.peer.is_some() {
+                ("Waiting for your paired device", p.secondary)
             } else {
-                ("Waiting for your partner", MUTED)
+                ("Connect your other PC", p.text)
             };
-            ui.label(RichText::new(label).size(22.0).color(color).strong());
-            ui.add_space(6.0);
-            ui.label(&snapshot.message);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(symbol("\u{e968}", 22.0).color(color));
+                ui.label(RichText::new(label).font(semibold(20.0)).color(color));
+            });
+            if let Some(peer) = &snapshot.settings.peer {
+                Self::secondary(ui, format!("Partner: {}", peer.name));
+            }
+            Self::secondary(ui, &snapshot.message);
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if snapshot.ready {
+                    if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
+                        self.dispatch(Command::Launch);
+                    }
+                    if ui.button("Send this save").clicked() {
+                        self.dispatch(Command::SendSave);
+                    }
+                    if ui.button("Connection details").clicked() {
+                        self.page = Page::Devices;
+                    }
+                } else {
+                    if Self::primary(ui, true, "Set up connection").clicked() {
+                        self.page = Page::Devices;
+                    }
+                    if snapshot.settings.game_exe.is_none()
+                        && ui.button("Set up Dusklight").clicked()
+                    {
+                        self.page = Page::Library;
+                    }
+                }
+            });
+            if !snapshot.ready {
+                Self::secondary(ui, "Protected play needs both paired managers online.");
+            } else if snapshot.settings.game_exe.is_none() {
+                Self::secondary(
+                    ui,
+                    "Select or install Dusklight on the Dusklight page before playing.",
+                );
+            } else if snapshot.settings.save_file.is_none() {
+                Self::secondary(ui, "Choose your save file or a receive destination below.");
+            }
+            if snapshot.ready && snapshot.settings.play_lock.is_none() {
+                Self::secondary(ui, "Protected launch allows one game session at a time.");
+            }
+        });
+
+        let network_approved = snapshot.network.as_ref().is_some_and(|network| {
+            snapshot.settings.network.as_deref() == Some(network.fingerprint.as_str())
+        });
+        if !network_approved
+            || snapshot.settings.peer.is_none()
+            || snapshot.settings.game_exe.is_none()
+        {
+            ui.add_space(12.0);
+            Self::card(ui, |ui| {
+                Self::section_title(ui, "Finish setup");
+                if !network_approved {
+                    Self::setting_row(
+                        ui,
+                        "Approve your home network",
+                        "Check the router on each PC before enabling discovery.",
+                        |ui| {
+                            if ui.button("Open devices").clicked() {
+                                self.page = Page::Devices;
+                            }
+                        },
+                    );
+                }
+                if snapshot.settings.peer.is_none() {
+                    if !network_approved {
+                        ui.separator();
+                    }
+                    Self::setting_row(
+                        ui,
+                        "Pair your other PC",
+                        "Open pairing on both. Compare codes from only one device.",
+                        |ui| {
+                            if ui.button("Pair a device").clicked() {
+                                self.page = Page::Devices;
+                            }
+                        },
+                    );
+                }
+                if snapshot.settings.game_exe.is_none() {
+                    ui.separator();
+                    Self::setting_row(
+                        ui,
+                        "Locate or install Dusklight",
+                        "Use your own game and disc image. Nothing launches automatically.",
+                        |ui| {
+                            if ui.button("Open Dusklight").clicked() {
+                                self.page = Page::Library;
+                            }
+                        },
+                    );
+                }
+            });
+        }
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Save file");
+            let matching =
+                snapshot.local_hash.is_some() && snapshot.local_hash == snapshot.remote_hash;
+            let (state, color) = if matching {
+                ("Both copies match", p.success)
+            } else if snapshot.local_hash.is_some() && snapshot.remote_hash.is_some() {
+                ("Different copies - approval may be required", p.warning)
+            } else if snapshot.local_hash.is_some() {
+                ("Local save is ready", p.success)
+            } else if snapshot.settings.save_file.is_some() {
+                ("Waiting for a valid, stable save", p.secondary)
+            } else {
+                ("No save selected", p.secondary)
+            };
+            Self::status(ui, "Status", state, color);
+            if let Some(path) = &snapshot.settings.save_file {
+                Self::path(ui, path);
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
-                        snapshot.ready
-                            && !snapshot.game_running
-                            && !snapshot.remote_game
-                            && !snapshot.install_busy
-                            && !snapshot.texture_busy
-                            && !snapshot.textures.recovery_needed
-                            && !snapshot.self_updates.preparing,
-                        egui::Button::new(RichText::new("Play Dusklight").color(BACKGROUND))
-                            .fill(GOLD),
+                        Self::management_available(snapshot),
+                        egui::Button::new("Choose save file..."),
                     )
                     .clicked()
                 {
-                    self.dispatch(Command::Launch);
+                    self.choose_save(false);
                 }
                 if ui
-                    .add_enabled(snapshot.ready, egui::Button::new("Send this save"))
+                    .add_enabled(
+                        Self::management_available(snapshot),
+                        egui::Button::new("Set receive destination..."),
+                    )
                     .clicked()
                 {
-                    self.dispatch(Command::SendSave);
+                    self.choose_save(true);
+                }
+                if ui.button("View history").clicked() {
+                    self.page = Page::History;
+                }
+            });
+            Self::secondary(
+                ui,
+                "Use Dusklight's actual Card A .gci file. A PC without a save needs a receive destination.",
+            );
+            ui.collapsing("Save details", |ui| {
+                if let Some(hash) = &snapshot.local_hash {
+                    ui.label(RichText::new(format!("Local SHA-256: {hash}")).monospace());
+                }
+                if let Some(hash) = &snapshot.remote_hash {
+                    ui.label(RichText::new(format!("Partner SHA-256: {hash}")).monospace());
                 }
             });
         });
-        ui.add_space(14.0);
-        Self::card(ui, |ui| {
-            ui.label(RichText::new("The latest chapter").strong().size(18.0));
-            ui.add_space(6.0);
-            let matching =
-                snapshot.local_hash.is_some() && snapshot.local_hash == snapshot.remote_hash;
-            Self::status(
-                ui,
-                "Save state",
-                if matching {
-                    "Matching, verified copies"
-                } else if snapshot.local_hash.is_some() && snapshot.remote_hash.is_some() {
-                    "Different copies - sync or resolve a conflict"
-                } else {
-                    "Select a GCI save on both devices"
-                },
-                if matching { TEAL } else { GOLD },
-            );
-            if let Some(path) = &snapshot.settings.save_file {
-                ui.monospace(path.display().to_string());
-            }
-            if let Some(hash) = &snapshot.local_hash {
-                ui.label(
-                    RichText::new(format!("SHA-256  {hash}"))
-                        .monospace()
-                        .size(11.0)
-                        .color(MUTED),
+        if snapshot.settings.play_lock.is_some() {
+            ui.add_space(12.0);
+            Self::card(ui, |ui| {
+                Self::setting_row(
+                    ui,
+                    "Protected play lock is held",
+                    "Disconnecting does not release it. Reconnect both PCs and stop both games before recovery.",
+                    |ui| {
+                        if ui
+                            .add_enabled(
+                                snapshot.ready && !snapshot.game_running && !snapshot.remote_game,
+                                egui::Button::new("Request recovery"),
+                            )
+                            .clicked()
+                        {
+                            self.dispatch(Command::Recover);
+                        }
+                    },
                 );
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Choose existing save").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Dusklight GCI save", &["gci"])
-                        .pick_file()
-                {
-                    self.dispatch(Command::SetSave(path));
-                }
-                if ui.button("Set receive destination").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Dusklight GCI save", &["gci"])
-                        .set_file_name("01-GZ2E-zeldaTp.dat.gci")
-                        .save_file()
-                {
-                    self.dispatch(Command::SetSave(path));
-                }
             });
-            ui.label(RichText::new("Select Dusklight's actual Card A GCI, not an export, raw memory card, or mod archive.").small().color(MUTED));
-        });
-        ui.add_space(14.0);
-        Self::card(ui, |ui| {
-            ui.label(RichText::new("Exclusive play").strong().size(18.0));
-            let held = snapshot.settings.play_lock.is_some();
-            Self::status(
-                ui,
-                "Durable lock",
-                if held {
-                    "Held - never expires on disconnect"
-                } else {
-                    "Available when both devices are online"
-                },
-                if held { GOLD } else { TEAL },
-            );
-            ui.label(RichText::new("Launch through this manager. Outside launches are detected, never forcibly terminated.").color(MUTED));
-            if held
-                && ui
-                    .button("Request crash recovery on both devices")
-                    .clicked()
-            {
-                self.dispatch(Command::Recover);
-            }
-        });
+        }
     }
 
     fn devices(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "A HANDSHAKE, NOT A LEAP OF FAITH",
-            "Meet your other device.",
-            "Discovery is only a hint. Trust begins when both people confirm the same code.",
-        );
-        Self::card(ui, |ui| {
-            ui.label(RichText::new("Your local network").strong().size(18.0));
-            if let Some(network) = &snapshot.network {
-                ui.label(format!(
-                    "{}  |  {} / {}",
-                    network.adapter, network.address, network.prefix
-                ));
-                ui.label(format!(
-                    "Router {}  |  {}",
-                    network.gateway, network.router_mac
-                ));
-                ui.label(
-                    RichText::new(&network.fingerprint)
-                        .monospace()
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                let trusted = snapshot.settings.network.as_deref() == Some(&network.fingerprint);
-                if trusted {
-                    ui.label(RichText::new("Router fingerprint approved").color(TEAL));
-                } else if ui
-                    .button("I recognize this private router - approve network")
-                    .clicked()
-                {
-                    self.dispatch(Command::TrustNetwork);
-                }
-            } else {
-                ui.label("No verifiable private LAN. Use a physical adapter and set your Windows network profile to Private.");
-            }
+        let p = Palette::of(ui);
+        let trusted = snapshot.network.as_ref().is_some_and(|network| {
+            snapshot.settings.network.as_deref() == Some(network.fingerprint.as_str())
         });
-        ui.add_space(14.0);
+        if snapshot.comparison_code.is_none() {
+            Self::card(ui, |ui| {
+                Self::section_title(ui, "Current network");
+                if let Some(network) = &snapshot.network {
+                    Self::status(
+                        ui,
+                        "Adapter",
+                        &format!("{} ({})", network.adapter, network.address),
+                        p.text,
+                    );
+                    Self::status(ui, "Router", &network.gateway.to_string(), p.text);
+                    Self::status(ui, "Router MAC", &network.router_mac, p.text);
+                    if trusted {
+                        ui.label(RichText::new("Approved for local discovery").color(p.success));
+                    } else {
+                        Self::secondary(
+                            ui,
+                            "Check that this is your private home router on both PCs.",
+                        );
+                        if Self::primary(
+                            ui,
+                            Self::management_available(snapshot),
+                            "Approve this network",
+                        )
+                        .clicked()
+                        {
+                            self.dispatch(Command::TrustNetwork);
+                        }
+                    }
+                    ui.collapsing("Network fingerprint", |ui| {
+                        ui.label(RichText::new(&network.fingerprint).monospace());
+                        Self::secondary(
+                            ui,
+                            format!("Direct subnet: {} / {}", network.address, network.prefix),
+                        );
+                        Self::secondary(
+                            ui,
+                            "A router fingerprint is a network check, not device authentication.",
+                        );
+                    });
+                } else {
+                    Self::notice(
+                        ui,
+                        Tone::Warning,
+                        "No supported private network",
+                        "Connect through a physical network adapter and set the Windows network profile to Private. VPN-only and public interfaces are not accepted.",
+                    );
+                }
+            });
+            ui.add_space(12.0);
+        }
         if let Some(code) = &snapshot.comparison_code {
             Self::card(ui, |ui| {
-                ui.label(
-                    RichText::new("COMPARE ON BOTH SCREENS")
-                        .color(GOLD)
-                        .strong(),
-                );
-                ui.label(
+                Self::section_title(
+                    ui,
                     snapshot
                         .peer_name
                         .as_deref()
-                        .unwrap_or("Authenticating device..."),
+                        .unwrap_or("Authenticating device"),
                 );
-                ui.add_space(8.0);
+                let code_size = (ui.available_width() / 5.8).clamp(24.0, 36.0);
                 ui.label(
                     RichText::new(code)
                         .monospace()
-                        .size(46.0)
-                        .color(TEAL)
-                        .strong(),
+                        .size(code_size)
+                        .color(p.accent),
                 );
-                ui.label("Do not approve if even one digit differs. The code changes for every handshake.");
-                ui.horizontal(|ui| {
-                    Self::status(
-                        ui,
-                        "This device:",
-                        if snapshot.local_approved {
-                            "Approved"
-                        } else {
-                            "Waiting"
-                        },
-                        GOLD,
-                    );
-                    Self::status(
-                        ui,
-                        "Other device:",
-                        if snapshot.remote_approved {
-                            "Approved"
-                        } else {
-                            "Waiting"
-                        },
-                        GOLD,
-                    );
+                ui.label("Both screens must show this exact code.");
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size.y = 18.0;
+                    ui.horizontal_wrapped(|ui| {
+                        Self::status(
+                            ui,
+                            "This PC",
+                            if snapshot.local_approved {
+                                "Approved"
+                            } else {
+                                "Waiting"
+                            },
+                            if snapshot.local_approved {
+                                p.success
+                            } else {
+                                p.secondary
+                            },
+                        );
+                        Self::status(
+                            ui,
+                            "Other PC",
+                            if snapshot.remote_approved {
+                                "Approved"
+                            } else {
+                                "Waiting"
+                            },
+                            if snapshot.remote_approved {
+                                p.success
+                            } else {
+                                p.secondary
+                            },
+                        );
+                    });
                 });
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !snapshot.local_approved,
-                            egui::Button::new("Codes match - approve this device"),
-                        )
+                ui.horizontal_wrapped(|ui| {
+                    if Self::primary(ui, !snapshot.local_approved, "Codes match - approve")
                         .clicked()
                     {
                         self.dispatch(Command::ApprovePairing);
@@ -591,161 +910,203 @@ impl Dashboard {
                         self.dispatch(Command::RejectPairing);
                     }
                 });
+                ui.collapsing("Connection details", |ui| {
+                    ui.label("Reject this request if any digit differs. The code changes for each handshake.");
+                    if let Some(network) = &snapshot.network {
+                        Self::secondary(ui, format!("Router: {} / {}", network.gateway, network.router_mac));
+                        ui.label(RichText::new(&network.fingerprint).monospace());
+                    }
+                });
             });
         } else if let Some(peer) = &snapshot.settings.peer {
             Self::card(ui, |ui| {
-                ui.label(RichText::new(&peer.name).size(20.0).strong());
+                Self::section_title(ui, "Paired device");
+                ui.label(RichText::new(&peer.name).font(semibold(18.0)));
                 Self::status(
                     ui,
-                    "Trust",
+                    "Status",
                     if snapshot.ready {
-                        "Pinned identity, connected"
+                        "Connected - identity verified"
                     } else {
-                        "Pinned identity, offline"
+                        "Offline - trust is retained"
                     },
-                    TEAL,
+                    if snapshot.ready {
+                        p.success
+                    } else {
+                        p.secondary
+                    },
                 );
-                ui.label(
-                    RichText::new(&peer.public_key)
-                        .monospace()
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                if !snapshot.ready && ui.button("Connect to discovered partner").clicked() {
-                    self.dispatch(Command::Connect(peer.public_key.clone()));
-                }
-                if ui.button("Revoke this partner").clicked() {
-                    self.dispatch(Command::Unpair);
-                }
+                ui.horizontal_wrapped(|ui| {
+                    let discovered = snapshot.devices.iter().any(|device| device.key == peer.public_key);
+                    if !snapshot.ready && ui.add_enabled(
+                        trusted && discovered && !snapshot.connecting,
+                        egui::Button::new(if snapshot.connecting { "Connecting..." } else { "Reconnect" }),
+                    ).clicked() {
+                        self.dispatch(Command::Connect(peer.public_key.clone()));
+                    }
+                    if ui.add_enabled(Self::management_available(snapshot), egui::Button::new("Unpair...")).clicked() {
+                        let approved = rfd::MessageDialog::new().set_title("Unpair device")
+                            .set_description(format!("Remove trust for {}?\n\nSave files and history are kept. Pair and approve both devices again before syncing.", peer.name))
+                            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                        if approved { self.dispatch(Command::Unpair); }
+                    }
+                });
+                ui.collapsing("Verified device identity", |ui| {
+                    ui.label(RichText::new(&peer.public_key).monospace());
+                });
             });
         } else {
             Self::card(ui, |ui| {
-                ui.label(RichText::new("Nearby devices").strong().size(18.0));
-                if ui
-                    .button(if snapshot.pairing_open {
-                        "Pairing open for two minutes - reopen"
-                    } else {
-                        "Open a two-minute pairing window"
-                    })
+                Self::section_title(ui, "Pair a device");
+                Self::secondary(
+                    ui,
+                    "Open pairing on both PCs. Choose Compare codes on only ONE PC, then approve the same code on BOTH.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if Self::primary(
+                        ui,
+                        trusted && !snapshot.connecting && Self::management_available(snapshot),
+                        if snapshot.pairing_open {
+                            "Restart pairing window"
+                        } else {
+                            "Open pairing"
+                        },
+                    )
                     .clicked()
-                {
-                    self.dispatch(Command::OpenPairing);
+                    {
+                        self.dispatch(Command::OpenPairing);
+                    }
+                    if snapshot.connecting {
+                        ui.spinner();
+                        ui.label("Establishing an encrypted connection...");
+                    } else if snapshot.pairing_open {
+                        ui.label(RichText::new("Pairing window is open").color(p.accent));
+                    }
+                });
+                if !trusted {
+                    Self::secondary(ui, "Approve the current network first.");
                 }
-                ui.label("Open pairing on both devices. Choose Compare codes on ONE device, then approve matching codes on BOTH.");
+                ui.add_space(8.0);
                 if snapshot.devices.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "Open Twilight Sync on your other device and approve the same router.",
-                        )
-                        .color(MUTED),
+                    Self::notice(
+                        ui,
+                        Tone::Info,
+                        "No nearby devices yet",
+                        "Open Twilight Sync on the other PC and approve the same router. Guest Wi-Fi isolation or a firewall may block local discovery.",
                     );
                 }
                 for device in &snapshot.devices {
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&device.name).strong());
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  |  unverified announcement",
-                                    device.address.ip()
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                        });
-                        if ui
-                            .add_enabled(
-                                snapshot.pairing_open && device.pairing,
-                                egui::Button::new("Compare codes"),
-                            )
-                            .clicked()
-                        {
-                            self.dispatch(Command::Connect(device.key.clone()));
-                        }
-                    });
+                    Self::setting_row(
+                        ui,
+                        &device.name,
+                        &format!(
+                            "{} - unverified discovery announcement",
+                            device.address.ip()
+                        ),
+                        |ui| {
+                            if ui
+                                .add_enabled(
+                                    snapshot.pairing_open && device.pairing && !snapshot.connecting,
+                                    egui::Button::new("Compare codes"),
+                                )
+                                .clicked()
+                            {
+                                self.dispatch(Command::Connect(device.key.clone()));
+                            }
+                        },
+                    );
+                    if !device.pairing {
+                        Self::secondary(ui, "Open the pairing window on this device too.");
+                    }
                 }
             });
         }
     }
 
     fn library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "BRING YOUR OWN ADVENTURE",
-            "Dusklight & your disc.",
-            "Program installation and optional disc transfer are separate from the save-only channel.",
-        );
+        let p = Palette::of(ui);
+        let available = Self::management_available(snapshot);
         Self::card(ui, |ui| {
-            ui.label(
-                RichText::new("The official Dusklight release")
-                    .strong()
-                    .size(18.0),
-            );
+            Self::section_title(ui, "Game installation");
             if let Some(path) = &snapshot.settings.game_exe {
-                ui.monospace(path.display().to_string());
+                Self::path(ui, path);
             } else {
-                ui.label("No executable selected. Locate your existing copy or install the official release.");
-            }
-            if let Some(version) = &snapshot.selected_release {
-                ui.label(RichText::new(format!("Selected installation: {version}")).color(TEAL));
-            }
-            if let Some(release) = &snapshot.latest_release {
-                ui.label(format!(
-                    "Latest official release: {}  |  {:.1} MiB",
-                    release.tag,
-                    release.size as f64 / 1_048_576.0
-                ));
-                ui.label(
-                    RichText::new(format!("Published SHA-256: {}", release.sha256))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
+                Self::secondary(
+                    ui,
+                    "No game selected. Locate an existing copy or install the official Windows release.",
                 );
             }
-            ui.horizontal(|ui| {
-                if ui.button("Locate dusklight.exe").clicked()
+            if let Some(version) = &snapshot.selected_release {
+                Self::status(ui, "Installed version", version, p.success);
+            }
+            ui.horizontal_wrapped(|ui| {
+                if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
+                    self.dispatch(Command::Launch);
+                }
+                if ui
+                    .add_enabled(available, egui::Button::new("Locate dusklight.exe..."))
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Dusklight executable", &["exe"])
                         .pick_file()
                 {
                     self.dispatch(Command::SetExecutable(path));
                 }
-                if ui
-                    .add_enabled(
-                        !snapshot.install_busy
-                            && !snapshot.texture_busy
-                            && !snapshot.self_updates.preparing,
-                        egui::Button::new(if snapshot.install_busy {
-                            "Checking / verifying..."
-                        } else {
-                            "Install / update Dusklight"
-                        }),
-                    )
-                    .clicked()
-                {
+            });
+            Self::secondary(
+                ui,
+                "Protected play requires both paired managers online and an explicit save destination.",
+            );
+        });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Dusklight updates");
+            if let Some(release) = &snapshot.latest_release {
+                Self::status(ui, "Latest official release", &release.tag, p.text);
+                Self::secondary(
+                    ui,
+                    format!(
+                        "Verified download: {:.1} MiB",
+                        release.size as f64 / 1_048_576.0
+                    ),
+                );
+                ui.collapsing("Download verification", |ui| {
+                    ui.label(RichText::new(format!("SHA-256: {}", release.sha256)).monospace());
+                });
+            } else {
+                Self::secondary(ui, "Check GitHub for the latest official game release.");
+            }
+            ui.horizontal_wrapped(|ui| {
+                if snapshot.install_busy {
+                    ui.spinner();
+                    ui.label("Checking, downloading, or verifying...");
+                }
+                if Self::primary(ui, available, "Install / update Dusklight").clicked() {
                     self.dispatch(Command::Install);
                 }
                 if ui
-                    .add_enabled(
-                        !snapshot.install_busy
-                            && !snapshot.texture_busy
-                            && !snapshot.self_updates.preparing,
-                        egui::Button::new("Check latest release"),
-                    )
+                    .add_enabled(available, egui::Button::new("Check latest release"))
                     .clicked()
                 {
                     self.dispatch(Command::CheckRelease);
                 }
             });
-            ui.label(RichText::new("Updates install side-by-side and preserve your user profile, textures, saves, and old program. Existing managed files are checked before reuse. Nothing is launched automatically.").small().color(MUTED));
+            Self::secondary(
+                ui,
+                "Installs side-by-side, verifies existing managed files, and preserves your profile, saves, and textures. Nothing launches automatically.",
+            );
+            Self::secondary(
+                ui,
+                "A Dusklight desktop shortcut opens this manager's protected Play controls.",
+            );
         });
-        ui.add_space(14.0);
+        ui.add_space(12.0);
         Self::card(ui, |ui| {
-            ui.label(
-                RichText::new("Your own GameCube disc image")
-                    .strong()
-                    .size(18.0),
+            Self::section_title(ui, "Disc image (optional)");
+            Self::secondary(
+                ui,
+                "Use your own unmodified, full-size Twilight Princess GameCube .iso. Game downloads, Wii images, RVZ, and archives are not supported.",
             );
             let mut enabled = snapshot.settings.iso_enabled;
             if ui
@@ -757,12 +1118,13 @@ impl Dashboard {
             {
                 self.dispatch(Command::SetIsoEnabled(enabled));
             }
-            ui.label("Only unmodified, full-size Twilight Princess GameCube .iso images are supported. No RVZ, Wii ISO, archives, or game downloads.");
             if let Some(path) = &snapshot.settings.iso_file {
-                ui.monospace(path.display().to_string());
+                Self::path(ui, path);
             }
-            ui.horizontal(|ui| {
-                if ui.button("Choose my ISO").clicked()
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(available, egui::Button::new("Choose my ISO..."))
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Your GameCube disc dump", &["iso"])
                         .pick_file()
@@ -771,7 +1133,7 @@ impl Dashboard {
                 }
                 if ui
                     .add_enabled(
-                        snapshot.ready && snapshot.settings.iso_enabled,
+                        snapshot.ready && snapshot.settings.iso_enabled && available,
                         egui::Button::new("Offer verified ISO to partner"),
                     )
                     .clicked()
@@ -779,7 +1141,10 @@ impl Dashboard {
                     self.dispatch(Command::SendIso);
                 }
             });
-            ui.label(RichText::new("The receiver must separately opt in and approve every transfer. Existing ISOs are never overwritten.").small().color(MUTED));
+            Self::secondary(
+                ui,
+                "The receiver must opt in and approve each transfer. Existing disc images are never overwritten.",
+            );
         });
     }
 
@@ -808,28 +1173,25 @@ impl Dashboard {
     }
 
     fn textures(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "A FAMILIAR WORLD, A FRESH COAT OF LIGHT",
-            "Texture library.",
-            "Creator-supported downloads. Per-user installs. One complete pack at a time.",
-        );
-        let busy =
-            snapshot.texture_busy || snapshot.install_busy || snapshot.self_updates.preparing;
+        let p = Palette::of(ui);
+        let available = Self::management_available(snapshot);
         if !snapshot.textures.notice.is_empty() {
-            ui.label(RichText::new(&snapshot.textures.notice).color(GOLD));
-            ui.add_space(8.0);
+            Self::notice(ui, Tone::Info, "Texture library", &snapshot.textures.notice);
+            ui.add_space(12.0);
         }
         Self::card(ui, |ui| {
-            ui.label(RichText::new("Your Dusklight profile").strong().size(18.0));
+            Self::section_title(ui, "Dusklight profile");
             if let Some(path) = &snapshot.settings.texture_profile {
-                ui.monospace(path.display().to_string());
+                Self::path(ui, path);
             } else {
-                ui.label("Select the actual Dusklight config.json, not the executable's folder. Start Dusklight once if its user profile does not exist yet.");
+                Self::secondary(
+                    ui,
+                    "Choose the game's actual config.json. Start Dusklight once if its user profile does not exist yet.",
+                );
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Choose Dusklight config.json"))
+                    .add_enabled(available, egui::Button::new("Choose config.json..."))
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Dusklight config.json", &["json"])
@@ -841,6 +1203,9 @@ impl Dashboard {
                     {
                         if let Some(parent) = path.parent() {
                             self.dispatch(Command::SetTextureProfile(parent.into()));
+                        } else {
+                            self.local_error =
+                                Some("The profile file has no parent folder.".into());
                         }
                     } else {
                         self.local_error =
@@ -848,18 +1213,26 @@ impl Dashboard {
                     }
                 }
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Refresh library"))
+                    .add_enabled(available, egui::Button::new("Refresh library"))
                     .clicked()
                 {
                     self.dispatch(Command::RefreshTextures);
                 }
             });
-            ui.label(RichText::new("Switches update texture_replacements and the real game.enableTextureReplacements setting while both games are stopped. No live injection or restart is forced.").small().color(MUTED));
+            Self::secondary(
+                ui,
+                "Pack changes apply to the next launch. Both games must be stopped; no game is forcibly restarted.",
+            );
             if snapshot.textures.recovery_needed {
-                ui.label(RichText::new("An interrupted switch needs recovery before this device can launch Dusklight.").color(RED));
+                Self::notice(
+                    ui,
+                    Tone::Error,
+                    "Texture recovery required",
+                    "An interrupted switch must be recovered before protected play.",
+                );
                 if ui
                     .add_enabled(
-                        !busy,
+                        available,
                         egui::Button::new("Recover interrupted texture switch"),
                     )
                     .clicked()
@@ -868,129 +1241,73 @@ impl Dashboard {
                 }
             }
         });
-        ui.add_space(14.0);
-        for project in crate::textures::CATALOG {
-            Self::card(ui, |ui| {
-                ui.label(RichText::new(project.name).strong().size(18.0));
-                ui.label(project.description);
-                ui.horizontal(|ui| {
-                    if project.creator_url.is_some()
-                        && ui.button("Get latest / updates from creator").clicked()
-                    {
-                        self.dispatch(Command::OpenTextureCreator(project.id.into()));
-                    }
-                    if ui
-                        .selectable_label(self.texture_source == project.id, "Select for import")
-                        .clicked()
-                    {
-                        self.texture_source = project.id.into();
-                        self.texture_version = project.suggested_version.map_or_else(
-                            || format!("Imported {}", time::OffsetDateTime::now_utc().date()),
-                            str::to_owned,
-                        );
-                    }
-                });
-            });
-            ui.add_space(10.0);
-        }
+        ui.add_space(12.0);
         Self::card(ui, |ui| {
-            ui.label(
-                RichText::new("Install a downloaded pack or update")
-                    .strong()
-                    .size(18.0),
-            );
-            ui.label(format!("Project: {}", self.texture_source));
-            ui.horizontal(|ui| {
-                ui.label("Version label");
-                ui.text_edit_singleline(&mut self.texture_version);
-            });
-            ui.checkbox(
-                &mut self.texture_permission,
-                "I have permission to use these assets",
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !busy && self.texture_permission,
-                        egui::Button::new("Install ZIP"),
-                    )
-                    .clicked()
-                {
-                    self.import_texture(false);
-                }
-                if ui
-                    .add_enabled(
-                        !busy && self.texture_permission,
-                        egui::Button::new("Install extracted GZ2 folder"),
-                    )
-                    .clicked()
-                {
-                    self.import_texture(true);
-                }
-            });
-            ui.label(RichText::new("For 7z/RAR, extract with your own archive utility first. Import only one resolution/variant. Only validated tex1_ PNG/DDS images are installed; bundled emulators, scripts, and installers are skipped.").small().color(MUTED));
-            ui.label(RichText::new("Creator pages may require your own account or browser download. Twilight Sync does not scrape logins, bypass access controls, or mirror paid packs.").small().color(MUTED));
-        });
-        ui.add_space(14.0);
-        Self::card(ui, |ui| {
-            ui.label(RichText::new("Installed versions").strong().size(18.0));
+            Self::section_title(ui, "Installed packs");
             if snapshot.textures.packs.is_empty() {
-                ui.label(RichText::new("No managed texture packs yet.").color(MUTED));
+                Self::secondary(
+                    ui,
+                    "No packs installed. Import an authorized download below.",
+                );
             }
             for pack in &snapshot.textures.packs {
                 ui.separator();
                 let active = snapshot.textures.active.as_deref() == Some(&pack.id);
-                ui.label(
-                    RichText::new(format!("{}  /  {}", pack.source, pack.version))
-                        .color(if active { TEAL } else { Color32::WHITE })
-                        .strong(),
+                let name = crate::textures::CATALOG
+                    .iter()
+                    .find(|project| project.id == pack.source)
+                    .map_or(pack.source.as_str(), |project| project.name);
+                let title = if name.ends_with(&format!(" v{}", pack.version)) {
+                    name.to_owned()
+                } else {
+                    format!("{name} - {}", pack.version)
+                };
+                Self::setting_row(
+                    ui,
+                    &title,
+                    &format!(
+                        "{} images, {:.1} MiB",
+                        pack.files,
+                        pack.bytes as f64 / 1_048_576.0
+                    ),
+                    |ui| {
+                        if active {
+                            ui.label(RichText::new("Active").color(p.success));
+                        } else if ui
+                            .add_enabled(
+                                available
+                                    && snapshot.settings.texture_profile.is_some()
+                                    && !snapshot.textures.recovery_needed,
+                                egui::Button::new("Activate"),
+                            )
+                            .clicked()
+                        {
+                            let preserve = !snapshot.textures.unmanaged
+                                || rfd::MessageDialog::new().set_title("Preserve existing texture files")
+                                    .set_description("Existing unmanaged textures will be moved to a named backup beside texture_replacements, not deleted. Disabling the managed pack restores that folder. Continue?")
+                                    .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                            if preserve {
+                                self.dispatch(Command::ActivateTextures {
+                                    id: Some(pack.id.clone()),
+                                    preserve_unmanaged: snapshot.textures.unmanaged,
+                                });
+                            }
+                        }
+                    },
                 );
-                ui.label(format!(
-                    "{} images  |  {:.1} MiB  |  {}",
-                    pack.files,
-                    pack.bytes as f64 / 1_048_576.0,
-                    pack.imported
-                ));
-                ui.label(
-                    RichText::new(format!("Content ID: {}", pack.id))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                if active {
-                    ui.label(RichText::new("ACTIVE FOR NEXT LAUNCH").color(TEAL).small());
-                }
-                if ui
-                    .add_enabled(
-                        !busy
-                            && !active
-                            && snapshot.settings.texture_profile.is_some()
-                            && !snapshot.textures.recovery_needed,
-                        egui::Button::new("Activate this version"),
-                    )
-                    .clicked()
-                {
-                    let preserve = if snapshot.textures.unmanaged {
-                        rfd::MessageDialog::new().set_title("Preserve existing texture files")
-                            .set_description("Existing unmanaged textures will be moved to a named backup beside texture_replacements, not deleted. Disabling the managed pack restores that folder. Continue?")
-                            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
-                    } else {
-                        true
-                    };
-                    if preserve {
-                        self.dispatch(Command::ActivateTextures {
-                            id: Some(pack.id.clone()),
-                            preserve_unmanaged: snapshot.textures.unmanaged,
-                        });
-                    }
-                }
+                egui::CollapsingHeader::new("Version details")
+                    .id_salt(&pack.id)
+                    .show(ui, |ui| {
+                        Self::secondary(ui, format!("Imported: {}", pack.imported));
+                        ui.label(RichText::new(format!("Content ID: {}", pack.id)).monospace());
+                    });
             }
             if ui
                 .add_enabled(
-                    !busy
+                    available
                         && snapshot.textures.active.is_some()
                         && !snapshot.textures.recovery_needed,
-                    egui::Button::new("Disable managed pack / restore original textures"),
+                    egui::Button::new("Disable pack and restore original textures"),
                 )
                 .clicked()
             {
@@ -1000,143 +1317,264 @@ impl Dashboard {
                 });
             }
         });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Import a texture pack");
+            Self::secondary(
+                ui,
+                "Download from the creator in your browser, then import one resolution or variant.",
+            );
+            let before = self.texture_source.clone();
+            let selected_name = crate::textures::CATALOG
+                .iter()
+                .find(|project| project.id == self.texture_source)
+                .map_or(self.texture_source.as_str(), |project| project.name);
+            egui::ComboBox::from_id_salt("texture-project")
+                .selected_text(selected_name)
+                .width(ui.available_width().min(520.0))
+                .show_ui(ui, |ui| {
+                    for project in crate::textures::CATALOG {
+                        ui.selectable_value(
+                            &mut self.texture_source,
+                            project.id.into(),
+                            project.name,
+                        );
+                    }
+                });
+            if before != self.texture_source
+                && let Some(project) = crate::textures::CATALOG
+                    .iter()
+                    .find(|project| project.id == self.texture_source)
+            {
+                self.texture_version = project.suggested_version.map_or_else(
+                    || format!("Imported {}", time::OffsetDateTime::now_utc().date()),
+                    str::to_owned,
+                );
+            }
+            if let Some(project) = crate::textures::CATALOG
+                .iter()
+                .find(|project| project.id == self.texture_source)
+            {
+                if project.creator_url.is_some()
+                    && ui.button("Open creator download page").clicked()
+                {
+                    self.dispatch(Command::OpenTextureCreator(project.id.into()));
+                }
+                ui.collapsing("About this pack", |ui| {
+                    Self::secondary(ui, project.description);
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Version label");
+                ui.add(egui::TextEdit::singleline(&mut self.texture_version).desired_width(240.0));
+            });
+            ui.checkbox(
+                &mut self.texture_permission,
+                "I have permission to use these texture assets",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if Self::primary(ui, available && self.texture_permission, "Import ZIP...")
+                    .clicked()
+                {
+                    self.import_texture(false);
+                }
+                if ui
+                    .add_enabled(
+                        available && self.texture_permission,
+                        egui::Button::new("Import GZ2 folder..."),
+                    )
+                    .clicked()
+                {
+                    self.import_texture(true);
+                }
+            });
+            Self::secondary(
+                ui,
+                "Only validated texture images are installed. Extract 7z/RAR with your own utility first. Accounts, purchases, and browser downloads stay with the creator.",
+            );
+        });
     }
 
     fn history(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "EVERY CHAPTER HAS A WAY BACK",
-            "Save time machine.",
-            "Lossless copy-on-write blocks and a parent-linked commit trail. No Windows VSS service or administrator access.",
-        );
+        let p = Palette::of(ui);
         Self::card(ui, |ui| {
             let stats = &snapshot.history.stats;
-            ui.label(
-                RichText::new(format!(
-                    "{} retained snapshots  /  {} shared blocks",
-                    stats.commits, stats.blocks
-                ))
-                .strong()
-                .size(18.0),
+            Self::section_title(ui, "Snapshot storage");
+            ui.horizontal_wrapped(|ui| {
+                for (value, label) in [
+                    (stats.commits.to_string(), "Snapshots"),
+                    (
+                        format!("{:.2} MiB", stats.stored_bytes as f64 / 1_048_576.0),
+                        "Stored",
+                    ),
+                    (
+                        format!("{:.0} MiB", stats.budget as f64 / 1_048_576.0),
+                        "Storage budget",
+                    ),
+                ] {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(140.0);
+                        ui.label(RichText::new(value).font(semibold(22.0)));
+                        Self::secondary(ui, label);
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            ui.scope(|ui| {
+                ui.visuals_mut().extreme_bg_color = p.disabled;
+                ui.add(
+                    egui::ProgressBar::new(
+                        (stats.stored_bytes as f32 / stats.budget.max(1) as f32).clamp(0.0, 1.0),
+                    )
+                    .desired_width(ui.available_width())
+                    .desired_height(6.0)
+                    .corner_radius(2)
+                    .fill(p.accent),
+                );
+            });
+            Self::secondary(
+                ui,
+                "Unchanged blocks are shared. Oldest snapshots are pruned when the budget is reached; filesystem overhead is separate.",
             );
-            ui.label(format!(
-                "{:.2} MiB stored, versus {:.2} MiB of full-file copies. Budget: {:.0} MiB.",
-                stats.stored_bytes as f64 / 1_048_576.0,
-                stats.logical_bytes as f64 / 1_048_576.0,
-                stats.budget as f64 / 1_048_576.0
-            ));
-            ui.add(
-                egui::ProgressBar::new(
-                    (stats.stored_bytes as f32 / stats.budget as f32).clamp(0.0, 1.0),
-                )
-                .show_percentage(),
-            );
-            ui.label(RichText::new(format!("{} oldest commits pruned. Shared blocks survive as long as any retained commit needs them. Filesystem allocation overhead is separate.", stats.pruned)).small().color(MUTED));
             if let Some(notice) = &snapshot.history.notice {
-                ui.label(RichText::new(notice).color(GOLD));
+                Self::notice(ui, Tone::Info, "Save history", notice);
             }
-            ui.horizontal(|ui| {
-                if ui.button("Latest / refresh").clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Refresh / latest").clicked() {
                     self.dispatch(Command::HistoryPage(None));
                 }
                 if ui
                     .add_enabled(
                         snapshot.history.next.is_some(),
-                        egui::Button::new("Older commits"),
+                        egui::Button::new("Older snapshots"),
                     )
                     .clicked()
                 {
                     self.dispatch(Command::HistoryPage(snapshot.history.next.clone()));
                 }
             });
-            ui.label(RichText::new("Valid saves are captured after two stable seconds, including in-game autosaves. Restoring adds a new commit and obeys normal sync conflict rules. Corrupt current files must be moved aside first; they are never silently overwritten.").small().color(MUTED));
+            ui.collapsing("How snapshots work", |ui| {
+                Self::secondary(ui, format!("{} shared blocks; {:.2} MiB if stored as full copies; {} oldest snapshots pruned.", stats.blocks, stats.logical_bytes as f64 / 1_048_576.0, stats.pruned));
+                Self::secondary(ui, "Valid saves are captured after two stable seconds, including in-game autosaves. Restore creates a new commit and retains normal sync conflict checks. A corrupt current file must be moved aside first.");
+            });
         });
-        ui.add_space(14.0);
-        let can_restore = snapshot.settings.save_file.is_some()
-            && !snapshot.game_running
-            && !snapshot.remote_game
-            && snapshot.settings.play_lock.is_none()
-            && !snapshot.texture_busy
-            && !snapshot.install_busy
-            && !snapshot.self_updates.preparing;
+        ui.add_space(12.0);
+        let can_restore =
+            snapshot.settings.save_file.is_some() && Self::management_available(snapshot);
         if snapshot.history.entries.is_empty() {
-            ui.label(RichText::new("Choose a GCI save and wait for a stable save, or refresh to migrate older backups.").color(MUTED));
+            Self::notice(
+                ui,
+                Tone::Info,
+                "No snapshots yet",
+                "Choose a valid GCI save on Home. Stable saves are recorded automatically; refresh can also migrate older backups.",
+            );
         }
         for entry in &snapshot.history.entries {
-            Self::card(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("#{}  {}", entry.sequence, entry.reason.label()))
-                        .strong()
-                        .color(TEAL),
-                );
-                ui.label(format!(
-                    "{}  |  {}  |  {} / {}",
-                    entry.timestamp, entry.username, entry.game, entry.name
-                ));
-                ui.label(
-                    RichText::new(format!("Commit {}", entry.id))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                ui.label(
-                    RichText::new(format!("Save SHA-256 {}", entry.hash))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                if let Some(parent) = &entry.parent {
-                    ui.label(
-                        RichText::new(format!("Parent {parent}"))
-                            .monospace()
-                            .size(10.0)
-                            .color(MUTED),
-                    );
-                }
+            ui.push_id(&entry.id, |ui| { Self::card(ui, |ui| {
                 let current = snapshot.local_hash.as_ref() == Some(&entry.hash);
-                if current {
-                    ui.label(
-                        RichText::new("MATCHES CURRENT LOCAL SAVE")
-                            .color(GOLD)
-                            .small(),
-                    );
-                }
-                if ui
-                    .add_enabled(
-                        can_restore && !current,
-                        egui::Button::new("Restore as a new commit"),
-                    )
-                    .clicked()
-                {
-                    let Some(destination) = snapshot.settings.save_file.as_ref() else {
-                        self.local_error =
-                            Some("Choose a local GCI destination before restoring.".into());
-                        return;
-                    };
-                    let destination = destination.display();
-                    let approved = rfd::MessageDialog::new().set_title("Restore save snapshot")
-                        .set_description(format!("Restore {} / {} to {}?\n\nThe current valid save is snapshotted first. This restore creates a new commit; paired-device conflicts still need approval.", entry.game, entry.name, destination))
-                        .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
-                    if approved {
-                        self.dispatch(Command::RestoreSnapshot {
-                            id: entry.id.clone(),
-                            expected: snapshot.local_hash.clone(),
-                        });
+                Self::setting_row(ui, &format!("#{}  {}", entry.sequence, entry.reason.label()),
+                    &format!("{}  /  {}", entry.timestamp, entry.username),
+                    |ui| {
+                        if current {
+                            ui.label(RichText::new("Current save").color(p.success));
+                        } else if ui.add_enabled(can_restore, egui::Button::new("Restore...")).clicked() {
+                            let Some(destination) = snapshot.settings.save_file.as_ref() else {
+                                self.local_error = Some("Choose a local GCI destination before restoring.".into());
+                                return;
+                            };
+                            let approved = rfd::MessageDialog::new().set_title("Restore save snapshot")
+                                .set_description(format!("Restore {} / {} to {}?\n\nThe current valid save is snapshotted first. This creates a new commit; paired-device conflicts still need approval.", entry.game, entry.name, destination.display()))
+                                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                            if approved {
+                                self.dispatch(Command::RestoreSnapshot { id: entry.id.clone(), expected: snapshot.local_hash.clone() });
+                            }
+                        }
+                    },
+                );
+                ui.collapsing("Snapshot details", |ui| {
+                    Self::secondary(ui, format!("Game: {} / {}", entry.game, entry.name));
+                    ui.label(RichText::new(format!("Commit: {}", entry.id)).monospace());
+                    ui.label(RichText::new(format!("Save SHA-256: {}", entry.hash)).monospace());
+                    if let Some(parent) = &entry.parent {
+                        ui.label(RichText::new(format!("Parent: {parent}")).monospace());
                     }
-                }
-            });
-            ui.add_space(10.0);
+                });
+            }); });
+            ui.add_space(8.0);
         }
     }
 
     fn security(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::header(
-            ui,
-            "SMALL PROTOCOL. EXPLICIT TRUST.",
-            "Built to fail closed.",
-            "No custom cryptography. No cloud account. No silent conflict winner.",
-        );
+        let p = Palette::of(ui);
         Self::card(ui, |ui| {
+            Self::section_title(ui, "Appearance");
+            let mut appearance = self.appearance.appearance;
+            Self::setting_row(
+                ui,
+                "App theme",
+                "Use the Windows setting, or choose a light or dark appearance.",
+                |ui| {
+                    egui::ComboBox::from_id_salt("appearance")
+                        .selected_text(appearance.label())
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for choice in [Appearance::System, Appearance::Light, Appearance::Dark]
+                            {
+                                ui.selectable_value(&mut appearance, choice, choice.label());
+                            }
+                        });
+                },
+            );
+            if appearance != self.appearance.appearance {
+                match self.appearance.set(appearance) {
+                    Ok(()) => appearance.apply(ui.ctx()),
+                    Err(error) => self.local_error = Some(format!("{error:#}")),
+                }
+            }
+        });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Startup and background");
+            let mut startup = snapshot.settings.startup;
+            Self::setting_row(
+                ui,
+                "Start with Windows",
+                "Start in the system tray when you sign in. Enabled by default on first launch.",
+                |ui| {
+                    if ui.checkbox(&mut startup, "Enabled").changed() {
+                        self.dispatch(Command::SetStartup(startup));
+                    }
+                },
+            );
+            ui.separator();
+            Self::secondary(
+                ui,
+                "Closing the window keeps sync running in the tray. Double-click the tray icon to reopen it; use its Quit action to exit.",
+            );
+        });
+        ui.add_space(12.0);
+        self.app_updates(ui, snapshot);
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Privacy and local data");
+            Self::secondary(
+                ui,
+                "Logs contain your username, paths, hashes, peer identities, and security decisions. Keep them private.",
+            );
+            if ui.button("Open application data folder").clicked()
+                && let Err(error) = open_data_directory()
+            {
+                self.local_error = Some(format!("{error:#}"));
+            }
+            ui.collapsing("Your device identity", |ui| {
+                ui.label(RichText::new(&snapshot.public_key).monospace());
+            });
+        });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Security");
+            Self::status(ui, "Channel", "twilightProto 1 / Noise XX", p.success);
+            ui.collapsing("Security details and limitations", |ui| {
             for (title, detail) in [
                 (
                     "twilightProto / 1",
@@ -1155,47 +1593,26 @@ impl Dashboard {
                     "Validation cannot prove a save contains no exploit for every Dusklight build. Exclusive play protects managed launches; direct launches and a compromised OS can bypass it. Keep Dusklight updated.",
                 ),
             ] {
-                ui.label(RichText::new(title).strong().color(TEAL));
+                ui.label(RichText::new(title).font(semibold(14.0)));
                 ui.label(detail);
                 ui.add_space(8.0);
             }
-        });
-        ui.add_space(14.0);
-        Self::card(ui, |ui| {
-            let mut startup = snapshot.settings.startup;
-            if ui
-                .checkbox(&mut startup, "Start with Windows (enabled by default)")
-                .changed()
-            {
-                self.dispatch(Command::SetStartup(startup));
-            }
-            ui.label("Audit logs in your home .twilight-sync folder contain your username, file paths, SHA-256 hashes, peer identities, and security decisions. Treat them as private.");
-            ui.label(
-                RichText::new(format!("Your public identity: {}", snapshot.public_key))
-                    .monospace()
-                    .size(11.0)
-                    .color(MUTED),
-            );
-            if ui.button("Open private application folder").clicked() {
-                match open_data_directory() {
-                    Ok(()) => {}
-                    Err(error) => self.local_error = Some(format!("{error:#}")),
-                }
-            }
+            });
         });
     }
 
     fn approvals(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let p = Palette::of(ui);
         if snapshot.pending_save {
             Self::card(ui, |ui| {
                 ui.label(
                     RichText::new("A save replacement needs your consent")
-                        .color(GOLD)
-                        .strong(),
+                        .color(p.warning)
+                        .font(semibold(16.0)),
                 );
                 ui.label("Your copy differs from the common version. Approving snapshots it into compact history before replacing it with your partner's copy.");
-                ui.horizontal(|ui| {
-                    if ui.button("Approve replacement and keep snapshot").clicked() {
+                ui.horizontal_wrapped(|ui| {
+                    if Self::primary(ui, true, "Accept and keep snapshot").clicked() {
                         self.dispatch(Command::AcceptSave(true));
                     }
                     if ui.button("Keep my save").clicked() {
@@ -1209,10 +1626,10 @@ impl Dashboard {
             Self::card(ui, |ui| {
                 ui.label(
                     RichText::new("Incoming disc image - explicit permission required")
-                        .color(GOLD)
-                        .strong(),
+                        .color(p.warning)
+                        .font(semibold(16.0)),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("I own this game - choose a new ISO destination")
                         .clicked()
@@ -1234,11 +1651,11 @@ impl Dashboard {
             Self::card(ui, |ui| {
                 ui.label(
                     RichText::new("Crash recovery - check both devices")
-                        .color(GOLD)
-                        .strong(),
+                        .color(p.warning)
+                        .font(semibold(16.0)),
                 );
                 ui.label("Confirm no Dusklight process is running on either device. Do not approve just because the other device disconnected.");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("Both games are stopped - approve recovery")
                         .clicked()
@@ -1252,6 +1669,77 @@ impl Dashboard {
             });
             ui.add_space(12.0);
         }
+    }
+
+    fn navigation_button(&mut self, ui: &mut egui::Ui, page: Page, compact: bool) {
+        let p = Palette::of(ui);
+        let selected = self.page == page;
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                true,
+                selected,
+                page.title(),
+            )
+        });
+        if response.gained_focus() {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+        if selected || response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4, if selected { p.selection } else { p.alternate });
+        }
+        if selected {
+            let marker = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 2.0, rect.center().y),
+                Vec2::new(3.0, 20.0),
+            );
+            ui.painter().rect_filled(marker, 2, p.accent);
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect.shrink(1.0),
+                4,
+                Stroke::new(1.5, p.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let foreground = if selected { p.accent } else { p.text };
+        ui.painter().text(
+            egui::pos2(
+                if compact {
+                    rect.center().x
+                } else {
+                    rect.left() + 22.0
+                },
+                rect.center().y,
+            ),
+            egui::Align2::CENTER_CENTER,
+            page.icon(),
+            egui::FontId::new(18.0, egui::FontFamily::Name("Windows icons".into())),
+            foreground,
+        );
+        if !compact {
+            ui.painter().text(
+                egui::pos2(rect.left() + 46.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                page.title(),
+                egui::FontId::proportional(14.0),
+                foreground,
+            );
+        }
+        if response.clicked()
+            || (response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                }))
+        {
+            response.request_focus();
+            self.page = page;
+        }
+        response.on_hover_text(page.title());
     }
 }
 
@@ -1271,6 +1759,11 @@ impl eframe::App for Dashboard {
                 return;
             }
         };
+        if snapshot.comparison_code.is_some() && snapshot.comparison_code != self.shown_pairing_code
+        {
+            self.page = Page::Devices;
+        }
+        self.shown_pairing_code = snapshot.comparison_code.clone();
         if snapshot.shutdown {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -1283,107 +1776,125 @@ impl eframe::App for Dashboard {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        let p = Palette::new(context.theme() == egui::Theme::Dark);
+        let compact = context.content_rect().width() < 760.0;
         egui::SidePanel::left("navigation")
-            .exact_width(190.0)
+            .exact_width(if compact { 64.0 } else { 208.0 })
             .resizable(false)
+            .frame(egui::Frame::new().fill(p.canvas).inner_margin(8))
             .show(context, |ui| {
-                ui.add_space(24.0);
-                ui.label(RichText::new("TWILIGHT").size(24.0).strong().color(GOLD));
-                ui.label(RichText::new("S Y N C").size(14.0).color(MUTED));
-                ui.add_space(28.0);
-                for (page, title) in [
-                    (Page::Overview, "Overview"),
-                    (Page::Devices, "Your devices"),
-                    (Page::Library, "Game & disc"),
-                    (Page::Textures, "Texture packs"),
-                    (Page::History, "Save history"),
-                    (Page::Security, "Trust & settings"),
-                ] {
-                    if ui
-                        .selectable_label(self.page == page, RichText::new(title).size(16.0))
-                        .clicked()
-                    {
-                        self.page = page;
-                    }
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let show_brand = ui.available_height() >= 360.0;
+                if show_brand && compact {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(symbol("\u{e708}", 22.0).color(p.accent))
+                            .on_hover_text("Twilight Sync");
+                    });
+                } else if show_brand {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Twilight Sync").font(semibold(18.0)));
+                    Self::secondary(ui, "Local save manager");
                 }
-                ui.add_space(28.0);
-                ui.separator();
-                ui.label(
-                    RichText::new("LOCAL BY DESIGN")
-                        .color(TEAL)
-                        .size(11.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new("No cloud.\nNo relay.\nNo automatic trust.")
-                        .color(MUTED)
-                        .small(),
-                );
-                ui.add_space(20.0);
-                ui.label(
-                    RichText::new(concat!(
-                        "v",
-                        env!("CARGO_PKG_VERSION"),
-                        "  /  twilightProto 1"
-                    ))
-                    .color(MUTED)
-                    .size(10.0),
-                );
+                if show_brand {
+                    ui.add_space(20.0);
+                }
+                let footer_height = if compact { 48.0 } else { 72.0 };
+                let menu_height = (ui.available_height() - footer_height).max(40.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("navigation-menu")
+                    .max_height(menu_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for page in Page::ALL.into_iter().filter(|page| *page != Page::Security) {
+                            self.navigation_button(ui, page, compact);
+                        }
+                    });
+                self.navigation_button(ui, Page::Security, compact);
+                if !compact {
+                    ui.label(
+                        RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .color(p.secondary),
+                    );
+                }
             });
-        egui::TopBottomPanel::bottom("footer").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(if snapshot.ready {
-                        "ENCRYPTED + PAIRED"
-                    } else {
-                        "NOT CONNECTED"
-                    })
-                    .color(if snapshot.ready { TEAL } else { MUTED })
-                    .size(11.0)
-                    .strong(),
-                );
-                ui.separator();
-                ui.label(
-                    RichText::new("Closing this window keeps Twilight Sync in the tray.")
-                        .color(MUTED)
-                        .size(11.0),
-                );
+        egui::TopBottomPanel::bottom("footer")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.canvas)
+                    .inner_margin(egui::Margin::symmetric(16, 4)),
+            )
+            .show(context, |ui| {
+                ui.spacing_mut().interact_size.y = 18.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(if snapshot.ready {
+                            "Connected securely"
+                        } else if snapshot.connecting {
+                            "Connecting..."
+                        } else {
+                            "Not connected"
+                        })
+                        .color(if snapshot.ready {
+                            p.success
+                        } else {
+                            p.secondary
+                        })
+                        .size(12.0),
+                    );
+                    if !compact {
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Closing the window keeps sync running in the tray.")
+                                .color(p.secondary)
+                                .size(12.0),
+                        );
+                    }
+                });
             });
-        });
-        egui::CentralPanel::default().show(context, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(22.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(18.0);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(ui.available_width() - 18.0);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.canvas)
+                    .inner_margin(if compact { 16 } else { 24 }),
+            )
+            .show(context, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("page-content", self.page))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let confirming_device =
+                            self.page == Page::Devices && snapshot.comparison_code.is_some();
+                        if confirming_device {
+                            ui.heading("Confirm device");
+                            ui.add_space(12.0);
+                        } else {
+                            Self::header(ui, self.page);
+                        }
                         let background_error = self.background.error();
-                        if let Some(error) = self
+                        let error = self
                             .local_error
                             .as_ref()
                             .or(background_error.as_ref())
                             .or(snapshot.error.as_ref())
-                        {
-                            Self::card(ui, |ui| {
-                                ui.label(RichText::new(error).color(RED));
-                            });
+                            .cloned();
+                        if !confirming_device && let Some(error) = &error {
+                            Self::notice(ui, Tone::Error, "Action needed", error);
                             ui.add_space(12.0);
                         }
                         if !snapshot.transfer.is_empty() {
-                            ui.label(RichText::new(&snapshot.transfer).color(TEAL));
+                            Self::notice(
+                                ui,
+                                Tone::Info,
+                                "Transfer in progress",
+                                &snapshot.transfer,
+                            );
                             ui.add_space(8.0);
                         }
                         self.approvals(ui, &snapshot);
-                        if self.page == Page::Security
-                            || (self.page == Page::Overview
-                                && (snapshot.self_updates.checking
-                                    || snapshot.self_updates.preparing
-                                    || snapshot.self_updates.checked_at.is_some()
-                                    || snapshot.self_updates.error.is_some()))
-                        {
-                            self.app_updates(ui, &snapshot);
-                            ui.add_space(14.0);
-                        }
                         match self.page {
                             Page::Overview => self.overview(ui, &snapshot),
                             Page::Devices => self.devices(ui, &snapshot),
@@ -1392,11 +1903,21 @@ impl eframe::App for Dashboard {
                             Page::History => self.history(ui, &snapshot),
                             Page::Security => self.security(ui, &snapshot),
                         }
+                        if confirming_device && let Some(error) = &error {
+                            ui.add_space(12.0);
+                            Self::notice(ui, Tone::Warning, "Previous action", error);
+                        }
+                        if self.page == Page::Overview
+                            && (snapshot.self_updates.available()
+                                || snapshot.self_updates.preparing
+                                || snapshot.self_updates.error.is_some())
+                        {
+                            ui.add_space(12.0);
+                            self.app_updates(ui, &snapshot);
+                        }
+                        ui.add_space(8.0);
                     });
-                });
-                ui.add_space(22.0);
             });
-        });
         context.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -1410,4 +1931,78 @@ fn open_data_directory() -> Result<()> {
         .arg(directory)
         .spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_snapshot() -> Result<Snapshot> {
+        let backend = crate::runtime::ui_smoke_backend("ready")?;
+        let snapshot = backend.snapshot()?;
+        backend.command(Command::Shutdown)?;
+        Ok(snapshot)
+    }
+
+    #[test]
+    fn play_controls_never_enable_for_disconnected_busy_or_locked_devices() -> Result<()> {
+        let ready = ready_snapshot()?;
+        assert!(Dashboard::can_launch(&ready));
+        for condition in [
+            "offline",
+            "local-game",
+            "remote-game",
+            "lock",
+            "install",
+            "textures",
+            "update",
+        ] {
+            let mut snapshot = ready.clone();
+            match condition {
+                "offline" => snapshot.ready = false,
+                "local-game" => snapshot.game_running = true,
+                "remote-game" => snapshot.remote_game = true,
+                "lock" => {
+                    snapshot.settings.play_lock = Some(crate::config::PlayLock {
+                        owner: snapshot.public_key.clone(),
+                        token: "d".repeat(64),
+                    })
+                }
+                "install" => snapshot.install_busy = true,
+                "textures" => snapshot.texture_busy = true,
+                "update" => snapshot.self_updates.preparing = true,
+                _ => unreachable!(),
+            }
+            assert!(!Dashboard::can_launch(&snapshot), "{condition}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn play_controls_require_files_and_no_pending_consent_or_transfer() -> Result<()> {
+        let ready = ready_snapshot()?;
+        for condition in [
+            "save",
+            "game",
+            "save-consent",
+            "iso-consent",
+            "recovery",
+            "transfer",
+            "texture-recovery",
+        ] {
+            let mut snapshot = ready.clone();
+            match condition {
+                "save" => snapshot.settings.save_file = None,
+                "game" => snapshot.settings.game_exe = None,
+                "save-consent" => snapshot.pending_save = true,
+                "iso-consent" => snapshot.pending_iso = true,
+                "recovery" => snapshot.pending_recovery = true,
+                "transfer" => snapshot.transfer = "Receiving...".into(),
+                "texture-recovery" => snapshot.textures.recovery_needed = true,
+                _ => unreachable!(),
+            }
+            assert!(!Dashboard::can_launch(&snapshot), "{condition}");
+        }
+        Ok(())
+    }
 }

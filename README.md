@@ -63,14 +63,14 @@ does not disable SmartScreen, antivirus, or PowerShell security settings.
 Do these steps on **both PCs**:
 
 1. Join the same home LAN and set its Windows network profile to **Private**.
-2. Open **Your devices**, check the displayed router information, and approve
+2. Open **Devices**, check the displayed router information, and approve
    that network.
 3. Open pairing on both PCs. On **one PC only**, choose the other device's
    **Compare codes** button. Compare the full code on both screens.
    **Both devices must approve the matching code.**
-4. In **Overview**, choose Dusklight's actual `.gci` save, or select a receive
+4. In **Home**, choose Dusklight's actual `.gci` save, or select a receive
    destination if this PC does not have a save yet.
-5. In **Game & disc**, locate `dusklight.exe` or use **Install / update Dusklight**.
+5. In **Dusklight**, locate `dusklight.exe` or use **Install / update Dusklight**.
    Configure the game with your own legally obtained disc dump.
 6. Resolve any initial save conflict by sending the copy you want and approving
    replacement on the receiving PC.
@@ -91,8 +91,19 @@ Closing the window keeps the app in the system tray. Double-click its moon icon
 to reopen it. Use the tray's **Quit** action after stopping the game.
 
 **Startup is enabled by default on the first normal launch.** Turn it off in
-**Trust & settings** or the tray menu if you prefer. The installer does not
+**Settings** or the tray menu if you prefer. The installer does not
 override a startup preference you already changed.
+
+### Windows appearance
+
+The dashboard follows your Windows light/dark setting by default. Choose
+**Settings > Appearance** to use Windows, Light, or Dark; the choice is saved
+locally without changing game or pairing settings. Window chrome follows the
+chosen theme too.
+
+The interface uses installed Windows Segoe UI fonts and system icons, with
+compact navigation for smaller windows and high-DPI handheld displays. Windows
+font files are loaded from the operating system, not bundled or redistributed.
 
 ## What you get
 
@@ -142,7 +153,7 @@ not a guaranteed compression ratio.
 
 Twilight Sync checks this repository's stable GitHub releases shortly after
 startup and every **six hours** by default. Turn **Automatically check app
-updates** off in the tray or **Trust & settings** to opt out. Manual checks
+updates** off in the tray or **Settings** to opt out. Manual checks
 remain available.
 
 When a newer version exists, the tray shows **Update Twilight Sync to v...**:

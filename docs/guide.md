@@ -72,7 +72,7 @@ The startup entry is per-user, not a scheduled task or administrator service.
 1. Connect both devices to the same private IPv4 LAN. Mark that Windows network
    **Private**. Public profiles, VPN-only interfaces, and virtual adapters are
    deliberately refused.
-2. Open **Your devices** on each machine. Check the adapter, router address, MAC,
+2. Open **Devices** on each machine. Check the adapter, router address, MAC,
    and fingerprint, then approve the router separately on each.
 3. Allow the app through Windows Firewall **on Private networks only**, if Windows
    prompts. The app does not alter firewall settings.
@@ -516,6 +516,7 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
     identity.dpapi          Current-user-protected Noise private key
     settings.json           Router pin, public peer key, local paths, common hash, play lock
     update-settings.json    Optional automatic app-update-check preference
+    interface.json          Optional Windows/System, Light, or Dark appearance preference
     instance.lock           Per-user single-manager lock
     logs\
         audit.jsonl         Current structured audit log
@@ -632,6 +633,11 @@ modify real startup settings or require a copyrighted save/disc fixture.
 A debug-only, 20-second native UI smoke run is available with
 `cargo run --locked -- --ui-smoke`; it creates no real keys, startup entries,
 settings, or network sockets. Add `--background` to exercise a hidden startup.
+Use `--theme light|dark|system`, `--page overview|devices|library|textures|history|security`,
+`--scenario offline|ready|pairing|connecting|attention`, and `--scale 1.5`
+to validate themes, populated/empty states, and high-DPI layouts. The isolated
+window is titled **Twilight Sync - UI smoke** and never saves appearance changes.
+Numeric smoke-test scales from 0.75 through 2 are supported.
 Use `--page textures`, `--page history`, or `--page library` to open a specific
 screen deterministically without interacting with real files or creator downloads.
 The tray uses a native GUI-thread timer rather than depending on redraws of

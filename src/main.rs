@@ -74,6 +74,9 @@ fn run() -> Result<()> {
     if first.as_deref().is_some_and(|a| a == "--ui-smoke") {
         let mut background = false;
         let mut page = "overview".to_owned();
+        let mut theme = "system".to_owned();
+        let mut scenario = "offline".to_owned();
+        let mut scale = 1.0_f32;
         while let Some(argument) = arguments.next() {
             if argument == "--background" {
                 background = true;
@@ -83,15 +86,39 @@ fn run() -> Result<()> {
                     .context("Missing UI smoke page")?
                     .into_string()
                     .map_err(|_| anyhow::anyhow!("UI smoke page must be UTF-8"))?;
+            } else if argument == "--theme" {
+                theme = arguments
+                    .next()
+                    .context("Missing UI smoke theme")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("UI smoke theme must be UTF-8"))?;
+            } else if argument == "--scenario" {
+                scenario = arguments
+                    .next()
+                    .context("Missing UI smoke scenario")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("UI smoke scenario must be UTF-8"))?;
+            } else if argument == "--scale" {
+                scale = arguments
+                    .next()
+                    .context("Missing UI smoke scale")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("UI smoke scale must be UTF-8"))?
+                    .parse()
+                    .context("UI smoke scale must be numeric")?;
             } else {
-                bail!("UI smoke accepts --background and --page PAGE");
+                bail!(
+                    "UI smoke accepts --background, --page PAGE, --theme system|light|dark, --scenario offline|ready|pairing|connecting|attention, and --scale NUMBER"
+                );
             }
         }
         println!("UI_SMOKE_STARTED (no persistent changes; exits after 20 seconds)");
         twilight_sync::ui::run_smoke(
-            twilight_sync::runtime::ui_smoke_backend(),
+            twilight_sync::runtime::ui_smoke_backend(&scenario)?,
             background,
             &page,
+            &theme,
+            scale,
         )?;
         println!("UI_SMOKE_OK");
         return Ok(());
