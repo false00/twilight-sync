@@ -190,6 +190,9 @@ pub fn handshake(
     initiator: bool,
 ) -> Result<Handshake> {
     ensure!(crate::files::valid_hash(network), "Invalid network binding");
+    stream
+        .set_nonblocking(false)
+        .context("Switching twilightProto channel to blocking I/O")?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -325,6 +328,49 @@ mod tests {
             session.writer.send(&Event::Ping)?;
         }
         assert!(matches!(session.reader.receive()?, Event::Saved { .. }));
+        let other_code = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Peer thread panicked"))??;
+        assert_eq!(session.comparison_code, other_code);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_nonblocking_socket_waits_for_pairing_traffic() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (stream, _) = listener.accept()?;
+        stream.set_nonblocking(true)?;
+        let left = snow::Builder::new(noise_params()?).generate_keypair()?;
+        let right = snow::Builder::new(noise_params()?).generate_keypair()?;
+        let network = "a".repeat(64);
+        let peer_network = network.clone();
+        let worker = thread::spawn(move || -> Result<String> {
+            let mut session = handshake(stream, &right.private, &peer_network, false)?;
+            ensure!(
+                matches!(session.reader.receive()?, Event::Hello { name } if name == "Alice"),
+                "Wrong pairing hello"
+            );
+            session.writer.send(&Event::Hello { name: "Bob".into() })?;
+            Ok(session.comparison_code)
+        });
+        thread::sleep(Duration::from_millis(50));
+        if worker.is_finished() {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Peer thread panicked"))??;
+            anyhow::bail!("Handshake completed before the peer sent its preface");
+        }
+        let mut session = handshake(client, &left.private, &network, true)?;
+        thread::sleep(Duration::from_millis(50));
+        session.writer.send(&Event::Hello {
+            name: "Alice".into(),
+        })?;
+        ensure!(
+            matches!(session.reader.receive()?, Event::Hello { name } if name == "Bob"),
+            "Wrong pairing hello"
+        );
         let other_code = worker
             .join()
             .map_err(|_| anyhow::anyhow!("Peer thread panicked"))??;

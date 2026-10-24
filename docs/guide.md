@@ -76,8 +76,9 @@ The startup entry is per-user, not a scheduled task or administrator service.
    and fingerprint, then approve the router separately on each.
 3. Allow the app through Windows Firewall **on Private networks only**, if Windows
    prompts. The app does not alter firewall settings.
-4. Open the two-minute pairing window on **both** devices. Select the discovered
-   partner on one device. Start only one connection attempt at a time.
+4. Open the two-minute pairing window on **both** devices. Choose the discovered
+   partner's **Compare codes** button on **one device only**. Do not start a
+   connection from both devices at once.
 5. Compare the full eight-digit code on both screens. Approve on **each** device
    only if every digit matches. Reject a mismatch. Neither device can transfer
    game data after only one approval.
@@ -167,6 +168,12 @@ prologue = "twilightProto/1|" + approved_network_fingerprint
 - Known partners must match the full previously pinned 32-byte public key. There
   is no automatic key replacement or downgrade.
 - New partners require the human comparison and approvals described below.
+
+The listener is polled without blocking, but each accepted channel switches to
+blocking I/O before Noise starts. Handshake reads and writes retain five-second
+deadlines; encrypted transport reads retain a twenty-second deadline with
+five-second heartbeats. Delayed packets wait within those limits rather than
+being rejected as nonblocking-socket errors.
 
 The private static key is stored as a **current-user DPAPI-protected blob**, not
 plaintext JSON. The application directory has inheritance removed and full
@@ -263,6 +270,15 @@ the accepted attack surface, including overlong name fields; they do not prove
 semantic safety or replace game updates, OS security, or an independent review.
 
 ## One game at a time: consistency over availability
+
+The **Dusklight (Twilight Sync)** desktop shortcut is created or refreshed by
+managed Dusklight installs and updates, including verification/reuse of an
+existing installation. It opens the manager's protected Play controls with
+`--open-dusklight`; an already-running manager is shown instead of starting a
+second instance. It does not launch the game or bypass bilateral play locks.
+Its icon follows the selected installed version. A private hash receipt prevents
+overwriting unrelated or independently modified shortcuts; deleting an owned
+shortcut allows the next install/update to recreate it.
 
 There is no lease TTL that could expire during a long game or network partition.
 

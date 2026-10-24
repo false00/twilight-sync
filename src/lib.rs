@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod config;
+pub mod desktop;
 pub mod files;
 pub mod history;
 pub mod install;

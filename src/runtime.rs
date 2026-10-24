@@ -149,7 +149,7 @@ enum Input {
         id: u64,
         reason: String,
     },
-    Installed(Result<Installed>),
+    Installed(Result<(Installed, PathBuf)>),
     ReleaseChecked(Result<ReleaseInfo>),
     SelfUpdateChecked(Result<self_update::Release>),
     SelfUpdatePrepared(Result<self_update::Prepared>),
@@ -663,13 +663,20 @@ impl Engine {
             }
             Input::Installed(result) => {
                 self.install_busy = false;
-                let installed = result?;
+                let (installed, shortcut) = result?;
                 self.audit.record(
                     "dusklight-installed",
                     Some(&installed.executable),
                     Some(&installed.sha256),
                     None,
                     &installed.tag,
+                )?;
+                self.audit.record(
+                    "dusklight-desktop-shortcut",
+                    Some(&shortcut),
+                    None,
+                    None,
+                    "Opens Twilight Sync protected Play controls; does not launch the game directly",
                 )?;
                 self.selected_release = Some(installed.tag.clone());
                 if self.latest_release.as_ref().is_some_and(|release| {
@@ -679,7 +686,7 @@ impl Engine {
                 }
                 self.store(|s| s.game_exe = Some(installed.executable))?;
                 self.message = format!(
-                    "Dusklight {} {}. Saves, profile, and texture selection were preserved; nothing was launched.",
+                    "Dusklight {} {}. Desktop shortcut opens protected Play controls. Saves, profile, and texture selection were preserved; nothing was launched.",
                     installed.tag,
                     if installed.reused {
                         "is already installed; managed files re-verified"
@@ -1018,7 +1025,7 @@ impl Engine {
                     None,
                     "Two-minute, five-attempt consent window",
                 )?;
-                self.message = "Open pairing on the other device, then choose it below.".into();
+                self.message = "Open pairing on both devices. Choose Compare codes on ONE device, then approve matching codes on BOTH.".into();
             }
             Command::Connect(key) => {
                 ensure!(self.link.is_none(), "A channel is already open");
@@ -1554,10 +1561,14 @@ impl Engine {
                 let root = self.root.clone();
                 let sender = self.sender.clone();
                 thread::spawn(move || {
-                    if sender
-                        .send(Input::Installed(install::install_official(&root)))
-                        .is_err()
-                    {
+                    let result = (|| {
+                        let installed = install::install_official(&root)?;
+                        let shortcut =
+                            crate::desktop::install_dusklight_shortcut(&root, &installed.executable)
+                                .context("Dusklight files were installed/verified, but its desktop shortcut could not be created")?;
+                        Ok((installed, shortcut))
+                    })();
+                    if sender.send(Input::Installed(result)).is_err() {
                         eprintln!("Twilight Sync stopped before installation completed");
                     }
                 });
@@ -3360,6 +3371,8 @@ mod tests {
             let remote_network = network.clone();
             let worker = thread::spawn(move || -> Result<Handshake> {
                 let (stream, _) = listener.accept()?;
+                // Accepted Winsock sockets inherit the listener's nonblocking mode.
+                stream.set_nonblocking(true)?;
                 protocol::handshake(stream, &right_private, &remote_network, false)
             });
             let left_session = protocol::handshake(

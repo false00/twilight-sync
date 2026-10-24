@@ -14,6 +14,7 @@ const GOLD: Color32 = Color32::from_rgb(240, 199, 117);
 const TEAL: Color32 = Color32::from_rgb(115, 219, 196);
 const MUTED: Color32 = Color32::from_rgb(156, 159, 182);
 const RED: Color32 = Color32::from_rgb(255, 145, 153);
+const WINDOW_TITLE: &str = "Twilight Sync";
 
 mod background;
 
@@ -120,7 +121,11 @@ fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
 }
 
 pub fn run(backend: Backend, background: bool) -> Result<()> {
-    run_page(backend, background, Page::Overview)
+    run_page(backend, background, Page::Overview, WINDOW_TITLE)
+}
+
+pub fn open_dusklight_controls() -> Result<bool> {
+    background::open_game_controls(WINDOW_TITLE)
 }
 
 #[cfg(debug_assertions)]
@@ -134,10 +139,10 @@ pub fn run_smoke(backend: Backend, background: bool, page: &str) -> Result<()> {
         "security" => Page::Security,
         _ => anyhow::bail!("Unknown UI smoke page"),
     };
-    run_page(backend, background, page)
+    run_page(backend, background, page, "Twilight Sync - UI smoke")
 }
 
-fn run_page(backend: Backend, background: bool, initial_page: Page) -> Result<()> {
+fn run_page(backend: Backend, background: bool, initial_page: Page, title: &str) -> Result<()> {
     let snapshot = backend.snapshot()?;
     let tray = make_tray(snapshot.settings.startup, snapshot.self_updates.enabled)?;
     let options = eframe::NativeOptions {
@@ -153,7 +158,7 @@ fn run_page(backend: Backend, background: bool, initial_page: Page) -> Result<()
         ..Default::default()
     };
     eframe::run_native(
-        "Twilight Sync",
+        title,
         options,
         Box::new(move |context| {
             let RawWindowHandle::Win32(window) = context.window_handle()?.as_raw() else {
@@ -626,6 +631,7 @@ impl Dashboard {
                 {
                     self.dispatch(Command::OpenPairing);
                 }
+                ui.label("Open pairing on both devices. Choose Compare codes on ONE device, then approve matching codes on BOTH.");
                 if snapshot.devices.is_empty() {
                     ui.label(
                         RichText::new(
@@ -1251,6 +1257,9 @@ impl Dashboard {
 
 impl eframe::App for Dashboard {
     fn update(&mut self, context: &egui::Context, _: &mut eframe::Frame) {
+        if self.background.take_open_game_controls() {
+            self.page = Page::Overview;
+        }
         self.tray_events();
         let snapshot = match self.backend.snapshot() {
             Ok(snapshot) => snapshot,

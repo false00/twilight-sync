@@ -65,8 +65,9 @@ Do these steps on **both PCs**:
 1. Join the same home LAN and set its Windows network profile to **Private**.
 2. Open **Your devices**, check the displayed router information, and approve
    that network.
-3. Open pairing on both PCs. Choose your other device and compare the full code
-   on both screens. **Both devices must approve the matching code.**
+3. Open pairing on both PCs. On **one PC only**, choose the other device's
+   **Compare codes** button. Compare the full code on both screens.
+   **Both devices must approve the matching code.**
 4. In **Overview**, choose Dusklight's actual `.gci` save, or select a receive
    destination if this PC does not have a save yet.
 5. In **Game & disc**, locate `dusklight.exe` or use **Install / update Dusklight**.
@@ -75,6 +76,12 @@ Do these steps on **both PCs**:
    replacement on the receiving PC.
 7. Use **Play Dusklight**. After you stop playing, the final save syncs before
    the other PC can start a protected session.
+
+Installing or updating Dusklight through the app also creates or refreshes
+**Dusklight (Twilight Sync)** on your Windows desktop. It opens the manager's
+protected Play controls, reusing the running manager if necessary; it never
+launches the game directly or bypasses pairing and play-lock checks.
+Unrelated or independently modified shortcuts are not overwritten.
 
 If Windows Firewall asks, allow the app on **Private networks only**.
 Guest Wi-Fi isolation, routed VLANs, and blocked local VPN traffic may prevent

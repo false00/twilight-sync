@@ -1,6 +1,6 @@
 use super::Tray;
 use crate::runtime::{Backend, Command};
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use eframe::egui;
 use std::{
     cell::{Cell, RefCell},
@@ -8,8 +8,14 @@ use std::{
     rc::Rc,
 };
 use windows_sys::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{IsWindow, KillTimer, SW_RESTORE, SetTimer, ShowWindow},
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    UI::{
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::{
+            FindWindowW, IsWindow, KillTimer, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+            SW_RESTORE, SendMessageTimeoutW, SetTimer, ShowWindow, WM_NCDESTROY,
+        },
+    },
 };
 
 const TIMER_ID: usize = 0x54575359;
@@ -26,6 +32,8 @@ struct Pump {
     last_status: RefCell<String>,
     attention: Cell<bool>,
     error: RefCell<Option<String>>,
+    open_message: u32,
+    open_game_controls: Cell<bool>,
 }
 
 pub(super) struct BackgroundGuard {
@@ -43,6 +51,46 @@ pub(super) fn reveal(window: NonZeroIsize, context: &egui::Context) {
     context.request_repaint();
 }
 
+fn open_message() -> std::io::Result<u32> {
+    let name: Vec<u16> = "TwilightSync.OpenDusklightControls.v1"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
+    if message == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(message)
+}
+
+pub(super) fn open_game_controls(title: &str) -> Result<bool> {
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if window.is_null() {
+        return Ok(false);
+    }
+    let mut response = 0;
+    ensure!(
+        unsafe {
+            SendMessageTimeoutW(
+                window,
+                open_message()?,
+                0,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                2000,
+                &mut response,
+            )
+        } != 0,
+        "The running manager did not respond; close any dialog and try the desktop shortcut again"
+    );
+    ensure!(
+        response == 1,
+        "The running manager must be restarted with the updated app before opening this shortcut"
+    );
+    Ok(true)
+}
+
 impl BackgroundGuard {
     pub(super) fn install(
         window: NonZeroIsize,
@@ -58,13 +106,29 @@ impl BackgroundGuard {
             last_status: RefCell::new(String::new()),
             attention: Cell::new(false),
             error: RefCell::new(None),
+            open_message: open_message()?,
+            open_game_controls: Cell::new(false),
         });
         PUMP.with(|cell| *cell.borrow_mut() = Some(pump.clone()));
+        if unsafe { SetWindowSubclass(window.get() as HWND, Some(window_message), TIMER_ID, 0) }
+            == 0
+        {
+            PUMP.with(|cell| *cell.borrow_mut() = None);
+            return Err(std::io::Error::other(
+                "Cannot install the desktop shortcut window handler",
+            ));
+        }
         // A GUI-thread timer keeps the tray alive without rendering the hidden dashboard.
         let timer = unsafe { SetTimer(window.get() as HWND, TIMER_ID, 1000, Some(tick)) };
         if timer == 0 {
+            let error = std::io::Error::last_os_error();
+            if unsafe { RemoveWindowSubclass(window.get() as HWND, Some(window_message), TIMER_ID) }
+                == 0
+            {
+                eprintln!("Cannot remove the desktop shortcut handler after timer setup failed");
+            }
             PUMP.with(|cell| *cell.borrow_mut() = None);
-            return Err(std::io::Error::last_os_error());
+            return Err(error);
         }
         Ok(Self { pump, timer })
     }
@@ -76,12 +140,21 @@ impl BackgroundGuard {
     pub(super) fn error(&self) -> Option<String> {
         self.pump.error.borrow().clone()
     }
+
+    pub(super) fn take_open_game_controls(&self) -> bool {
+        self.pump.open_game_controls.replace(false)
+    }
 }
 
 impl Drop for BackgroundGuard {
     fn drop(&mut self) {
         let window = self.pump.window.get() as HWND;
         unsafe {
+            if IsWindow(window) != 0
+                && RemoveWindowSubclass(window, Some(window_message), TIMER_ID) == 0
+            {
+                eprintln!("Cannot remove the desktop shortcut window handler");
+            }
             if IsWindow(window) != 0 && KillTimer(window, self.timer) == 0 {
                 eprintln!(
                     "Cannot remove Twilight Sync GUI timer: {}",
@@ -91,6 +164,30 @@ impl Drop for BackgroundGuard {
         }
         PUMP.with(|cell| *cell.borrow_mut() = None);
     }
+}
+
+unsafe extern "system" fn window_message(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    let pump = PUMP.with(|cell| cell.borrow().clone());
+    if let Some(pump) = pump
+        && message == pump.open_message
+    {
+        pump.open_game_controls.set(true);
+        reveal(pump.window, &pump.context);
+        return 1;
+    }
+    if message == WM_NCDESTROY
+        && unsafe { RemoveWindowSubclass(window, Some(window_message), TIMER_ID) } == 0
+    {
+        eprintln!("Cannot remove the desktop shortcut handler while the window is closing");
+    }
+    unsafe { DefSubclassProc(window, message, wparam, lparam) }
 }
 
 impl Pump {
