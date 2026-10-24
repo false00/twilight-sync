@@ -60,6 +60,15 @@ fn unchanged(path: &Path, expected: Option<&[u8]>) -> Result<bool> {
     }
 }
 
+fn same_path(actual: &Path, expected: &Path) -> Result<bool> {
+    ensure_safe_path(actual)?;
+    ensure_safe_path(expected)?;
+    Ok(actual.canonicalize().context("Resolving shortcut path")?
+        == expected
+            .canonicalize()
+            .context("Resolving expected shortcut path")?)
+}
+
 fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<PathBuf> {
     let destination = desktop.join(SHORTCUT_NAME);
     let receipt_path = root.join(RECEIPT_NAME);
@@ -111,21 +120,31 @@ fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<Pa
     let staged = stage.path().join("Dusklight.lnk");
     let details = write_link(&staged, manager, game)?;
     ensure!(
-        details
-            .target
-            .as_os_str()
-            .eq_ignore_ascii_case(manager.as_os_str())
-            && details.arguments == OPEN_ARGUMENT
-            && details.working.as_os_str().eq_ignore_ascii_case(
-                manager
-                    .parent()
-                    .context("Manager has no parent folder")?
-                    .as_os_str()
-            )
-            && details
-                .icon
-                .eq_ignore_ascii_case(&format!("{},0", game.display())),
-        "The desktop shortcut does not point to protected Play controls"
+        same_path(&details.target, manager)?,
+        "The desktop shortcut target is not the current manager"
+    );
+    ensure!(
+        details.arguments == OPEN_ARGUMENT,
+        "The desktop shortcut arguments do not open protected Play controls"
+    );
+    ensure!(
+        same_path(
+            &details.working,
+            manager.parent().context("Manager has no parent folder")?
+        )?,
+        "The desktop shortcut working directory does not match the manager"
+    );
+    let (icon, index) = details
+        .icon
+        .rsplit_once(',')
+        .context("The desktop shortcut icon has no resource index")?;
+    let icon = icon
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap_or(icon);
+    ensure!(
+        index == "0" && same_path(Path::new(icon), game)?,
+        "The desktop shortcut icon does not match the installed game"
     );
     let bytes = read_bounded(&staged, 64 * 1024)?;
     ensure!(
@@ -271,6 +290,41 @@ mod tests {
         let receipt: Receipt = serde_json::from_slice(&fs::read(f.root.join(RECEIPT_NAME))?)?;
         assert_eq!(receipt.game, next);
         assert_eq!(receipt.sha256, sha256(&fs::read(path)?));
+        Ok(())
+    }
+
+    #[test]
+    fn shell_link_short_path_aliases_keep_the_same_protected_targets() -> Result<()> {
+        use std::{os::windows::process::CommandExt, process::Command};
+        #[derive(Deserialize)]
+        struct ShortPaths {
+            manager: PathBuf,
+            game: PathBuf,
+        }
+        let f = fixture()?;
+        let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
+        let output = Command::new(
+            PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        )
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $fs=New-Object -ComObject Scripting.FileSystemObject; try { @{manager=$fs.GetFile($env:TWILIGHT_MANAGER).ShortPath; game=$fs.GetFile($env:TWILIGHT_GAME).ShortPath} | ConvertTo-Json -Compress } finally { $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($fs) }",
+        ])
+        .env("TWILIGHT_MANAGER", &f.manager)
+        .env("TWILIGHT_GAME", &f.game)
+        .creation_flags(0x08000000)
+        .output()?;
+        ensure!(
+            output.status.success(),
+            "Cannot resolve fixture short paths"
+        );
+        let paths: ShortPaths = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(paths.manager.canonicalize()?, f.manager.canonicalize()?);
+        assert_eq!(paths.game.canonicalize()?, f.game.canonicalize()?);
+        let shortcut = create(&f.root, &f.desktop, &paths.manager, &paths.game)?;
+        assert!(shortcut.is_file());
         Ok(())
     }
 

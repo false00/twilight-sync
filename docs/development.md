@@ -29,7 +29,7 @@ The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.3.1
+.\scripts\Package-Release.ps1 -Version v0.3.2
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
