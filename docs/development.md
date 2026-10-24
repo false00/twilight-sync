@@ -29,7 +29,7 @@ The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.2.0
+.\scripts\Package-Release.ps1 -Version v0.3.0
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
@@ -44,7 +44,7 @@ Checksums cover both the executable and the bootstrap script.
 ## Publishing future versions
 
 1. Update the Cargo package version and lockfile, validate the code, and commit.
-2. Create and push the matching stable tag, such as `v0.2.1`.
+2. Create and push the matching stable tag, such as `v0.3.1`.
 3. The release workflow builds and tests on Windows, creates a draft release,
    uploads all assets, then publishes it as latest.
 4. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`
@@ -58,6 +58,21 @@ The GitHub token is supplied by Actions at runtime, never embedded in scripts.
 Only reviewed, pinned checkout actions are used. No game assets, save files,
 private logs, identity keys, or texture archives belong in source control or
 release assets.
+
+## Consent-based app self-updates
+
+The automatic checker uses public release metadata only. Installation is a
+separate user-approved action, with strict SemVer comparison and matching GitHub
+asset/checksum-file SHA-256 values. The user can disable periodic checks without
+changing the game's settings schema.
+
+The staged native helper must acknowledge readiness before the manager exits.
+It verifies its own compiled version and original process identity, waits for
+clean exit without terminating that process, and uses the installer's lock plus
+same-directory atomic replacement. Tests launch isolated PE-shaped copies of
+the Rust test harness to exercise real Windows process/file-lock behavior; no
+real app profile or startup entries are used. Internal ignored subprocess
+fixtures are invoked only by their integration test.
 
 ## Licensing and security
 

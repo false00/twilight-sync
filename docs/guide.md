@@ -499,6 +499,7 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
 %USERPROFILE%\.twilight-sync\
     identity.dpapi          Current-user-protected Noise private key
     settings.json           Router pin, public peer key, local paths, common hash, play lock
+    update-settings.json    Optional automatic app-update-check preference
     instance.lock           Per-user single-manager lock
     logs\
         audit.jsonl         Current structured audit log
@@ -515,6 +516,8 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
         pending.json       Present only while texture recovery may be needed
     apps\
         <tag>-<hash>\      Side-by-side official program and file-hash receipt
+    updates\
+        stage-<id>\        Verified app-update handoff; failed logs/backups are retained
 ```
 
 Logs include the local **username, file paths, hashes, public peer keys, timestamps,
@@ -543,6 +546,35 @@ application directory after preserving any backups you want.
 
 ## Diagnostics and tests
 
+### Twilight Sync app updates
+
+App checks use `https://api.github.com/repos/false00/twilight-sync/releases/latest`,
+not the separate Dusklight repository. They run after startup and every six
+hours unless disabled. Only stable, newer SemVer releases are offered.
+Metadata requests time out and failures are reported as unknown update status,
+never as a successful "up to date" check.
+
+No binary downloads happen without tray/dashboard confirmation. The updater
+requires an exact official asset URL, bounded file size, GitHub SHA-256 digest,
+matching `SHA256SUMS.txt` entry, and a Windows x64 PE32+ binary. It never runs an
+unchecked remote script or elevates. The verified new executable runs as a
+minimal helper, acknowledges readiness, and waits for the original PID and
+executable to exit normally before applying a same-directory replacement.
+
+Gameplay, persistent play locks, pending transfers, and management operations
+block handoff. If conditions change while downloading, the helper is cancelled
+and the current app stays running. Installation receipts are updated for the
+PowerShell installer; game settings, pairing identities, and save histories are
+not migrated or reset. Preference storage is separate from the original game
+settings schema. Interrupted/failed update files are preserved for manual review;
+only known completed/cancelled stage files are eligible for automatic cleanup.
+
+As with the bootstrap, this trusts the public repository/release publisher and
+certificate infrastructure. Checksums are not independent publisher signatures.
+This automatic metadata request is an explicit exception to LAN-only save traffic.
+
+### Read-only commands
+
 Read-only diagnostics do not initialize the desktop, register startup, trust a
 router, or write application state:
 
@@ -552,6 +584,7 @@ cargo run --locked -- --check-save 'C:\Games\Dusklight\Card A\01-GZ2E-zeldaTp.da
 cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.iso'
 cargo run --locked -- --check-network
 cargo run --locked -- --check-updates
+cargo run --locked -- --check-app-updates
 ```
 
 An unsupported/corrupt input exits with an error. Do not treat a `VALID GCI`

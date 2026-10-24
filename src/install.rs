@@ -76,12 +76,12 @@ fn allowed_download_url(url: &reqwest::Url) -> bool {
         )
 }
 
-fn official_client() -> Result<Client> {
+pub(crate) fn official_client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent(concat!(
             "twilight-sync/",
             env!("CARGO_PKG_VERSION"),
-            " (official Dusklight updater)"
+            " (GitHub release updater)"
         ))
         .https_only(true)
         .no_proxy()

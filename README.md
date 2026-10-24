@@ -98,6 +98,8 @@ override a startup preference you already changed.
   and TP Definitive Edition+ v1.2.0, plus authorized local HD imports.
 - **Official Dusklight updater:** verified, side-by-side program updates that
   preserve your user profile and saves.
+- **Tray app updates:** optional automatic GitHub version checks, with a
+  confirmation before downloading or installing Twilight Sync itself.
 - **Optional ISO transfer:** separately approved transfers of verified,
   unmodified GameCube images you own. No game downloads are included.
 
@@ -128,8 +130,35 @@ not a guaranteed compression ratio.
 
 ## Update Twilight Sync
 
-Stop Dusklight, **quit Twilight Sync from its tray menu**, then rerun the same
-one-line command. Your private data remains in `%USERPROFILE%\.twilight-sync`.
+Twilight Sync checks this repository's stable GitHub releases shortly after
+startup and every **six hours** by default. Turn **Automatically check app
+updates** off in the tray or **Trust & settings** to opt out. Manual checks
+remain available.
+
+When a newer version exists, the tray shows **Update Twilight Sync to v...**:
+
+1. Stop both games and finish any save/ISO/texture work.
+2. Choose the update action and confirm the version/download size.
+3. The app checks the published SHA-256 digest and checksum list, stages a
+   verified native helper, and waits for its readiness acknowledgement.
+4. Twilight Sync shuts down cleanly. The helper waits for that exact process
+   to exit, replaces the executable, preserves the installer receipt when
+   present, and restarts the app in the tray.
+
+**Version checks do not download or install updates.** Installation always
+requires your approval. Update-check errors are shown separately and do not
+disable LAN save syncing. Game state, pairing, snapshots, textures, and startup
+preferences remain under `%USERPROFILE%\.twilight-sync` unchanged.
+
+There is no forced process termination or elevation. If a file changes, is in
+use, or fails validation, the update is refused. Native handoff tests cover
+waiting for a running app, rollback, and receipt preservation. Failed updates
+retain their private logs/backups under `.twilight-sync\updates` for review.
+Portable builds update their existing executable path; the PowerShell installer
+continues to manage its normal per-user location.
+
+For versions that predate tray updates, stop Dusklight, **quit Twilight Sync
+from its tray menu**, then rerun the one-line command.
 
 The installer will not forcibly stop an app or overwrite an unrelated or
 modified executable. Reinstalling an unchanged release does not open a duplicate
@@ -140,14 +169,14 @@ For a specific release, or to install without opening the app, download and
 review [install.ps1](install.ps1), then run:
 
 ```powershell
-.\install.ps1 -Version v0.2.0 -NoLaunch
+.\install.ps1 -Version v0.3.0 -NoLaunch
 ```
 
 Optional parameters:
 
 | Parameter | Purpose |
 | --- | --- |
-| `-Version v0.2.0` | Install a specific published stable release |
+| `-Version v0.3.0` | Install a specific published stable release |
 | `-InstallDirectory 'D:\Apps\TwilightSync'` | Choose a local per-user installation folder |
 | `-NoLaunch` | Do not open the app after installation |
 | `-NoShortcut` | Do not create or update a Start-menu shortcut |
@@ -174,9 +203,10 @@ Start with copies of your saves.
 
 ## Privacy and uninstalling
 
-There is no save-cloud account or telemetry. Installer/program downloads and
-creator pages use the Internet only when requested; save traffic stays within
-the app's approved-LAN policy.
+There is no save-cloud account or telemetry. Automatic app-update checks use the
+Internet for public GitHub release metadata only and can be disabled. Binary
+downloads, game-program updates, and creator pages still require your action;
+save traffic stays within the app's approved-LAN policy.
 
 Local logs and snapshot metadata include usernames, file paths, hashes, and
 security decisions. Treat `%USERPROFILE%\.twilight-sync` as private and redact

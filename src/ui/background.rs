@@ -102,16 +102,56 @@ impl Pump {
             "Playing here - save writes paused"
         } else if snapshot.remote_game {
             "Partner playing - save writes paused"
+        } else if snapshot.self_updates.preparing {
+            "Preparing verified Twilight Sync update"
         } else if snapshot.texture_busy {
             "Installing / switching texture data"
         } else if snapshot.install_busy {
             "Checking / updating official Dusklight"
+        } else if snapshot.self_updates.available() {
+            "Twilight Sync update available - open tray"
         } else if snapshot.ready {
             "Secure partner connected"
         } else {
             "Offline - locks preserved"
         };
         self.tray.startup.set_checked(snapshot.settings.startup);
+        self.tray
+            .automatic_updates
+            .set_checked(snapshot.self_updates.enabled);
+        self.tray
+            .check_updates
+            .set_enabled(!snapshot.self_updates.checking && !snapshot.self_updates.preparing);
+        self.tray
+            .check_updates
+            .set_text(if snapshot.self_updates.checking {
+                "Checking Twilight Sync updates..."
+            } else {
+                "Check Twilight Sync updates"
+            });
+        let can_update = snapshot.self_updates.available()
+            && !snapshot.self_updates.checking
+            && !snapshot.self_updates.preparing
+            && !snapshot.game_running
+            && !snapshot.remote_game
+            && snapshot.settings.play_lock.is_none()
+            && !snapshot.install_busy
+            && !snapshot.texture_busy;
+        self.tray.update_app.set_enabled(can_update);
+        let update_text = if snapshot.self_updates.preparing {
+            "Preparing verified app update...".into()
+        } else if snapshot.self_updates.error.is_some() {
+            "App update check needs attention".into()
+        } else if let Some(release) = &snapshot.self_updates.latest {
+            if release.update_available {
+                format!("Update Twilight Sync to {}...", release.tag)
+            } else {
+                "Twilight Sync is up to date".into()
+            }
+        } else {
+            "Update Twilight Sync (check first)".into()
+        };
+        self.tray.update_app.set_text(update_text);
         if *self.last_status.borrow() != status {
             self.tray.status.set_text(status);
             self.tray

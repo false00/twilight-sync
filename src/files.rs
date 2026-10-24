@@ -71,7 +71,7 @@ pub fn validate_save(bytes: &[u8]) -> Result<SaveIdentity> {
             "Unsupported save data version"
         );
         let (mut high, mut low) = (0_u16, 0_u16);
-        for word in sector[..0x1ffc].chunks_exact(2) {
+        for word in sector[..0x1ffc].as_chunks::<2>().0 {
             let word = u16::from_be_bytes([word[0], word[1]]);
             high = high.wrapping_add(word);
             low = low.wrapping_add(!word);
@@ -293,7 +293,7 @@ pub fn fixture_save() -> Vec<u8> {
             quest[QUEST_SIZE - 8..].copy_from_slice(&u64::from(low).to_be_bytes());
         }
         let (mut high, mut low) = (0_u16, 0_u16);
-        for word in sector[..0x1ffc].chunks_exact(2) {
+        for word in sector[..0x1ffc].as_chunks::<2>().0 {
             let value = u16::from_be_bytes([word[0], word[1]]);
             high = high.wrapping_add(value);
             low = low.wrapping_add(!value);
@@ -402,7 +402,9 @@ mod tests {
                     .copy_from_slice(&((u64::from(high) << 32) | u64::from(low)).to_be_bytes());
             }
             let sum: u32 = sector[..0x1ffc]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
                 .sum();
             let high = (sum & 0xffff) as u16;

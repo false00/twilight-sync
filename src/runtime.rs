@@ -7,6 +7,7 @@ use crate::{
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
     protocol::{self, Event, Handshake, SecureWriter},
+    self_update,
     textures::{self, Activation, Pack},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -57,6 +58,7 @@ pub struct Snapshot {
     pub texture_busy: bool,
     pub textures: textures::State,
     pub history: history::Page,
+    pub self_updates: self_update::State,
     pub message: String,
     pub error: Option<String>,
     pub shutdown: bool,
@@ -83,6 +85,9 @@ pub enum Command {
     AcceptIso(Option<PathBuf>),
     Install,
     CheckRelease,
+    CheckSelfUpdate,
+    SetAutoUpdateChecks(bool),
+    UpdateSelf,
     SetTextureProfile(PathBuf),
     OpenTextureCreator(String),
     ImportTextures {
@@ -146,6 +151,9 @@ enum Input {
     },
     Installed(Result<Installed>),
     ReleaseChecked(Result<ReleaseInfo>),
+    SelfUpdateChecked(Result<self_update::Release>),
+    SelfUpdatePrepared(Result<self_update::Prepared>),
+    SelfUpdateCancelled(Result<()>),
     TextureProgress {
         files: usize,
         bytes: u64,
@@ -283,6 +291,9 @@ struct Engine {
     history_last_hash: Option<String>,
     history_cursor: Option<String>,
     migrated_backups: bool,
+    self_updates: self_update::State,
+    last_self_update_check: Instant,
+    last_self_update_cleanup: Instant,
     transfer: String,
     message: String,
     error: Option<String>,
@@ -339,6 +350,9 @@ pub fn start() -> Result<Backend> {
                 engine.report(error);
             }
             if let Err(error) = engine.reload_textures() {
+                engine.report(error);
+            }
+            if let Err(error) = engine.initialize_self_updates() {
                 engine.report(error);
             }
             engine.message = "Local stores checked. Checking your private LAN...".into();
@@ -423,6 +437,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         texture_busy: false,
         textures: textures::State::default(),
         history: history::Page::default(),
+        self_updates: self_update::State::default(),
         message: "Loading compact history and checking your private LAN...".into(),
         error: None,
         shutdown: false,
@@ -494,6 +509,10 @@ impl Engine {
             history_last_hash: None,
             history_cursor: None,
             migrated_backups: false,
+            self_updates: self_update::State::default(),
+            last_self_update_check: Instant::now() - self_update::CHECK_INTERVAL
+                + Duration::from_secs(15),
+            last_self_update_cleanup: Instant::now(),
             transfer: String::new(),
             message: "Loading compact history and checking your private LAN...".into(),
             error: None,
@@ -520,6 +539,7 @@ impl Engine {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
             if !self.fatal
+                && !self.shutdown
                 && let Err(error) = self.tick()
             {
                 self.report(error);
@@ -688,6 +708,104 @@ impl Engine {
                 self.latest_release = Some(release);
                 Ok(())
             }
+            Input::SelfUpdateChecked(result) => {
+                self.self_updates.checking = false;
+                self.self_updates.checked_at = Some(time::OffsetDateTime::now_utc().to_string());
+                match result {
+                    Ok(release) => {
+                        self.audit.record(
+                            "app-update-checked",
+                            None,
+                            Some(&release.sha256),
+                            None,
+                            &release.tag,
+                        )?;
+                        self.self_updates.error = None;
+                        self.self_updates.message = if release.update_available {
+                            format!(
+                                "Twilight Sync {} is available. Use Update Twilight Sync in the tray when both games are stopped.",
+                                release.tag
+                            )
+                        } else {
+                            format!(
+                                "Running Twilight Sync {}; latest published release is {}.",
+                                env!("CARGO_PKG_VERSION"),
+                                release.tag
+                            )
+                        };
+                        self.self_updates.latest = Some(release);
+                    }
+                    Err(error) => {
+                        let detail = format!("Cannot check Twilight Sync updates: {error:#}");
+                        self.audit
+                            .record("app-update-check-failed", None, None, None, &detail)?;
+                        self.self_updates.latest = None;
+                        self.self_updates.error = Some(detail);
+                        self.self_updates.message = "Update status is unknown. LAN syncing is not affected; retry the check when connected.".into();
+                    }
+                }
+                Ok(())
+            }
+            Input::SelfUpdatePrepared(result) => {
+                self.self_updates.preparing = false;
+                let prepared = match result {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.self_updates.error = Some(format!("{error:#}"));
+                        self.self_updates.message =
+                            "Update preparation failed. The current app remains running.".into();
+                        return Err(error);
+                    }
+                };
+                self.game_running = self.process.game_running();
+                let safe = (|| -> Result<()> {
+                    self.require_idle()?;
+                    ensure!(
+                        self.no_transfer()
+                            && !self.iso_preparing
+                            && self.child.is_none()
+                            && self.launch_pending.is_none(),
+                        "Finish all gameplay and transfers before updating"
+                    );
+                    self.audit.record("app-update-handoff", None, None, None, "Verified helper acknowledged readiness; clean shutdown requested. Persistent state is unchanged")?;
+                    Ok(())
+                })();
+                if let Err(error) = safe {
+                    self.self_updates.error = Some(format!("Update deferred: {error:#}"));
+                    self.self_updates.message = "Gameplay or a transfer began during preparation. The update was cancelled without stopping the game.".into();
+                    self.self_updates.preparing = true;
+                    let sender = self.sender.clone();
+                    thread::spawn(move || {
+                        if sender
+                            .send(Input::SelfUpdateCancelled(prepared.cancel()))
+                            .is_err()
+                        {
+                            eprintln!("Cannot deliver self-update cancellation result");
+                        }
+                    });
+                } else {
+                    drop(prepared);
+                    self.self_updates.message =
+                        "Restarting to install the verified update...".into();
+                    self.shutdown = true;
+                }
+                Ok(())
+            }
+            Input::SelfUpdateCancelled(result) => {
+                self.self_updates.preparing = false;
+                if let Err(error) = result {
+                    self.self_updates.error = Some(format!("{error:#}"));
+                    return Err(error);
+                }
+                self.audit.record(
+                    "app-update-cancelled",
+                    None,
+                    None,
+                    None,
+                    "Current app and game were not terminated",
+                )?;
+                Ok(())
+            }
             Input::TextureProgress { files, bytes } => {
                 if self.texture_busy {
                     self.texture_state.notice = format!(
@@ -834,7 +952,7 @@ impl Engine {
 
     fn require_idle(&self) -> Result<()> {
         ensure!(
-            !self.install_busy && !self.texture_busy,
+            !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
             "Wait for the current installation, update, or texture operation"
         );
         ensure!(
@@ -1161,7 +1279,7 @@ impl Engine {
             Command::AcceptIso(destination) => self.accept_iso(destination)?,
             Command::CheckRelease => {
                 ensure!(
-                    !self.install_busy && !self.texture_busy,
+                    !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
                     "A management operation is already running"
                 );
                 self.audit.record(
@@ -1180,6 +1298,74 @@ impl Engine {
                         .is_err()
                     {
                         eprintln!("Twilight Sync stopped during the release check");
+                    }
+                });
+            }
+            Command::CheckSelfUpdate => self.begin_self_update_check()?,
+            Command::SetAutoUpdateChecks(enabled) => {
+                self_update::set_enabled(&self.root, enabled)?;
+                self.audit.record(
+                    "automatic-app-update-checks-changed",
+                    None,
+                    None,
+                    None,
+                    if enabled {
+                        "Enabled: startup and every six hours; never automatic installation"
+                    } else {
+                        "Disabled; manual checks remain available"
+                    },
+                )?;
+                self.self_updates.enabled = enabled;
+                if enabled {
+                    self.last_self_update_check = Instant::now() - self_update::CHECK_INTERVAL;
+                }
+            }
+            Command::UpdateSelf => {
+                self.game_running = self.process.game_running();
+                self.require_idle()?;
+                ensure!(
+                    !self.self_updates.checking,
+                    "Wait for the current update check"
+                );
+                ensure!(
+                    self.no_transfer()
+                        && !self.iso_preparing
+                        && self.child.is_none()
+                        && self.launch_pending.is_none(),
+                    "Finish gameplay and transfers before updating"
+                );
+                ensure!(
+                    self.self_updates.available(),
+                    "Check for a newer Twilight Sync release first"
+                );
+                let release = self
+                    .self_updates
+                    .latest
+                    .clone()
+                    .context("No verified release metadata")?;
+                self.audit.record(
+                    "app-update-approved",
+                    None,
+                    Some(&release.sha256),
+                    None,
+                    &release.tag,
+                )?;
+                self.self_updates.preparing = true;
+                self.self_updates.error = None;
+                self.self_updates.message = format!(
+                    "Downloading and verifying Twilight Sync {}. This app remains running until the helper is ready.",
+                    release.tag
+                );
+                let root = self.root.clone();
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    if sender
+                        .send(Input::SelfUpdatePrepared(self_update::prepare(
+                            &root, &release,
+                        )))
+                        .is_err()
+                    {
+                        eprintln!("Cannot deliver the verified self-update preparation result");
                     }
                 });
             }
@@ -1401,7 +1587,10 @@ impl Engine {
                     "Stop Dusklight before quitting; close the window to the tray instead"
                 );
                 ensure!(
-                    !self.install_busy && !self.texture_busy && !self.iso_preparing,
+                    !self.install_busy
+                        && !self.texture_busy
+                        && !self.self_updates.preparing
+                        && !self.iso_preparing,
                     "Wait for installation, textures, or ISO verification to finish"
                 );
                 self.shutdown = true;
@@ -1861,7 +2050,10 @@ impl Engine {
                 self.refresh_save()?;
                 let result = (|| -> Result<PlayLock> {
                     ensure!(
-                        self.no_transfer() && !self.install_busy && !self.texture_busy,
+                        self.no_transfer()
+                            && !self.install_busy
+                            && !self.texture_busy
+                            && !self.self_updates.preparing,
                         "A transfer or installation is active"
                     );
                     ensure!(
@@ -1940,21 +2132,17 @@ impl Engine {
                     .as_ref()
                     .context("Select or install Dusklight")?;
                 self.managed_token = Some(token);
-                match play::launch(executable) {
-                    Ok(child) => {
-                        self.child = Some(child);
-                        self.game_running = true;
-                        self.audit.record(
-                            "game-started",
-                            Some(executable),
-                            self.local_hash.as_deref(),
-                            Some(&peer),
-                            "Both devices durably reserved the same exclusive-play lock",
-                        )?;
-                        self.send_state()?;
-                    }
-                    Err(error) => return Err(error),
-                }
+                let child = play::launch(executable)?;
+                self.child = Some(child);
+                self.game_running = true;
+                self.audit.record(
+                    "game-started",
+                    Some(executable),
+                    self.local_hash.as_deref(),
+                    Some(&peer),
+                    "Both devices durably reserved the same exclusive-play lock",
+                )?;
+                self.send_state()?;
             }
             Event::LeaseDenied { token, reason } => {
                 ensure!(
@@ -2315,7 +2503,10 @@ impl Engine {
         );
         self.require_idle()?;
         ensure!(
-            self.no_transfer() && !self.install_busy && !self.texture_busy,
+            self.no_transfer()
+                && !self.install_busy
+                && !self.texture_busy
+                && !self.self_updates.preparing,
             "Finish all transfers and installation before playing"
         );
         ensure!(
@@ -2422,6 +2613,68 @@ impl Engine {
                 Err(error).context("Save validation failed; no data was transferred or overwritten")
             }
         }
+    }
+
+    fn initialize_self_updates(&mut self) -> Result<()> {
+        match self_update::load_enabled(&self.root) {
+            Ok(enabled) => self.self_updates.enabled = enabled,
+            Err(error) => {
+                self.self_updates.enabled = false;
+                self.self_updates.error =
+                    Some(format!("Update preferences need review: {error:#}"));
+                return Err(error);
+            }
+        }
+        self.clean_completed_updates()
+    }
+
+    fn clean_completed_updates(&mut self) -> Result<()> {
+        match self_update::cleanup(&self.root) {
+            Ok(count) => {
+                if count > 0 {
+                    self.audit.record("app-update-staging-cleaned", None, None, None, &format!("Removed {count} completed/cancelled updater folders; failed backups were retained"))?;
+                }
+            }
+            Err(error) => {
+                let detail = format!("Completed update cleanup needs review: {error:#}");
+                self.audit
+                    .record("app-update-cleanup-failed", None, None, None, &detail)?;
+                self.self_updates.error = Some(detail);
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_self_update_check(&mut self) -> Result<()> {
+        ensure!(
+            !self.self_updates.checking && !self.self_updates.preparing,
+            "A Twilight Sync update operation is already running"
+        );
+        ensure!(
+            self.last_self_update_check.elapsed() >= Duration::from_secs(10),
+            "Update checks are rate limited; retry shortly"
+        );
+        self.audit.record(
+            "app-update-check-requested",
+            None,
+            None,
+            None,
+            "Official GitHub stable-release metadata only; no automatic download or installation",
+        )?;
+        self.last_self_update_check = Instant::now();
+        self.self_updates.checking = true;
+        self.self_updates.error = None;
+        self.self_updates.message = "Checking official Twilight Sync releases...".into();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            if sender
+                .send(Input::SelfUpdateChecked(self_update::check()))
+                .is_err()
+            {
+                eprintln!("Twilight Sync stopped during its app-update check");
+            }
+        });
+        Ok(())
     }
 
     fn reload_textures(&mut self) -> Result<()> {
@@ -2540,6 +2793,19 @@ impl Engine {
     }
 
     fn tick(&mut self) -> Result<()> {
+        if self.self_updates.enabled
+            && !self.self_updates.checking
+            && !self.self_updates.preparing
+            && self.last_self_update_check.elapsed() >= self_update::CHECK_INTERVAL
+        {
+            self.begin_self_update_check()?;
+        }
+        if !self.self_updates.preparing
+            && self.last_self_update_cleanup.elapsed() >= Duration::from_secs(60)
+        {
+            self.last_self_update_cleanup = Instant::now();
+            self.clean_completed_updates()?;
+        }
         if self.network.is_some() && self.last_verified.elapsed() > Duration::from_secs(12) {
             self.stop_network("Router verification is stale; all network activity stopped");
             self.network = None;
@@ -2978,6 +3244,7 @@ impl Engine {
             texture_busy: self.texture_busy,
             textures: self.texture_state.clone(),
             history: self.history_page.clone(),
+            self_updates: self.self_updates.clone(),
             message: self.message.clone(),
             error: self.error.clone(),
             shutdown: self.shutdown,
@@ -3171,6 +3438,49 @@ mod tests {
             self.left.disconnect("Test completed");
             self.right.disconnect("Test completed");
         }
+    }
+
+    #[test]
+    fn app_update_opt_out_and_network_failures_do_not_change_save_settings() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), None)?;
+        let original = fs::read(h.left.root.join("settings.json"))?;
+        h.left.command(Command::SetAutoUpdateChecks(false))?;
+        assert!(!self_update::load_enabled(&h.left.root)?);
+        assert_eq!(fs::read(h.left.root.join("settings.json"))?, original);
+        h.left.input(Input::SelfUpdateChecked(Err(anyhow::anyhow!(
+            "simulated offline connection"
+        ))))?;
+        assert!(
+            h.left
+                .self_updates
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("offline"))
+        );
+        assert!(
+            h.left.error.is_none(),
+            "App update metadata failures must not fail LAN syncing"
+        );
+        assert!(!h.left.self_updates.available());
+        Ok(())
+    }
+
+    #[test]
+    fn app_updates_require_verified_availability_and_an_idle_manager() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), None)?;
+        h.left.self_updates.preparing = true;
+        assert!(h.left.require_idle().is_err());
+        h.left.self_updates.preparing = false;
+        h.left.process = ProcessMonitor::for_test(true);
+        assert!(h.left.command(Command::UpdateSelf).is_err());
+        h.left.process = ProcessMonitor::for_test(false);
+        assert!(h.left.command(Command::UpdateSelf).is_err());
+        assert!(!h.left.self_updates.preparing);
+        assert!(
+            !h.left.root.join("updates").try_exists()?,
+            "No available release means no download or staging"
+        );
+        Ok(())
     }
 
     #[test]

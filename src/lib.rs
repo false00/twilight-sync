@@ -7,6 +7,7 @@ pub mod lan;
 pub mod play;
 pub mod protocol;
 pub mod runtime;
+pub mod self_update;
 pub mod textures;
 #[cfg(windows)]
 pub mod ui;

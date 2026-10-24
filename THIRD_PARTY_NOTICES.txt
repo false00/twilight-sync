@@ -1,7 +1,7 @@
 Generated third-party and bundled-font notices for Twilight Sync.
 Manifest fingerprints use UTF-8 text with LF-normalized line endings.
-Cargo.toml SHA-256: 8743e5da980e7c4abc3f78aef2b4abc55ed8c909061ccd6b3829e5e94c9ab067
-Cargo.lock SHA-256: 08691eed8bd6378d52a0591e391c07fbf09aca84bd900c7738550487beb56f46
+Cargo.toml SHA-256: 6ac352b441d8416c481f72a56206f1fc47821215b6c64cd8d6d1563db18b18a3
+Cargo.lock SHA-256: f46f8381ff7f3b24a47aa8cf509ec0ca220d6ab30bce01dcfb3149b75b31478a
 
 Twilight Sync - third-party notices
 ==================================
@@ -5309,7 +5309,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License
 ----------------------------------------------------------------------
 Used by:
-  twilight-sync 0.2.0 - https://crates.io/crates/twilight-sync/0.2.0
+  twilight-sync 0.3.0 - https://crates.io/crates/twilight-sync/0.3.0
 
 MIT License
 
@@ -5348,6 +5348,7 @@ Used by:
   pin-project-lite 0.2.17 - https://crates.io/crates/pin-project-lite/0.2.17
   proc-macro2 1.0.107 - https://crates.io/crates/proc-macro2/1.0.107
   quote 1.0.47 - https://crates.io/crates/quote/1.0.47
+  semver 1.0.28 - https://crates.io/crates/semver/1.0.28
   serde 1.0.229 - https://crates.io/crates/serde/1.0.229
   serde_core 1.0.229 - https://crates.io/crates/serde_core/1.0.229
   serde_derive 1.0.229 - https://crates.io/crates/serde_derive/1.0.229

@@ -18,7 +18,7 @@ fn main() {
         #[cfg(windows)]
         if std::env::args_os()
             .nth(1)
-            .is_none_or(|a| a == "--background")
+            .is_none_or(|a| a == "--background" || a == "--apply-update")
         {
             rfd::MessageDialog::new()
                 .set_title("Twilight Sync - action needed")
@@ -33,9 +33,19 @@ fn main() {
 fn run() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next();
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--apply-update")
+    {
+        let plan = PathBuf::from(arguments.next().context("Missing private update plan")?);
+        if arguments.next().is_some() {
+            bail!("Unexpected update helper arguments");
+        }
+        return twilight_sync::self_update::apply(&twilight_sync::config::root_directory()?, &plan);
+    }
     if first.as_deref().is_some_and(|a| a == "--help" || a == "-h") {
         println!(
-            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically."
+            "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --check-save PATH\n                                Validate a GCI without changing anything\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
         return Ok(());
     }
@@ -80,6 +90,23 @@ fn run() -> Result<()> {
         println!(
             "OFFICIAL DUSKLIGHT RELEASE\nVersion: {}\nAsset: {}\nSize: {}\nSHA-256: {}\nNo program or settings were changed.",
             release.tag, release.asset, release.size, release.sha256
+        );
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--check-app-updates")
+    {
+        if arguments.next().is_some() {
+            bail!("Unexpected extra arguments");
+        }
+        let release = twilight_sync::self_update::check()?;
+        println!(
+            "TWILIGHT SYNC RELEASE\nCurrent: {}\nPublished: {}\nUpdate available: {}\nSHA-256: {}\nNo program or settings were changed.",
+            env!("CARGO_PKG_VERSION"),
+            release.tag,
+            release.update_available,
+            release.sha256
         );
         return Ok(());
     }

@@ -32,6 +32,9 @@ struct Tray {
     icon: TrayIcon,
     status: MenuItem,
     startup: CheckMenuItem,
+    automatic_updates: CheckMenuItem,
+    check_updates: MenuItem,
+    update_app: MenuItem,
     show: MenuId,
     sync: MenuId,
     launch: MenuId,
@@ -66,13 +69,21 @@ fn icon_pixels() -> Vec<u8> {
     pixels
 }
 
-fn make_tray(startup: bool) -> Result<Tray> {
+fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
     let menu = Menu::new();
     let status = MenuItem::new("Checking private LAN...", false, None);
     let show = MenuItem::new("Open Twilight Sync", true, None);
     let sync = MenuItem::new("Send save to partner", true, None);
     let launch = MenuItem::new("Play Dusklight (protected)", true, None);
     let startup = CheckMenuItem::new("Start with Windows", true, startup, None);
+    let automatic_updates = CheckMenuItem::new(
+        "Automatically check app updates",
+        true,
+        automatic_updates,
+        None,
+    );
+    let check_updates = MenuItem::new("Check Twilight Sync updates", true, None);
+    let update_app = MenuItem::new("Update Twilight Sync (check first)", false, None);
     let quit = MenuItem::new("Quit", true, None);
     menu.append_items(&[
         &status,
@@ -80,6 +91,10 @@ fn make_tray(startup: bool) -> Result<Tray> {
         &show,
         &sync,
         &launch,
+        &PredefinedMenuItem::separator(),
+        &check_updates,
+        &update_app,
+        &automatic_updates,
         &PredefinedMenuItem::separator(),
         &startup,
         &quit,
@@ -94,6 +109,9 @@ fn make_tray(startup: bool) -> Result<Tray> {
         icon,
         status,
         startup,
+        automatic_updates,
+        check_updates,
+        update_app,
         show: show.id().clone(),
         sync: sync.id().clone(),
         launch: launch.id().clone(),
@@ -121,7 +139,7 @@ pub fn run_smoke(backend: Backend, background: bool, page: &str) -> Result<()> {
 
 fn run_page(backend: Backend, background: bool, initial_page: Page) -> Result<()> {
     let snapshot = backend.snapshot()?;
-    let tray = make_tray(snapshot.settings.startup)?;
+    let tray = make_tray(snapshot.settings.startup, snapshot.self_updates.enabled)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1060.0, 780.0])
@@ -219,10 +237,110 @@ impl Dashboard {
                 self.dispatch(Command::Launch);
             } else if event.id == *self.tray.startup.id() {
                 self.dispatch(Command::SetStartup(self.tray.startup.is_checked()));
+            } else if event.id == *self.tray.automatic_updates.id() {
+                self.dispatch(Command::SetAutoUpdateChecks(
+                    self.tray.automatic_updates.is_checked(),
+                ));
+            } else if event.id == *self.tray.check_updates.id() {
+                self.dispatch(Command::CheckSelfUpdate);
+            } else if event.id == *self.tray.update_app.id() {
+                self.confirm_app_update();
             } else if event.id == self.tray.quit {
                 self.dispatch(Command::Shutdown);
             }
         }
+    }
+
+    fn confirm_app_update(&mut self) {
+        let snapshot = match self.backend.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.local_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let Some(release) = snapshot
+            .self_updates
+            .latest
+            .filter(|release| release.update_available)
+        else {
+            self.local_error = Some("Check for a newer Twilight Sync release first.".into());
+            return;
+        };
+        let approved = rfd::MessageDialog::new().set_title("Update Twilight Sync")
+            .set_description(format!("Download and install Twilight Sync {} ({:.1} MiB)?\n\nBoth games and all transfers must be idle. The app will verify SHA-256, shut down cleanly, update its executable, and restart in the tray. Saves, pairing, snapshots, textures, and preferences are preserved.\n\nNo update is installed without your approval.", release.tag, release.size as f64 / 1_048_576.0))
+            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+        if approved {
+            self.dispatch(Command::UpdateSelf);
+        }
+    }
+
+    fn app_updates(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        Self::card(ui, |ui| {
+            ui.label(RichText::new("Twilight Sync updates").strong().size(18.0));
+            ui.label(format!("Current app: v{}", env!("CARGO_PKG_VERSION")));
+            ui.label(&snapshot.self_updates.message);
+            if let Some(error) = &snapshot.self_updates.error {
+                ui.label(RichText::new(error).color(GOLD));
+            }
+            if let Some(release) = &snapshot.self_updates.latest {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Published release: {}", release.tag))
+                            .color(if release.update_available { GOLD } else { TEAL }),
+                    );
+                    ui.hyperlink_to("Release notes", &release.notes_url);
+                });
+            }
+            if let Some(checked) = &snapshot.self_updates.checked_at {
+                ui.label(
+                    RichText::new(format!("Last check: {checked}"))
+                        .small()
+                        .color(MUTED),
+                );
+            }
+            let mut enabled = snapshot.self_updates.enabled;
+            if ui
+                .add_enabled(
+                    !snapshot.self_updates.preparing,
+                    egui::Checkbox::new(
+                        &mut enabled,
+                        "Automatically check GitHub at startup and every six hours",
+                    ),
+                )
+                .changed()
+            {
+                self.dispatch(Command::SetAutoUpdateChecks(enabled));
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !snapshot.self_updates.checking && !snapshot.self_updates.preparing,
+                        egui::Button::new("Check app updates now"),
+                    )
+                    .clicked()
+                {
+                    self.dispatch(Command::CheckSelfUpdate);
+                }
+                let safe = !snapshot.game_running
+                    && !snapshot.remote_game
+                    && snapshot.settings.play_lock.is_none()
+                    && !snapshot.texture_busy
+                    && !snapshot.install_busy
+                    && !snapshot.self_updates.preparing
+                    && !snapshot.self_updates.checking;
+                if ui
+                    .add_enabled(
+                        safe && snapshot.self_updates.available(),
+                        egui::Button::new("Update Twilight Sync..."),
+                    )
+                    .clicked()
+                {
+                    self.confirm_app_update();
+                }
+            });
+            ui.label(RichText::new("Only version metadata is checked automatically. Downloading and restarting require a confirmation. This is separate from the Dusklight game updater.").small().color(MUTED));
+        });
     }
 
     fn header(ui: &mut egui::Ui, eyebrow: &str, title: &str, description: &str) {
@@ -238,7 +356,7 @@ impl Dashboard {
             .fill(PANEL)
             .corner_radius(14.0)
             .inner_margin(20.0)
-            .stroke(Stroke::new(1.0, Color32::from_rgb(47, 48, 67)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(47, 48, 67)))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 content(ui);
@@ -281,7 +399,8 @@ impl Dashboard {
                             && !snapshot.remote_game
                             && !snapshot.install_busy
                             && !snapshot.texture_busy
-                            && !snapshot.textures.recovery_needed,
+                            && !snapshot.textures.recovery_needed
+                            && !snapshot.self_updates.preparing,
                         egui::Button::new(RichText::new("Play Dusklight").color(BACKGROUND))
                             .fill(GOLD),
                     )
@@ -588,7 +707,9 @@ impl Dashboard {
                 }
                 if ui
                     .add_enabled(
-                        !snapshot.install_busy && !snapshot.texture_busy,
+                        !snapshot.install_busy
+                            && !snapshot.texture_busy
+                            && !snapshot.self_updates.preparing,
                         egui::Button::new(if snapshot.install_busy {
                             "Checking / verifying..."
                         } else {
@@ -601,7 +722,9 @@ impl Dashboard {
                 }
                 if ui
                     .add_enabled(
-                        !snapshot.install_busy && !snapshot.texture_busy,
+                        !snapshot.install_busy
+                            && !snapshot.texture_busy
+                            && !snapshot.self_updates.preparing,
                         egui::Button::new("Check latest release"),
                     )
                     .clicked()
@@ -685,7 +808,8 @@ impl Dashboard {
             "Texture library.",
             "Creator-supported downloads. Per-user installs. One complete pack at a time.",
         );
-        let busy = snapshot.texture_busy || snapshot.install_busy;
+        let busy =
+            snapshot.texture_busy || snapshot.install_busy || snapshot.self_updates.preparing;
         if !snapshot.textures.notice.is_empty() {
             ui.label(RichText::new(&snapshot.textures.notice).color(GOLD));
             ui.add_space(8.0);
@@ -927,7 +1051,8 @@ impl Dashboard {
             && !snapshot.remote_game
             && snapshot.settings.play_lock.is_none()
             && !snapshot.texture_busy
-            && !snapshot.install_busy;
+            && !snapshot.install_busy
+            && !snapshot.self_updates.preparing;
         if snapshot.history.entries.is_empty() {
             ui.label(RichText::new("Choose a GCI save and wait for a stable save, or refresh to migrate older backups.").color(MUTED));
         }
@@ -1239,6 +1364,16 @@ impl eframe::App for Dashboard {
                             ui.add_space(8.0);
                         }
                         self.approvals(ui, &snapshot);
+                        if self.page == Page::Security
+                            || (self.page == Page::Overview
+                                && (snapshot.self_updates.checking
+                                    || snapshot.self_updates.preparing
+                                    || snapshot.self_updates.checked_at.is_some()
+                                    || snapshot.self_updates.error.is_some()))
+                        {
+                            self.app_updates(ui, &snapshot);
+                            ui.add_space(14.0);
+                        }
                         match self.page {
                             Page::Overview => self.overview(ui, &snapshot),
                             Page::Devices => self.devices(ui, &snapshot),
