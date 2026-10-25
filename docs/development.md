@@ -81,13 +81,35 @@ The runtime sets a stable application identity and supplies matching window and
 tray icons. Verify both PE resources and real native window icons in a debug UI
 smoke session; do not modify the running installation for a visual test.
 
+## Texture archive validation
+
+```powershell
+cargo test --lib --locked -- textures::tests runtime::tests
+```
+
+The importer mirrors the pinned Aurora native directory comparator and
+first-key-wins registration rule. Tests cover category aliases, path traversal,
+image magic/size/CRC checks, cancellation, automatic profile preparation,
+atomic switching, and recovery. Large ZIP64/texture tests can use an authorized
+local archive without changing it or a real game profile:
+
+```powershell
+$env:TWILIGHT_TEXTURE_TEST_ARCHIVE = 'C:\Users\YourName\Downloads\TPDE+ 1.2.0.zip'
+cargo test --release --lib --locked textures::tests::supplied_tpde_archive_installs_and_switches_without_manual_extraction -- --ignored --exact --nocapture
+```
+
+The supplied v1.2.0 archive selects exactly 5,456 native texture keys and
+8,622,649,300 image bytes. The test installs, activates, disables, and compares
+restored configuration values only inside an owned temporary profile. Original
+JSON formatting is not a save-setting value and is not assumed to be stable.
+
 ## Windows release packaging
 
 The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.7.0
+.\scripts\Package-Release.ps1 -Version v0.8.0
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
@@ -104,7 +126,7 @@ Checksums cover both the executable and the bootstrap script.
 1. Update the Cargo package version and lockfile, refresh dependency notices,
    validate the code, and commit.
 2. Push `main` and wait for CI on that exact commit to pass.
-3. Create and push the matching fresh stable tag, such as `v0.7.1`.
+3. Create and push the matching fresh stable tag, such as `v0.8.1`.
 4. The release workflow builds and tests on Windows, creates a draft release,
    uploads all assets, then publishes it as latest.
 5. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`

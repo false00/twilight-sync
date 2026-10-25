@@ -447,11 +447,11 @@ The **Texture packs** page includes:
 
 - **Henriko Magnifico's Twilight Princess 4K** project.
 - The same creator's **1080p** edition, with lower-resolution textures.
-- **[TP Definitive Edition+ v1.2.0](https://gamebanana.com/mods/676609)**, with a
-  dedicated project entry and a `1.2.0` import-version preset.
+- **[TP Definitive Edition+](https://gamebanana.com/mods/676609)**, including the
+  complete v1.2.0 archive and a `1.2.0` local version-label preset.
 - **Authorized local HD/custom imports**, including assets you have permission
   to use from your own sources. Nintendo-derived HD assets are not bundled,
-  linked for download, or redistributed by Twilight Sync.
+  redistributed by Twilight Sync.
 
 The project and its native Dusklight compatibility were checked against the
 [creator's own page](https://www.henrikomagnifico.com/zelda-twilight-princess-4k)
@@ -468,25 +468,24 @@ downloaded archive's release version, and no pack assets are bundled or rehosted
 
 ### Install or update a texture pack
 
-1. Choose **Get latest / updates from creator**. The creator maintains the
-   current downloads; select the desktop release and resolution you want.
-2. Complete the publisher's normal browser/account/download flow yourself.
-   There is no Drive/Patreon scraping, embedded account login, paywall bypass,
-   or rehosting. Texture updates are **creator-assisted, not silent automatic
-   downloads**.
-3. Select the project in Twilight Sync, enter a version label, and confirm you
-   have permission to use the assets.
-4. Choose **Install ZIP** or **Install extracted GZ2 folder**. For 7z/RAR,
-   extract with your own trusted archive utility first. Select one resolution
-   and variant, not a bundle containing conflicting versions of the same texture.
-5. Choose the actual Dusklight **config.json** to associate its user profile.
-   The manager uses that file's directory and its `texture_replacements` child;
-   it does not guess the profile from the executable's directory.
-6. Stop Dusklight on both paired devices and select **Activate this version**.
-   Switches take effect on the next launch through the normal game launcher.
+1. Stop Dusklight on both paired devices.
+2. Select the project and confirm permission to use its texture assets.
+3. Choose **Install ZIP** and select the complete creator archive. An already
+   extracted folder is also supported. There is no need to extract individual
+   category/variant folders or select `config.json`.
+4. The manager resolves Dusklight's actual profile, validates the archive,
+   installs the native-selected textures, and activates the pack. Existing
+   unmanaged texture files require approval to preserve them before switching.
+5. Use **Activate** beside an installed version to switch later. Changes apply
+   on the next normal game launch.
 
-Updating means importing the new authorized archive/folder and activating that
-installed version. Identical content is deduplicated by content ID instead of
+Direct downloads are paused while creator sources are inaccessible. The TPDE+
+Google Drive source returned a download-quota error and its second listed mirror
+refused access during validation. Hosting quotas, account permissions, paid
+access, and anti-bot controls are not bypassed. Automatic downloading is not
+included in this update.
+
+Updating means installing the new authorized archive/folder. Identical content is deduplicated by content ID instead of
 being installed again under a different label. Older installed versions stay
 available for switching back. Texture libraries are independent on each device;
 **texture files never travel over twilightProto**.
@@ -494,15 +493,29 @@ available for switching back. Texture libraries are independent on each device;
 Only native-style `tex1_...` PNG/DDS images are installed. The importer reports
 skipped files: bundled emulators, DLLs, scripts, shaders, installers, documentation,
 and Dolphin-only names such as unsupported material maps are not copied.
-Path traversal, links, alternate data streams, unsafe names, conflicting
-texture keys, excessive entry counts/depth, and oversized files are refused.
-PNG structure/chunk CRCs and DDS headers/mip payload lengths are checked, with a
-16-megapixel decoded-dimension bound. This is structural validation, not a
+Category duplicates are selected exactly like released Dusklight/Aurora:
+relative path components are sorted case-insensitively with original-case
+tie-breaking, and the first registration for each texture key wins. The complete
+TPDE+ archive therefore does not need manual variant extraction. Repeated entries
+at the exact same archive path are still refused.
+
+Path traversal, links, alternate data streams, unsafe names, excessive entry
+counts/depth, and oversized files are refused. PNG structure/chunk CRCs and DDS
+headers/mip payload lengths are checked. Valid DDS data mislabeled `.png` is
+installed with the correct extension after full structural validation; unrelated
+or executable data is not renamed into acceptance.
+
+Images are bounded to 16,384 pixels per dimension and 64 megapixels total, which
+supports the pack's 9,216-pixel font atlases and large 8K textures. This is structural validation, not a
 guarantee that every image is harmless to every game/graphics-library version.
 
-The import limits are 25,000 selected images, 100,000 source entries, 128 MiB per
+The import limits are 25,000 selected images, 100,000 source entries, 256 MiB per
 image, and 16 GiB per pack. Large packs genuinely use gigabytes; the save-history
 budget does not apply to textures or program installations.
+
+Free space for the entire selected pack is checked before copying. Installation
+reports progress and can be cancelled before the transactional activation stage.
+The archive is opened read-only; only PNG/DDS assets are published into the library.
 
 ### Safe switching and recovery
 

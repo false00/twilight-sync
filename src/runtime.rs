@@ -21,7 +21,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Child,
     sync::{
         Arc, Mutex,
@@ -92,12 +92,13 @@ pub enum Command {
     CheckSelfUpdate,
     SetAutoUpdateChecks(bool),
     UpdateSelf,
-    SetTextureProfile(PathBuf),
     OpenTextureCreator(String),
+    CancelTextures,
     ImportTextures {
         source: String,
         version: String,
         path: PathBuf,
+        preserve_unmanaged: bool,
     },
     ActivateTextures {
         id: Option<String>,
@@ -162,6 +163,10 @@ enum Input {
         files: usize,
         bytes: u64,
     },
+    TextureStatus {
+        message: String,
+        cancellable: bool,
+    },
     TextureDone(Result<TextureOutcome>),
     IsoPrepared {
         id: u64,
@@ -180,7 +185,7 @@ enum Input {
 }
 
 enum TextureOutcome {
-    Imported(Pack),
+    Installed { pack: Pack, activation: Activation },
     Activated(Activation),
     Recovered(Vec<PathBuf>),
 }
@@ -314,6 +319,7 @@ struct Engine {
     latest_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
     texture_busy: bool,
+    texture_cancel: Arc<AtomicBool>,
     texture_state: textures::State,
     textures_loaded: bool,
     history: Option<History>,
@@ -344,6 +350,28 @@ fn texture_game_stopped() -> Result<()> {
     ensure!(
         !ProcessMonitor::default().game_running(),
         "Stop every Dusklight process before changing textures"
+    );
+    Ok(())
+}
+
+fn texture_profile_stopped(
+    view: &Arc<Mutex<Snapshot>>,
+    default_profile: &Path,
+    executable: Option<&Path>,
+    profile: &Path,
+) -> Result<()> {
+    texture_game_stopped()?;
+    let snapshot = view
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Texture status lock is poisoned"))?;
+    ensure!(
+        !snapshot.remote_game,
+        "Stop Dusklight on the paired device before applying textures"
+    );
+    drop(snapshot);
+    ensure!(
+        save_location::profile(default_profile, executable)? == profile,
+        "Dusklight's profile changed during texture installation; no pack was applied to another profile"
     );
     Ok(())
 }
@@ -633,6 +661,7 @@ impl Engine {
             latest_release: None,
             selected_release: None,
             texture_busy: false,
+            texture_cancel: Arc::new(AtomicBool::new(false)),
             texture_state: textures::State::default(),
             textures_loaded: false,
             history: None,
@@ -964,6 +993,16 @@ impl Engine {
                 }
                 Ok(())
             }
+            Input::TextureStatus {
+                message,
+                cancellable,
+            } => {
+                if self.texture_busy {
+                    self.texture_state.notice = message;
+                    self.texture_state.cancellable = cancellable;
+                }
+                Ok(())
+            }
             Input::TextureDone(result) => {
                 self.texture_busy = false;
                 let refresh = self.reload_textures();
@@ -979,20 +1018,29 @@ impl Engine {
                 };
                 refresh?;
                 match outcome {
-                    TextureOutcome::Imported(pack) => {
+                    TextureOutcome::Installed { pack, activation } => {
                         self.audit.record(
                             "texture-pack-imported",
                             None,
                             Some(&pack.id),
                             None,
                             &format!(
-                                "{} {}; {} images; {} unrelated files skipped",
+                                "{} {}; {} images; {} entries not selected by native texture rules",
                                 pack.source, pack.version, pack.files, pack.skipped
                             ),
                         )?;
+                        self.audit.record(
+                            "texture-pack-switched",
+                            self.settings.texture_profile.as_deref(),
+                            activation.active.as_deref(),
+                            None,
+                            "Texture pack installed and activated in the detected profile",
+                        )?;
                         self.texture_state.notice = format!(
-                            "Installed {} textures; {} bundled/non-texture files were not installed. Select Activate to switch.",
-                            pack.files, pack.skipped
+                            "{} {} installed and active: {} textures. Changes apply on the next game launch.",
+                            textures::catalog(&pack.source)?.name,
+                            pack.version,
+                            pack.files
                         );
                     }
                     TextureOutcome::Activated(activation) => {
@@ -1192,6 +1240,106 @@ impl Engine {
             && self.outgoing_iso.is_none()
             && !self.iso_preparing
             && self.iso_verifying.is_none()
+    }
+
+    fn install_texture(
+        &mut self,
+        source: String,
+        version: String,
+        path: PathBuf,
+        preserve_unmanaged: bool,
+    ) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
+        ensure!(
+            self.no_transfer(),
+            "Finish pending transfers before installing textures"
+        );
+        textures::catalog(&source)?;
+        ensure!(
+            self.settings.game_exe.is_some(),
+            "Locate or install Dusklight before installing its textures"
+        );
+        self.reload_textures()?;
+        let profile = self
+            .settings
+            .texture_profile
+            .clone()
+            .context("Automatic Dusklight profile detection is not ready")?;
+        self.audit.record(
+            "texture-install-requested",
+            Some(&path),
+            None,
+            None,
+            &format!("{source}; user approved authorized texture installation"),
+        )?;
+        self.texture_busy = true;
+        self.texture_cancel = Arc::new(AtomicBool::new(false));
+        self.texture_state.cancellable = true;
+        self.texture_state.notice = "Preparing texture installation...".into();
+        let cancel = self.texture_cancel.clone();
+        let root = self.root.clone();
+        let default_profile = self.default_profile.clone();
+        let executable = self.settings.game_exe.clone();
+        let view = self.view.clone();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let status = |message: String, cancellable: bool| -> Result<()> {
+                sender
+                    .send(Input::TextureStatus {
+                        message,
+                        cancellable,
+                    })
+                    .map_err(|_| anyhow::anyhow!("Texture manager stopped during installation"))
+            };
+            let check_idle = || -> Result<()> {
+                texture_profile_stopped(&view, &default_profile, executable.as_deref(), &profile)
+            };
+            let result = (|| -> Result<TextureOutcome> {
+                status("Installing the validated texture selection using Dusklight's own priority rules...".into(), true)?;
+                let mut reported = 0;
+                let pack = textures::import_cancellable(
+                    &root,
+                    &source,
+                    &version,
+                    &path,
+                    cancel.clone(),
+                    |files, bytes| {
+                        if files >= reported + 20 {
+                            reported = files;
+                            if let Err(error) = sender.send(Input::TextureProgress { files, bytes })
+                            {
+                                eprintln!("Cannot deliver texture progress: {error}");
+                                cancel.store(true, Ordering::Release);
+                            }
+                        }
+                    },
+                )?;
+                ensure!(
+                    !cancel.load(Ordering::Acquire),
+                    "Texture pack is installed; activation was cancelled"
+                );
+                status(
+                    "Applying textures to the detected Dusklight profile...".into(),
+                    false,
+                )?;
+                textures::prepare_profile(&profile, check_idle)
+                    .context("Texture pack is installed, but profile setup could not complete")?;
+                let activation = textures::activate(
+                    &root,
+                    &profile,
+                    Some(&pack.id),
+                    preserve_unmanaged,
+                    check_idle,
+                )
+                .context("Texture pack is installed, but activation could not complete")?;
+                Ok(TextureOutcome::Installed { pack, activation })
+            })();
+            if sender.send(Input::TextureDone(result)).is_err() {
+                eprintln!("Twilight Sync stopped before texture installation completed");
+            }
+        });
+        Ok(())
     }
 
     fn command(&mut self, command: Command) -> Result<()> {
@@ -1552,19 +1700,14 @@ impl Engine {
                     }
                 });
             }
-            Command::SetTextureProfile(path) => {
-                self.game_running = self.process.game_running();
-                self.require_idle()?;
-                textures::validate_profile(&path)?;
-                self.audit.record(
-                    "texture-profile-selected",
-                    Some(&path),
-                    None,
-                    None,
-                    "User selected Dusklight's actual config.json directory",
-                )?;
-                self.store(|s| s.texture_profile = Some(path))?;
-                self.reload_textures()?;
+            Command::CancelTextures => {
+                ensure!(
+                    self.texture_busy && self.texture_state.cancellable,
+                    "Texture activation cannot be interrupted; wait for it to finish"
+                );
+                self.texture_cancel.store(true, Ordering::Release);
+                self.texture_state.notice = "Cancelling texture installation...".into();
+                self.texture_state.cancellable = false;
             }
             Command::OpenTextureCreator(source) => {
                 let entry = textures::catalog(&source)?;
@@ -1583,39 +1726,9 @@ impl Engine {
                 source,
                 version,
                 path,
+                preserve_unmanaged,
             } => {
-                self.game_running = self.process.game_running();
-                self.require_idle()?;
-                textures::catalog(&source)?;
-                self.audit.record(
-                    "texture-import-requested",
-                    Some(&path),
-                    None,
-                    None,
-                    &format!("{source} {version}; user confirms permission to use these assets"),
-                )?;
-                self.texture_busy = true;
-                self.texture_state.notice = "Validating and importing texture data only...".into();
-                let root = self.root.clone();
-                let sender = self.sender.clone();
-                thread::spawn(move || {
-                    let mut reported = 0;
-                    let result =
-                        textures::import(&root, &source, &version, &path, |files, bytes| {
-                            if files >= reported + 25 {
-                                reported = files;
-                                if let Err(error) =
-                                    sender.send(Input::TextureProgress { files, bytes })
-                                {
-                                    eprintln!("Cannot deliver texture import progress: {error}");
-                                }
-                            }
-                        })
-                        .map(TextureOutcome::Imported);
-                    if sender.send(Input::TextureDone(result)).is_err() {
-                        eprintln!("Twilight Sync stopped during texture import");
-                    }
-                });
+                self.install_texture(source, version, path, preserve_unmanaged)?;
             }
             Command::ActivateTextures {
                 id,
@@ -1623,11 +1736,12 @@ impl Engine {
             } => {
                 self.game_running = self.process.game_running();
                 self.require_idle()?;
+                self.reload_textures()?;
                 let profile = self
                     .settings
                     .texture_profile
                     .clone()
-                    .context("Select Dusklight's config.json first")?;
+                    .context("Automatic Dusklight profile detection is not ready")?;
                 self.audit.record(
                     "texture-switch-requested",
                     Some(&profile),
@@ -1640,15 +1754,29 @@ impl Engine {
                     "Verifying and switching texture files; do not launch Dusklight...".into();
                 let root = self.root.clone();
                 let sender = self.sender.clone();
+                let view = self.view.clone();
+                let default_profile = self.default_profile.clone();
+                let executable = self.settings.game_exe.clone();
                 thread::spawn(move || {
-                    let result = textures::activate(
-                        &root,
-                        &profile,
-                        id.as_deref(),
-                        preserve_unmanaged,
-                        texture_game_stopped,
-                    )
-                    .map(TextureOutcome::Activated);
+                    let check_idle = || {
+                        texture_profile_stopped(
+                            &view,
+                            &default_profile,
+                            executable.as_deref(),
+                            &profile,
+                        )
+                    };
+                    let result = (|| {
+                        textures::prepare_profile(&profile, check_idle)?;
+                        textures::activate(
+                            &root,
+                            &profile,
+                            id.as_deref(),
+                            preserve_unmanaged,
+                            check_idle,
+                        )
+                        .map(TextureOutcome::Activated)
+                    })();
                     if sender.send(Input::TextureDone(result)).is_err() {
                         eprintln!("Twilight Sync stopped during texture activation");
                     }
@@ -2780,7 +2908,7 @@ impl Engine {
 
     fn request_launch(&mut self) -> Result<()> {
         self.ensure_history()?;
-        if !self.textures_loaded {
+        if !self.textures_loaded && !self.texture_busy {
             self.reload_textures()?;
         }
         ensure!(
@@ -2955,6 +3083,9 @@ impl Engine {
             self.history_last_hash = None;
             self.history_cursor = None;
         }
+        if self.save_profile.as_ref() != Some(&profile) {
+            self.textures_loaded = false;
+        }
         self.save_profile = Some(profile);
         if changed {
             self.send_state()?;
@@ -3070,6 +3201,11 @@ impl Engine {
     }
 
     fn reload_textures(&mut self) -> Result<()> {
+        let profile =
+            save_location::profile(&self.default_profile, self.settings.game_exe.as_deref())?;
+        if self.settings.texture_profile.as_ref() != Some(&profile) {
+            self.store(|settings| settings.texture_profile = Some(profile))?;
+        }
         self.texture_state =
             textures::inventory(&self.root, self.settings.texture_profile.as_deref())?;
         self.textures_loaded = true;
@@ -3277,7 +3413,7 @@ impl Engine {
         if self.last_process.elapsed() >= Duration::from_secs(1) {
             self.last_process = Instant::now();
             self.process_tick()?;
-            if !self.textures_loaded {
+            if !self.textures_loaded && !self.texture_busy {
                 self.reload_textures()?;
             }
             self.refresh_save()?;
@@ -4980,6 +5116,38 @@ mod tests {
         assert!(format!("{error:#}").contains("memory-card format changed"));
         assert_eq!(files::read_save(&original)?, native_variant(0));
         assert!(!h.right.default_profile.join("MemoryCardA.USA.raw").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn local_texture_install_detects_and_prepares_the_profile_without_a_config_picker() -> Result<()>
+    {
+        let mut h = Harness::new(Some(variant(0)), None)?;
+        let executable = h.left.root.join("dusklight.exe");
+        fs::write(&executable, b"not executed")?;
+        h.left.command(Command::SetExecutable(executable))?;
+        let wrong = h.left.root.join("not-the-game-profile");
+        h.left.settings.texture_profile = Some(wrong.clone());
+        let source = textures::tests::source(&h.left.root)?;
+        h.left.command(Command::ImportTextures {
+            source: "local-hd".into(),
+            version: "test".into(),
+            path: source,
+            preserve_unmanaged: false,
+        })?;
+        h.pump_until(|h| !h.left.texture_busy)?;
+        assert_eq!(
+            h.left.settings.texture_profile.as_ref(),
+            Some(&h.left.default_profile)
+        );
+        assert!(h.left.texture_state.active.is_some());
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(h.left.default_profile.join("config.json"))?)?;
+        assert_eq!(
+            config.get("game.enableTextureReplacements"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(!wrong.exists());
         Ok(())
     }
 

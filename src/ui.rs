@@ -1135,7 +1135,14 @@ impl Dashboard {
         });
     }
 
-    fn import_texture(&mut self, folder: bool) {
+    fn preserve_texture_files(snapshot: &Snapshot) -> bool {
+        !snapshot.textures.unmanaged || rfd::MessageDialog::new()
+            .set_title("Preserve existing texture files")
+            .set_description("Existing textures will be kept in a backup beside texture_replacements. Disabling the managed pack restores them. Continue?")
+            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
+    }
+
+    fn import_texture(&mut self, folder: bool, snapshot: &Snapshot) {
         if !self.texture_permission {
             self.local_error =
                 Some("Confirm that you have permission to use the texture assets.".into());
@@ -1143,7 +1150,7 @@ impl Dashboard {
         }
         let selected = if folder {
             rfd::FileDialog::new()
-                .set_title("Choose one resolution's GZ2 texture folder")
+                .set_title("Choose the complete texture folder")
                 .pick_folder()
         } else {
             rfd::FileDialog::new()
@@ -1151,10 +1158,14 @@ impl Dashboard {
                 .pick_file()
         };
         if let Some(path) = selected {
+            if !Self::preserve_texture_files(snapshot) {
+                return;
+            }
             self.dispatch(Command::ImportTextures {
                 source: self.texture_source.clone(),
                 version: self.texture_version.clone(),
                 path,
+                preserve_unmanaged: snapshot.textures.unmanaged,
             });
         }
     }
@@ -1166,39 +1177,27 @@ impl Dashboard {
             Self::notice(ui, Tone::Info, "Texture library", &snapshot.textures.notice);
             ui.add_space(12.0);
         }
+        if snapshot.texture_busy
+            && snapshot.textures.cancellable
+            && ui.button("Cancel installation").clicked()
+        {
+            self.dispatch(Command::CancelTextures);
+        }
         Self::card(ui, |ui| {
             Self::section_title(ui, "Dusklight profile");
             if let Some(path) = &snapshot.settings.texture_profile {
-                Self::path(ui, path);
+                Self::secondary(
+                    ui,
+                    "Detected automatically. The pack is applied to the profile Dusklight actually uses.",
+                );
+                ui.collapsing("Profile details", |ui| Self::path(ui, path));
             } else {
                 Self::secondary(
                     ui,
-                    "Choose the game's actual config.json. Start Dusklight once if its user profile does not exist yet.",
+                    "Locate or install Dusklight on the Dusklight page. Its profile will be detected automatically.",
                 );
             }
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(available, egui::Button::new("Choose config.json..."))
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Dusklight config.json", &["json"])
-                        .pick_file()
-                {
-                    if path
-                        .file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("config.json"))
-                    {
-                        if let Some(parent) = path.parent() {
-                            self.dispatch(Command::SetTextureProfile(parent.into()));
-                        } else {
-                            self.local_error =
-                                Some("The profile file has no parent folder.".into());
-                        }
-                    } else {
-                        self.local_error =
-                            Some("Choose Dusklight's file named config.json.".into());
-                    }
-                }
                 if ui
                     .add_enabled(available, egui::Button::new("Refresh library"))
                     .clicked()
@@ -1234,7 +1233,7 @@ impl Dashboard {
             if snapshot.textures.packs.is_empty() {
                 Self::secondary(
                     ui,
-                    "No packs installed. Import an authorized download below.",
+                    "No packs installed. Choose a pack and install its ZIP below.",
                 );
             }
             for pack in &snapshot.textures.packs {
@@ -1269,10 +1268,7 @@ impl Dashboard {
                             )
                             .clicked()
                         {
-                            let preserve = !snapshot.textures.unmanaged
-                                || rfd::MessageDialog::new().set_title("Preserve existing texture files")
-                                    .set_description("Existing unmanaged textures will be moved to a named backup beside texture_replacements, not deleted. Disabling the managed pack restores that folder. Continue?")
-                                    .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                            let preserve = Self::preserve_texture_files(snapshot);
                             if preserve {
                                 self.dispatch(Command::ActivateTextures {
                                     id: Some(pack.id.clone()),
@@ -1306,10 +1302,10 @@ impl Dashboard {
         });
         ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::section_title(ui, "Import a texture pack");
+            Self::section_title(ui, "Install a texture pack");
             Self::secondary(
                 ui,
-                "Download from the creator in your browser, then import one resolution or variant.",
+                "Install a complete ZIP or folder in one step. No manual extraction or config selection is needed.",
             );
             let before = self.texture_source.clone();
             let selected_name = crate::textures::CATALOG
@@ -1342,42 +1338,50 @@ impl Dashboard {
                 .iter()
                 .find(|project| project.id == self.texture_source)
             {
-                if project.creator_url.is_some()
-                    && ui.button("Open creator download page").clicked()
-                {
+                if project.creator_url.is_some() && ui.button("View creator page").clicked() {
                     self.dispatch(Command::OpenTextureCreator(project.id.into()));
                 }
                 ui.collapsing("About this pack", |ui| {
                     Self::secondary(ui, project.description);
                 });
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Version label");
-                ui.add(egui::TextEdit::singleline(&mut self.texture_version).desired_width(240.0));
-            });
             ui.checkbox(
                 &mut self.texture_permission,
                 "I have permission to use these texture assets",
             );
+            ui.collapsing("Version details", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Version label");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.texture_version).desired_width(240.0),
+                    );
+                });
+            });
             ui.horizontal_wrapped(|ui| {
-                if Self::primary(ui, available && self.texture_permission, "Import ZIP...")
-                    .clicked()
+                if Self::primary(
+                    ui,
+                    available && self.texture_permission && snapshot.settings.game_exe.is_some(),
+                    "Install ZIP...",
+                )
+                .clicked()
                 {
-                    self.import_texture(false);
+                    self.import_texture(false, snapshot);
                 }
                 if ui
                     .add_enabled(
-                        available && self.texture_permission,
-                        egui::Button::new("Import GZ2 folder..."),
+                        available
+                            && self.texture_permission
+                            && snapshot.settings.game_exe.is_some(),
+                        egui::Button::new("Install folder..."),
                     )
                     .clicked()
                 {
-                    self.import_texture(true);
+                    self.import_texture(true, snapshot);
                 }
             });
             Self::secondary(
                 ui,
-                "Only validated texture images are installed. Extract 7z/RAR with your own utility first. Accounts, purchases, and browser downloads stay with the creator.",
+                "Only validated texture images are installed. Creator sign-in, paid access, quotas, and hosting restrictions are not bypassed.",
             );
         });
     }

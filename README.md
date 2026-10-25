@@ -122,8 +122,8 @@ font files are loaded from the operating system, not bundled or redistributed.
   A disconnect does not unlock a still-running game.
 - **Compact save history:** shared compressed blocks, parent-linked commits,
   restore-as-a-new-commit, and a 64 MiB managed-data budget.
-- **Texture management:** creator-download workflows for Henriko's 4K/1080p packs
-  and TP Definitive Edition+ v1.2.0, plus authorized local HD imports.
+- **Texture management:** install complete Henriko or TP Definitive Edition+
+  archives, detect the game profile, and activate the selected pack in one step.
 - **Official Dusklight updater:** verified, side-by-side program updates that
   preserve your user profile and saves.
 - **Tray app updates:** optional automatic GitHub version checks, with a
@@ -134,11 +134,16 @@ font files are loaded from the operating system, not bundled or redistributed.
 
 ### Textures
 
-Open **Texture packs**, visit the creator's download page, then import one
-downloaded ZIP or extracted GZ2 folder. Select the real Dusklight `config.json`
-and activate the installed version while both games are stopped.
+Open **Texture packs**, choose the project, confirm permission to use its assets,
+and select **Install ZIP**. Use the complete archive; no manual extraction,
+variant-folder selection, or `config.json` picker is needed. Installation also
+activates the pack in Dusklight's automatically detected profile.
 
-Creator accounts and browser downloads stay with the creator; the app does not
+Stop Dusklight on both devices before applying packs. Direct downloads are
+paused until accessible creator sources are available; archives you already have
+can be installed directly.
+
+Creator accounts and access controls stay with the creator; the app does not
 scrape logins, bypass access controls, or rehost texture assets. Nintendo-derived
 HD assets require your own authorization and are not bundled with this app.
 

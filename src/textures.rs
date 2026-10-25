@@ -5,15 +5,19 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_FILES: usize = 25_000;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_PACK: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_TEXTURE: u64 = 128 * 1024 * 1024;
+const MAX_TEXTURE: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 8 * 1024 * 1024;
 const MAX_CONFIG: u64 = 2 * 1024 * 1024;
 const MARKER: &str = ".twilight-sync-pack.json";
@@ -31,28 +35,28 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "henriko-4k",
         name: "Henriko Magnifico - Twilight Princess 4K",
-        description: "Creator-authored 4K replacements with native Dusklight support. Obtain the current desktop pack from the creator, then import its GZ2 folder or ZIP.",
+        description: "Henriko Magnifico's public PC 4K texture release with native Dusklight support. Requires more memory than the 1080p edition.",
         creator_url: Some("https://www.henrikomagnifico.com/zelda-twilight-princess-4k#downloads"),
         suggested_version: None,
     },
     CatalogEntry {
         id: "henriko-1080p",
         name: "Henriko Magnifico - Twilight Princess 1080p",
-        description: "The creator's lower-resolution edition, with the same coverage and lower memory requirements. Select the 1080p variant on the creator's page.",
+        description: "Henriko Magnifico's public PC 1080p texture release, with lower memory requirements.",
         creator_url: Some("https://www.henrikomagnifico.com/zelda-twilight-princess-4k#downloads"),
         suggested_version: None,
     },
     CatalogEntry {
         id: "tp-definitive-edition-plus",
-        name: "TP Definitive Edition+ v1.2.0",
-        description: "Community HD texture pack with Dusklight support. Obtain v1.2.0 from the author's GameBanana project, then import one authorized GZ2 folder or ZIP. The version label is a preset, not archive authentication.",
+        name: "TP Definitive Edition+",
+        description: "HD texture pack by ValdarTP, with Masterkillua, Team TrueD-TPHD, theb1gm4c, GossipGeist, and Kurow. Creator release: v1.2.0. CC BY-NC-ND 4.0; assets are not redistributed by Twilight Sync.",
         creator_url: Some("https://gamebanana.com/mods/676609"),
         suggested_version: Some("1.2.0"),
     },
     CatalogEntry {
         id: "local-hd",
         name: "HD / custom textures (authorized local import)",
-        description: "Manage texture-only PNG/DDS assets you are authorized to use. Nintendo-derived HD assets are not bundled, linked for download, or redistributed.",
+        description: "Install texture-only PNG/DDS assets you are authorized to use from a local ZIP or folder. Assets are not bundled with or redistributed by Twilight Sync.",
         creator_url: None,
         suggested_version: None,
     },
@@ -102,6 +106,7 @@ pub struct State {
     pub unmanaged: bool,
     pub recovery_needed: bool,
     pub notice: String,
+    pub cancellable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +248,23 @@ pub fn validate_profile(profile: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn prepare_profile(profile: &Path, check_idle: impl Fn() -> Result<()>) -> Result<()> {
+    check_idle()?;
+    ensure_safe_path(profile)?;
+    fs::create_dir_all(profile).context("Preparing Dusklight's detected profile")?;
+    let path = profile.join("config.json");
+    ensure_safe_path(&path)?;
+    match File::options().create_new(true).write(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(b"{}")?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("Preparing Dusklight configuration"),
+    }
+    validate_profile(profile)
+}
+
 fn read_config(profile: &Path) -> Result<(Vec<u8>, serde_json::Map<String, serde_json::Value>)> {
     let bytes = bounded_read(&profile.join("config.json"), MAX_CONFIG)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -371,12 +393,12 @@ fn parse_texture_key(mut stem: &str) -> Option<String> {
 
 fn image_dimensions(width: u32, height: u32) -> Result<()> {
     ensure!(
-        width > 0 && height > 0 && width <= 8192 && height <= 8192,
+        width > 0 && height > 0 && width <= 16384 && height <= 16384,
         "Texture dimensions exceed supported bounds"
     );
     ensure!(
-        u64::from(width) * u64::from(height) <= 4096 * 4096,
-        "Texture exceeds the 16-megapixel safety limit"
+        u64::from(width) * u64::from(height) <= 8192 * 8192,
+        "Texture exceeds the 64-megapixel safety limit"
     );
     Ok(())
 }
@@ -538,6 +560,15 @@ fn validate_image(path: &Path) -> Result<()> {
 }
 
 fn copy_image(mut input: impl Read, destination: &Path, expected: u64) -> Result<String> {
+    copy_image_cancellable(&mut input, destination, expected, &AtomicBool::new(false))
+}
+
+fn copy_image_cancellable(
+    mut input: impl Read,
+    destination: &Path,
+    expected: u64,
+    cancel: &AtomicBool,
+) -> Result<String> {
     ensure!(
         expected > 0 && expected <= MAX_TEXTURE,
         "Texture exceeds file size limit"
@@ -551,6 +582,10 @@ fn copy_image(mut input: impl Read, destination: &Path, expected: u64) -> Result
     let mut total = 0_u64;
     let mut buffer = [0; 64 * 1024];
     loop {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "Texture installation was cancelled"
+        );
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -566,7 +601,8 @@ fn copy_image(mut input: impl Read, destination: &Path, expected: u64) -> Result
     ensure!(total == expected, "Texture was truncated");
     output.sync_all()?;
     drop(output);
-    validate_image(destination)?;
+    validate_image(destination)
+        .with_context(|| format!("Validating texture {}", destination.display()))?;
     Ok(hex::encode(sha.finalize()))
 }
 
@@ -576,6 +612,7 @@ struct Importer {
     keys: BTreeMap<String, String>,
     bytes: u64,
     skipped: usize,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Importer {
@@ -593,17 +630,33 @@ impl Importer {
             .checked_add(size)
             .context("Texture size overflow")?;
         ensure!(self.bytes <= MAX_PACK, "Texture pack expands beyond 16 GiB");
-        let name = name.to_ascii_lowercase();
+        let mut input = BufReader::new(input);
+        let header = input.fill_buf()?;
+        let extension = if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "png"
+        } else if header.starts_with(b"DDS ") {
+            "dds"
+        } else {
+            bail!(
+                "Texture {} does not contain supported PNG or DDS data",
+                name
+            );
+        };
+        let name = Path::new(name)
+            .with_extension(extension)
+            .to_str()
+            .context("Invalid normalized texture filename")?
+            .to_ascii_lowercase();
         ensure!(
             !self.files.contains_key(&name) && !self.keys.contains_key(&key),
-            "Archive includes conflicting texture variants; import only one GZ2/resolution folder"
+            "Texture selection contains an unresolved duplicate key"
         );
         ensure!(
             fs2::available_space(&self.stage)? > size + 64 * 1024 * 1024,
             "Not enough space to import textures"
         );
         let path = self.stage.join(&name);
-        let hash = copy_image(input, &path, size)?;
+        let hash = copy_image_cancellable(input, &path, size, &self.cancel)?;
         self.keys.insert(key, name.clone());
         self.files
             .insert(name.clone(), TextureFile { name, hash, size });
@@ -611,11 +664,100 @@ impl Importer {
     }
 }
 
+enum ImageSource {
+    File(PathBuf),
+    Zip(usize),
+}
+
+struct Candidate {
+    name: String,
+    size: u64,
+    components: Vec<String>,
+    source: ImageSource,
+}
+
+fn native_order(left: &[String], right: &[String]) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let folded = left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase());
+        if !folded.is_eq() {
+            return folded;
+        }
+        let original = left.cmp(right);
+        if !original.is_eq() {
+            return original;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn select_candidate(
+    selected: &mut BTreeMap<String, Candidate>,
+    relative: &Path,
+    size: u64,
+    source: ImageSource,
+    skipped: &mut usize,
+) -> Result<()> {
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid texture source name")?;
+    let Some(key) = texture_key(name)? else {
+        *skipped += 1;
+        return Ok(());
+    };
+    let candidate = Candidate {
+        name: name.into(),
+        size,
+        source,
+        components: relative
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .map(str::to_owned)
+                    .context("Texture source path is not UTF-8")
+            })
+            .collect::<Result<_>>()?,
+    };
+    if let Some(previous) = selected.get(&key) {
+        let order = native_order(&candidate.components, &previous.components);
+        ensure!(
+            !order.is_eq(),
+            "Texture archive contains duplicate entries at the same path"
+        );
+        *skipped += 1;
+        if order.is_gt() {
+            return Ok(());
+        }
+    }
+    selected.insert(key, candidate);
+    Ok(())
+}
+
 pub fn import(
     root: &Path,
     source: &str,
     version: &str,
     input: &Path,
+    progress: impl FnMut(usize, u64),
+) -> Result<Pack> {
+    import_cancellable(
+        root,
+        source,
+        version,
+        input,
+        Arc::new(AtomicBool::new(false)),
+        progress,
+    )
+}
+
+pub fn import_cancellable(
+    root: &Path,
+    source: &str,
+    version: &str,
+    input: &Path,
+    cancel: Arc<AtomicBool>,
     mut progress: impl FnMut(usize, u64),
 ) -> Result<Pack> {
     catalog(source)?;
@@ -634,11 +776,18 @@ pub fn import(
         keys: BTreeMap::new(),
         bytes: 0,
         skipped: 0,
+        cancel: cancel.clone(),
     };
+    let mut selected = BTreeMap::new();
+    let mut archive = None;
     if input.is_dir() {
         let mut pending = vec![(input.to_path_buf(), 0)];
         let mut entries = 0;
         while let Some((path, depth)) = pending.pop() {
+            ensure!(
+                !cancel.load(Ordering::Acquire),
+                "Texture installation was cancelled"
+            );
             ensure!(depth <= 24, "Texture folder nesting exceeds limit");
             ensure_safe_path(&path)?;
             for entry in fs::read_dir(path)? {
@@ -657,16 +806,13 @@ pub fn import(
                         entry.file_type()?.is_file(),
                         "Texture source contains a link or special file"
                     );
-                    let name = entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|_| anyhow::anyhow!("Texture name is not UTF-8"))?;
-                    if texture_key(&name)?.is_none() {
-                        importer.skipped += 1;
-                        continue;
-                    }
-                    importer.add(&name, entry.metadata()?.len(), File::open(path)?)?;
-                    progress(importer.files.len(), importer.bytes);
+                    select_candidate(
+                        &mut selected,
+                        path.strip_prefix(input)?,
+                        entry.metadata()?.len(),
+                        ImageSource::File(path.clone()),
+                        &mut importer.skipped,
+                    )?;
                 }
             }
         }
@@ -682,13 +828,17 @@ pub fn import(
             archive_file.metadata()?.len() <= MAX_PACK,
             "Texture archive exceeds 16 GiB"
         );
-        let mut archive = zip::ZipArchive::new(archive_file)?;
+        let mut zip = zip::ZipArchive::new(archive_file)?;
         ensure!(
-            archive.len() <= MAX_ENTRIES,
+            zip.len() <= MAX_ENTRIES,
             "Texture archive has too many entries"
         );
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index)?;
+        for index in 0..zip.len() {
+            ensure!(
+                !cancel.load(Ordering::Acquire),
+                "Texture installation was cancelled"
+            );
+            let entry = zip.by_index(index)?;
             let relative = entry
                 .enclosed_name()
                 .context("Unsafe texture archive path")?;
@@ -702,14 +852,53 @@ pub fn import(
             if entry.is_dir() {
                 continue;
             }
-            let name = relative
-                .file_name()
-                .and_then(|s| s.to_str())
-                .context("Invalid archive filename")?;
-            let size = entry.size();
-            importer.add(name, size, &mut entry)?;
-            progress(importer.files.len(), importer.bytes);
+            select_candidate(
+                &mut selected,
+                &relative,
+                entry.size(),
+                ImageSource::Zip(index),
+                &mut importer.skipped,
+            )?;
         }
+        archive = Some(zip);
+    }
+    ensure!(
+        selected.len() <= MAX_FILES,
+        "Texture pack has too many images"
+    );
+    let mut required = 0_u64;
+    for candidate in selected.values() {
+        ensure!(
+            candidate.size > 0 && candidate.size <= MAX_TEXTURE,
+            "Texture exceeds file size limit"
+        );
+        required = required
+            .checked_add(candidate.size)
+            .context("Texture pack size overflow")?;
+    }
+    ensure!(required <= MAX_PACK, "Texture pack expands beyond 16 GiB");
+    ensure!(
+        fs2::available_space(stage.path())? > required + 64 * 1024 * 1024,
+        "Not enough free space to install the complete texture pack"
+    );
+    for candidate in selected.into_values() {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "Texture installation was cancelled"
+        );
+        match candidate.source {
+            ImageSource::File(path) => {
+                importer.add(&candidate.name, candidate.size, File::open(path)?)?
+            }
+            ImageSource::Zip(index) => {
+                let mut entry = archive
+                    .as_mut()
+                    .context("Missing texture archive")?
+                    .by_index(index)?;
+                importer.add(&candidate.name, candidate.size, &mut entry)?;
+            }
+        }
+        progress(importer.files.len(), importer.bytes);
     }
     ensure!(
         !importer.files.is_empty(),
@@ -804,7 +993,16 @@ pub fn inventory(root: &Path, profile: Option<&Path>) -> Result<State> {
         .packs
         .sort_by(|a, b| b.imported.cmp(&a.imported).then_with(|| a.id.cmp(&b.id)));
     if let Some(profile) = profile {
-        validate_profile(profile)?;
+        ensure_safe_path(profile)?;
+        if profile.join("config.json").try_exists()? {
+            validate_profile(profile)?;
+        } else {
+            ensure!(
+                !profile.try_exists()? || profile.is_dir(),
+                "Dusklight profile is not a directory"
+            );
+            state.notice = "Dusklight profile detected; texture setup will prepare its configuration when needed.".into();
+        }
         let active = profile.join("texture_replacements");
         if active.try_exists()? {
             ensure!(active.is_dir(), "texture_replacements is not a directory");
@@ -1167,14 +1365,14 @@ pub fn open_creator(_: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use flate2::{Compression, write::ZlibEncoder};
 
     #[test]
     fn tp_definitive_edition_plus_has_the_requested_version_and_supports_switching() -> Result<()> {
         let project = catalog("tp-definitive-edition-plus")?;
-        assert_eq!(project.name, "TP Definitive Edition+ v1.2.0");
+        assert_eq!(project.name, "TP Definitive Edition+");
         assert_eq!(project.suggested_version, Some("1.2.0"));
         assert_eq!(
             project.creator_url,
@@ -1230,7 +1428,7 @@ mod tests {
         Ok(bytes)
     }
 
-    fn source(root: &Path) -> Result<PathBuf> {
+    pub(crate) fn source(root: &Path) -> Result<PathBuf> {
         let source = root.join("source");
         fs::create_dir(&source)?;
         atomic_write(&source.join("tex1_16x16_0123456789abcdef_14.png"), &png()?)?;
@@ -1503,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_zip_traversal_and_conflicting_resolutions() -> Result<()> {
+    fn refuses_zip_traversal_and_resolves_aliases_like_the_native_loader() -> Result<()> {
         use zip::{ZipWriter, write::SimpleFileOptions};
         let temp = tempfile::tempdir()?;
         let archive = temp.path().join("bad.zip");
@@ -1520,7 +1718,125 @@ mod tests {
             &source.join("tex1_16x16_m_0123456789abcdef_14.png"),
             &png()?,
         )?;
-        assert!(import(temp.path(), "local-hd", "test", &source, |_, _| {}).is_err());
+        let pack = import(temp.path(), "local-hd", "test", &source, |_, _| {})?;
+        assert_eq!(pack.files, 1);
+        assert_eq!(pack.skipped, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn category_duplicates_use_native_component_order_and_safe_data_extensions() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let folder = root.path().join("source");
+        let first = folder.join("1 - Main");
+        let alternative = folder.join("6 - Alt");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&alternative)?;
+        let name = "tex1_16x16_0123456789abcdef_14.png";
+        atomic_write(&first.join(name), &png()?)?;
+        atomic_write(&alternative.join(name), b"unused alternate must not win")?;
+        let pack = import(root.path(), "local-hd", "test", &folder, |_, _| {})?;
+        assert_eq!(pack.files, 1);
+        assert_eq!(pack.skipped, 1);
+        assert_eq!(
+            fs::read(pack_path(root.path(), &pack.id)?.join(name))?,
+            png()?
+        );
+        assert!(native_order(&["a".into(), "z".into()], &["A".into(), "a".into()]).is_gt());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_preparation_preserves_settings_and_cancelled_imports_publish_nothing() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let profile = profile(root.path())?;
+        let before = fs::read(profile.join("config.json"))?;
+        prepare_profile(&profile, || Ok(()))?;
+        assert_eq!(fs::read(profile.join("config.json"))?, before);
+        let input = source(root.path())?;
+        assert!(
+            import_cancellable(
+                root.path(),
+                "local-hd",
+                "test",
+                &input,
+                Arc::new(AtomicBool::new(true)),
+                |_, _| {}
+            )
+            .is_err()
+        );
+        assert!(inventory(root.path(), Some(&profile))?.packs.is_empty());
+        image_dimensions(16384, 4096)?;
+        assert!(image_dimensions(16385, 1).is_err());
+        assert!(image_dimensions(16384, 4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Read-only source archive; imports and activates only in an isolated temporary profile"]
+    fn supplied_tpde_archive_installs_and_switches_without_manual_extraction() -> Result<()> {
+        let path = std::env::var_os("TWILIGHT_TEXTURE_TEST_ARCHIVE")
+            .context("Missing authorized archive path")?;
+        let input = Path::new(&path);
+        let before = input.metadata()?;
+        let root = tempfile::tempdir()?;
+        let profile = profile(root.path())?;
+        let original_config = fs::read(profile.join("config.json"))?;
+        let pack = import(
+            root.path(),
+            "tp-definitive-edition-plus",
+            "1.2.0",
+            input,
+            |_, _| {},
+        )?;
+        println!(
+            "Selected native textures: {}; bytes: {}; skipped: {}",
+            pack.files, pack.bytes, pack.skipped
+        );
+        ensure!(
+            pack.files == 5_456 && pack.bytes == 8_622_649_300,
+            "Unexpected TPDE archive coverage"
+        );
+        ensure!(
+            pack.skipped > 50,
+            "Expected deterministic duplicate/non-texture handling"
+        );
+        let location = pack_path(root.path(), &pack.id)?;
+        ensure!(
+            location
+                .join("tex1_128x32_d1873c36067db6f1_14.dds")
+                .is_file(),
+            "Mislabeled DDS was not normalized"
+        );
+        ensure!(
+            location
+                .join("tex1_512x256_m_4452fdd502cef8f3_14.dds")
+                .metadata()?
+                .len()
+                == 178_957_100,
+            "Large native texture was not preserved"
+        );
+        activate(root.path(), &profile, Some(&pack.id), false, || Ok(()))?;
+        ensure!(
+            inventory(root.path(), Some(&profile))?.active.as_deref() == Some(&pack.id),
+            "Pack was not activated"
+        );
+        activate(root.path(), &profile, None, false, || Ok(()))?;
+        ensure!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(profile.join("config.json"))?)?
+                == serde_json::from_slice::<serde_json::Value>(&original_config)?,
+            "Original game settings changed"
+        );
+        ensure!(
+            input.metadata()?.len() == before.len()
+                && input.metadata()?.modified()? == before.modified()?,
+            "Source ZIP was changed"
+        );
+        println!(
+            "Real TPDE archive: {} selected textures, {} bytes, {} non-selected entries; isolated install/activate/disable passed",
+            pack.files, pack.bytes, pack.skipped
+        );
         Ok(())
     }
 
