@@ -267,6 +267,12 @@ impl Pump {
         if snapshot.shutdown || (attention && !previous) {
             reveal(self.window, &self.context);
         }
+        let desktop_error = self.error.borrow().clone();
+        if let Some(detail) = desktop_error {
+            self.backend.command(Command::DesktopRecovered(detail))?;
+            *self.error.borrow_mut() = None;
+            self.context.request_repaint();
+        }
         Ok(())
     }
 

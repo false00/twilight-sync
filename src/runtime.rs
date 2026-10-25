@@ -71,6 +71,7 @@ pub struct Snapshot {
 
 pub enum Command {
     DesktopError(String),
+    DesktopRecovered(String),
     TrustNetwork,
     OpenPairing,
     Connect(String),
@@ -119,6 +120,12 @@ pub enum Command {
 pub struct Backend {
     sender: Sender<Input>,
     pub view: Arc<Mutex<Snapshot>>,
+}
+
+fn clear_desktop_error(error: &mut Option<String>, detail: &str) {
+    if error.as_deref() == Some(detail) {
+        *error = None;
+    }
 }
 
 impl Backend {
@@ -541,6 +548,15 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
                         }
                     }
                 }
+                Ok(Input::Command(Command::DesktopRecovered(detail))) => match worker_view.lock() {
+                    Ok(mut view) => {
+                        clear_desktop_error(&mut view.error, &detail);
+                    }
+                    Err(error) => {
+                        eprintln!("UI smoke state failure: {error}");
+                        return;
+                    }
+                },
                 Ok(_) => match worker_view.lock() {
                     Ok(mut view) => {
                         view.error = Some("UI smoke mode does not perform real actions.".into())
@@ -1343,9 +1359,12 @@ impl Engine {
     }
 
     fn command(&mut self, command: Command) -> Result<()> {
-        self.error = None;
+        if !matches!(command, Command::DesktopRecovered(_)) {
+            self.error = None;
+        }
         match command {
             Command::DesktopError(detail) => bail!("{detail}"),
+            Command::DesktopRecovered(detail) => clear_desktop_error(&mut self.error, &detail),
             Command::TrustNetwork => {
                 self.require_idle()?;
                 let network = self
@@ -5360,6 +5379,29 @@ mod tests {
         assert_eq!(fs::read(old)?, b"untouched");
         assert_eq!(fs::read(other)?, bytes);
         Ok(())
+    }
+
+    #[test]
+    fn desktop_recovery_clears_only_the_reported_desktop_error() {
+        let detail = format!(
+            "Background desktop error: {}",
+            std::io::Error::from_raw_os_error(1460)
+        );
+        let mut error = Some(detail.clone());
+        clear_desktop_error(&mut error, &detail);
+        assert!(error.is_none());
+
+        error = Some("Unrelated network problem".into());
+        clear_desktop_error(&mut error, &detail);
+        assert_eq!(error.as_deref(), Some("Unrelated network problem"));
+
+        error = Some(format!("{detail}; AUDIT FAILURE: storage unavailable"));
+        clear_desktop_error(&mut error, &detail);
+        assert!(error.is_some());
+
+        error = None;
+        clear_desktop_error(&mut error, &detail);
+        assert!(error.is_none());
     }
 
     #[test]
