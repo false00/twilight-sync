@@ -79,15 +79,17 @@ Do these steps on **both PCs**:
 5. Save setup is automatic. Sync finds Dusklight's standard save in its active
    profile and prepares a receiving PC when needed. There are no save-file or
    save-folder pickers.
-6. Resolve any initial save conflict by sending the copy you want and approving
-   replacement on the receiving PC.
-7. Use **Play Dusklight**. After you stop playing, the final save syncs before
-   the other PC can start a protected session.
+6. If progress differs, compare the save branches. Choose a complete save to
+   keep, or choose **Keep both; play this PC** and reconcile later. Replacing
+   the partner's save still requires their approval.
+7. Use **Play Dusklight**, including when the other PC is offline. Local progress
+   is retained and synced or compared when you reconnect. Matching online saves
+   still use the coordinated play lock.
 
 Installing or updating Dusklight through the app also creates or refreshes
 **Dusklight (Twilight Sync)** on your Windows desktop. It opens the manager's
-protected Play controls, reusing the running manager if necessary; it never
-launches the game directly or bypasses pairing and play-lock checks.
+Play controls, reusing the running manager if necessary; it never launches the
+game directly or bypasses local save, process, and profile checks.
 Unrelated or independently modified shortcuts are not overwritten.
 
 If Windows Firewall asks, allow the app on **Private networks only**.
@@ -117,11 +119,16 @@ font files are loaded from the operating system, not bundled or redistributed.
 - **Encrypted LAN sync:** `twilightProto` uses an established Noise handshake,
   authenticated encryption, router approval, and pinned device identities.
 - **Conflict protection:** different save changes never silently pick a winner.
-  Replacement requires consent and preserves the old valid save in history.
-- **One protected game session:** both managers reserve a persistent play lock.
-  A disconnect does not unlock a still-running game.
+   Compare both branches and replace only with consent; originals stay in history.
+- **Offline play:** the other PC does not have to be online. When connected with
+   matching saves, both managers reserve a play lock. An active game is never
+   forcibly stopped or silently unlocked because the connection drops.
+- **Actual save progress:** all occupied quest slots, save dates, play time,
+   heart containers and pieces, rupees, inventory, equipment, collectibles, and
+   factual milestone summaries decoded directly from validated save bytes.
 - **Compact save history:** shared compressed blocks, parent-linked commits,
-  restore-as-a-new-commit, and a 64 MiB managed-data budget.
+   visible forks and reconciliation, restore-as-a-new-commit, and a 64 MiB
+   managed-data budget.
 - **Texture management:** install complete Henriko or TP Definitive Edition+
   archives, detect the game profile, and activate the selected pack in one step.
 - **Official Dusklight updater:** verified, side-by-side program updates that
@@ -167,6 +174,14 @@ Open **Save history** to browse and restore earlier valid saves. Unchanged
 blocks are reused rather than copied for every revision. Oldest commits are
 pruned when the managed store reaches 64 MiB; filesystem allocation overhead,
 textures, and game installations are separate.
+
+The timeline connects local and preserved partner branches. Each snapshot shows
+decoded progress and gains/losses since its parent. The comparison prompt shows
+both versions, changes since the retained common save when available, and an
+explicit branch selection with no default winner. All three quest slots travel
+together; inventory and story flags are never spliced into an unsafe hybrid save.
+Save clocks are informational, not proof that one branch is preferable.
+Both PCs need this build for the read-only preview and reconciliation workflow.
 
 In one 100-revision synthetic test, history used **571,527 bytes rather than
 3,283,200 bytes: 82.6% less managed storage**. This is a fixture-specific result,
@@ -243,8 +258,9 @@ Start with copies of your saves.
 - File validation cannot prove the absence of every game-engine exploit.
 - Exclusive play protects launches through this manager. Direct or renamed
   game executables and compromised hosts can bypass cooperative enforcement.
-- Strict play requires both managers online. Recover stale locks with approval
-  on both devices rather than force-unlocking an offline partner.
+- Online coordination is optional; offline or independent branch play cannot
+   guarantee exclusivity across PCs. Offline recovery requires local confirmation
+   that the game is stopped; divergent saves still require reconciliation later.
 
 [Protocol, threat model, file checks, and diagnostics](docs/guide.md)
 

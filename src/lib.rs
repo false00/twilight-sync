@@ -10,6 +10,7 @@ pub mod play;
 pub mod protocol;
 pub mod raw_card;
 pub mod runtime;
+pub mod save_data;
 pub mod save_location;
 pub mod self_update;
 pub mod textures;

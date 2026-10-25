@@ -13,6 +13,7 @@ const WINDOW_TITLE: &str = "Twilight Sync";
 mod background;
 mod design;
 mod icons;
+mod saves;
 
 use design::{Appearance, AppearanceStore, Palette, semibold, symbol};
 
@@ -49,11 +50,11 @@ impl Page {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Overview => "Your connection, save files, and protected play.",
+            Self::Overview => "Your save progress and game sessions.",
             Self::Devices => "Approve your network and pair one trusted device.",
             Self::Library => "Install the game, manage updates, and select your own disc image.",
             Self::Textures => "Import authorized texture packs and choose the active version.",
-            Self::History => "Browse snapshots and safely restore an earlier save.",
+            Self::History => "Save branches, progress changes, and recovery.",
             Self::Security => "Appearance, startup, application updates, and privacy.",
         }
     }
@@ -104,6 +105,9 @@ struct Dashboard {
     texture_permission: bool,
     appearance: AppearanceStore,
     shown_pairing_code: Option<String>,
+    shown_fork: Option<(String, String, bool)>,
+    fork_dialog_open: bool,
+    fork_choice: Option<bool>,
 }
 
 fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
@@ -112,7 +116,7 @@ fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
     let status = MenuItem::new("Checking private LAN...", false, None);
     let show = MenuItem::new("Open Twilight Sync", true, None);
     let sync = MenuItem::new("Send save to partner", true, None);
-    let launch = MenuItem::new("Play Dusklight (protected)", true, None);
+    let launch = MenuItem::new("Play Dusklight", true, None);
     let startup = CheckMenuItem::new("Start with Windows", true, startup, None);
     let automatic_updates = CheckMenuItem::new(
         "Automatically check app updates",
@@ -269,6 +273,9 @@ fn run_page(
                 texture_permission: false,
                 appearance,
                 shown_pairing_code: None,
+                shown_fork: None,
+                fork_dialog_open: false,
+                fork_choice: None,
             }))
         }),
     )
@@ -536,17 +543,86 @@ impl Dashboard {
     }
 
     fn can_launch(snapshot: &Snapshot) -> bool {
-        snapshot.ready
-            && Self::management_available(snapshot)
+        Self::local_play_available(snapshot, false)
+    }
+
+    fn local_play_available(snapshot: &Snapshot, allow_pending_save: bool) -> bool {
+        Self::management_available(snapshot)
             && !snapshot.textures.recovery_needed
             && snapshot.settings.save_file.is_some()
             && snapshot.save_profile.is_some()
             && snapshot.save_ready
             && snapshot.settings.game_exe.is_some()
-            && !snapshot.pending_save
+            && (allow_pending_save || !snapshot.pending_save)
             && !snapshot.pending_iso
             && !snapshot.pending_recovery
             && snapshot.transfer.is_empty()
+    }
+
+    fn start_play(&mut self, snapshot: &Snapshot) {
+        if snapshot.conflict.is_some() {
+            self.fork_dialog_open = true;
+        } else {
+            self.dispatch(Command::Launch);
+        }
+    }
+
+    fn can_reconcile(snapshot: &Snapshot) -> bool {
+        snapshot.ready
+            && Self::management_available(snapshot)
+            && snapshot.save_ready
+            && snapshot.save_profile.is_some()
+            && snapshot.settings.save_file.is_some()
+            && !snapshot.pending_iso
+            && !snapshot.pending_recovery
+            && snapshot.transfer.is_empty()
+            && snapshot
+                .conflict
+                .as_ref()
+                .and_then(|conflict| conflict.remote.as_ref())
+                .zip(snapshot.local_save.as_ref())
+                .is_some_and(|(remote, local)| {
+                    remote.game == local.game && remote.file_name == local.file_name
+                })
+    }
+
+    fn reconcile_prompt(&mut self, context: &egui::Context, snapshot: &Snapshot) {
+        let Some(conflict) = &snapshot.conflict else {
+            self.shown_fork = None;
+            self.fork_dialog_open = false;
+            self.fork_choice = None;
+            return;
+        };
+        let fingerprint = (
+            conflict.local_hash.clone(),
+            conflict.remote_hash.clone(),
+            snapshot.pending_save,
+        );
+        if self.shown_fork.as_ref() != Some(&fingerprint)
+            && !snapshot.game_running
+            && !snapshot.remote_game
+        {
+            self.shown_fork = Some(fingerprint);
+            self.fork_dialog_open = true;
+            self.fork_choice = None;
+        }
+        if !self.fork_dialog_open {
+            return;
+        }
+        let available = Self::local_play_available(snapshot, true);
+        let (close, command) = saves::prompt(
+            context,
+            snapshot,
+            &mut self.fork_choice,
+            available,
+            Self::can_reconcile(snapshot),
+        );
+        if close {
+            self.fork_dialog_open = false;
+        }
+        if let Some(command) = command {
+            self.dispatch(command);
+        }
     }
 
     fn setting_row(
@@ -588,8 +664,8 @@ impl Dashboard {
                 ("Your partner is playing", p.warning)
             } else if snapshot.ready {
                 ("Connected securely", p.success)
-            } else if snapshot.settings.peer.is_some() {
-                ("Waiting for your paired device", p.secondary)
+            } else if snapshot.settings.game_exe.is_some() {
+                ("Ready to play offline", p.accent)
             } else {
                 ("Connect your other PC", p.text)
             };
@@ -603,10 +679,10 @@ impl Dashboard {
             Self::secondary(ui, &snapshot.message);
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
+                if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
+                    self.start_play(snapshot);
+                }
                 if snapshot.ready {
-                    if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
-                        self.dispatch(Command::Launch);
-                    }
                     if ui
                         .add_enabled(
                             snapshot.save_ready
@@ -623,7 +699,7 @@ impl Dashboard {
                         self.page = Page::Devices;
                     }
                 } else {
-                    if Self::primary(ui, true, "Set up connection").clicked() {
+                    if ui.button("Connection details").clicked() {
                         self.page = Page::Devices;
                     }
                     if snapshot.settings.game_exe.is_none()
@@ -634,7 +710,10 @@ impl Dashboard {
                 }
             });
             if !snapshot.ready {
-                Self::secondary(ui, "Protected play needs both paired managers online.");
+                Self::secondary(
+                    ui,
+                    "Partner offline. Your progress stays on this PC until you reconnect.",
+                );
             } else if snapshot.settings.game_exe.is_none() {
                 Self::secondary(
                     ui,
@@ -723,12 +802,19 @@ impl Dashboard {
                 ("Automatic detection needs attention", p.warning)
             };
             Self::status(ui, "Status", state, color);
+            if let Some(summary) = &snapshot.local_save {
+                ui.add_space(8.0);
+                saves::progress(ui, summary);
+            }
             Self::secondary(
                 ui,
                 "Uses the standard save inside Dusklight's active profile, including its own portable or custom profile. No folders to choose.",
             );
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
+                if snapshot.conflict.is_some() && ui.button("Compare save branches").clicked() {
+                    self.fork_dialog_open = true;
+                }
                 if ui.button("View history").clicked() {
                     self.page = Page::History;
                 }
@@ -759,17 +845,23 @@ impl Dashboard {
             Self::card(ui, |ui| {
                 Self::setting_row(
                     ui,
-                    "Protected play lock is held",
-                    "Disconnecting does not release it. Reconnect both PCs and stop both games before recovery.",
+                    "Previous session needs attention",
+                    "Stop Dusklight before recovery. Offline recovery keeps local progress separate from your partner's.",
                     |ui| {
                         if ui
                             .add_enabled(
-                                snapshot.ready && !snapshot.game_running && !snapshot.remote_game,
+                                !snapshot.game_running && !snapshot.remote_game,
                                 egui::Button::new("Request recovery"),
                             )
                             .clicked()
                         {
-                            self.dispatch(Command::Recover);
+                            let approved = snapshot.ready || rfd::MessageDialog::new()
+                                .set_title("Recover local session offline?")
+                                .set_description("Confirm Dusklight is stopped on this PC. Partner activity is unknown. Both save branches will require reconciliation if they differ when you reconnect.")
+                                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                            if approved {
+                                self.dispatch(Command::Recover);
+                            }
                         }
                     },
                 );
@@ -1025,7 +1117,7 @@ impl Dashboard {
             }
             ui.horizontal_wrapped(|ui| {
                 if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
-                    self.dispatch(Command::Launch);
+                    self.start_play(snapshot);
                 }
                 if ui
                     .add_enabled(available, egui::Button::new("Locate dusklight.exe..."))
@@ -1039,7 +1131,11 @@ impl Dashboard {
             });
             Self::secondary(
                 ui,
-                "Protected play requires both paired managers online and an automatically detected save profile.",
+                if snapshot.ready {
+                    "Partner connected. Online play protection is available."
+                } else {
+                    "Offline play is available. Saves remain on this PC until your partner returns."
+                },
             );
         });
         ui.add_space(12.0);
@@ -1462,10 +1558,17 @@ impl Dashboard {
                 "Valid saves are recorded automatically from Dusklight's detected profile. Play and save in Dusklight, or receive your partner's save - no location setup is needed.",
             );
         }
+        let mut nodes = std::collections::HashMap::new();
         for entry in &snapshot.history.entries {
-            ui.push_id(&entry.id, |ui| { Self::card(ui, |ui| {
+            ui.push_id(&entry.id, |ui| { ui.horizontal_top(|ui| {
+                let (rail, response) = ui.allocate_exact_size(Vec2::new(60.0, 38.0), egui::Sense::hover());
+                let partner_branch = entry.reason == crate::history::Reason::PeerBranch;
+                let position = egui::pos2(rail.left() + if partner_branch { 44.0 } else { 14.0 }, rail.top() + 26.0);
+                nodes.insert(entry.id.clone(), position);
+                response.on_hover_text(if partner_branch { "Preserved partner branch" } else if entry.merge_parent.is_some() { "Reconciled save; both parent branches retained" } else { "Local save history" });
+                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 0.0), egui::Layout::top_down(egui::Align::Min), |ui| { Self::card(ui, |ui| {
                 let current = snapshot.local_hash.as_ref() == Some(&entry.hash);
-                Self::setting_row(ui, &format!("#{}  {}", entry.sequence, entry.reason.label()),
+                Self::setting_row(ui, &format!("#{}  {}", entry.sequence, if entry.merge_parent.is_some() { "Reconciled save" } else { entry.reason.label() }),
                     &format!("{}  /  {}", entry.timestamp, entry.username),
                     |ui| {
                         if current {
@@ -1493,6 +1596,15 @@ impl Dashboard {
                         }
                     },
                 );
+                if let Some(summary) = &entry.summary {
+                    saves::brief(ui, summary);
+                    if !entry.changes.is_empty() {
+                        saves::changes(ui, &entry.changes);
+                    }
+                    ui.collapsing("Progress and inventory", |ui| saves::progress(ui, summary));
+                } else {
+                    Self::secondary(ui, "Progress details unavailable for this snapshot.");
+                }
                 ui.collapsing("Snapshot details", |ui| {
                     Self::secondary(ui, format!("Game: {} / {}", entry.game, entry.name));
                     ui.label(RichText::new(format!("Commit: {}", entry.id)).monospace());
@@ -1500,10 +1612,19 @@ impl Dashboard {
                     if let Some(parent) = &entry.parent {
                         ui.label(RichText::new(format!("Parent: {parent}")).monospace());
                     }
+                    if let Some(parent) = &entry.merge_parent {
+                        ui.add(egui::Label::new(RichText::new(format!("Partner branch: {parent}")).monospace()).wrap());
+                    }
                 });
-            }); });
+            }); }); }); });
             ui.add_space(8.0);
         }
+        saves::history_graph(
+            ui,
+            &snapshot.history.entries,
+            &nodes,
+            snapshot.local_hash.as_deref(),
+        );
     }
 
     fn security(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -1612,10 +1733,10 @@ impl Dashboard {
                         .color(p.warning)
                         .font(semibold(16.0)),
                 );
-                ui.label("Your copy differs from the common version. Approving snapshots it into compact history before replacing it with your partner's copy.");
+                ui.label("Both save branches are preserved. Review the progress comparison before replacing your copy.");
                 ui.horizontal_wrapped(|ui| {
-                    if Self::primary(ui, true, "Accept and keep snapshot").clicked() {
-                        self.dispatch(Command::AcceptSave(true));
+                    if Self::primary(ui, true, "Compare branches").clicked() {
+                        self.fork_dialog_open = true;
                     }
                     if ui.button("Keep my save").clicked() {
                         self.dispatch(Command::AcceptSave(false));
@@ -1933,6 +2054,7 @@ impl eframe::App for Dashboard {
                         ui.add_space(8.0);
                     });
             });
+        self.reconcile_prompt(context, &snapshot);
         context.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -1960,11 +2082,13 @@ mod tests {
     }
 
     #[test]
-    fn play_controls_never_enable_for_disconnected_busy_or_locked_devices() -> Result<()> {
+    fn play_controls_allow_offline_but_never_busy_or_locked_devices() -> Result<()> {
         let ready = ready_snapshot()?;
         assert!(Dashboard::can_launch(&ready));
+        let mut offline = ready.clone();
+        offline.ready = false;
+        assert!(Dashboard::can_launch(&offline));
         for condition in [
-            "offline",
             "local-game",
             "remote-game",
             "lock",
@@ -1974,7 +2098,6 @@ mod tests {
         ] {
             let mut snapshot = ready.clone();
             match condition {
-                "offline" => snapshot.ready = false,
                 "local-game" => snapshot.game_running = true,
                 "remote-game" => snapshot.remote_game = true,
                 "lock" => {
@@ -2022,6 +2145,38 @@ mod tests {
             }
             assert!(!Dashboard::can_launch(&snapshot), "{condition}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_needs_matching_save_identities_but_not_a_game_installation() -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        let summary = crate::save_data::inspect(&crate::save_data::tests::populated(true)?)?;
+        snapshot.local_save = Some(summary.clone());
+        snapshot.conflict = Some(crate::runtime::SaveConflict {
+            local_hash: "a".repeat(64),
+            remote_hash: "b".repeat(64),
+            base_hash: None,
+            base: None,
+            remote: Some(summary),
+        });
+        snapshot.settings.game_exe = None;
+        assert!(Dashboard::can_reconcile(&snapshot));
+        assert!(!Dashboard::can_launch(&snapshot));
+        snapshot.ready = false;
+        assert!(!Dashboard::can_reconcile(&snapshot));
+        snapshot.ready = true;
+        snapshot.pending_iso = true;
+        assert!(!Dashboard::can_reconcile(&snapshot));
+        snapshot.pending_iso = false;
+        if let Some(remote) = snapshot
+            .conflict
+            .as_mut()
+            .and_then(|conflict| conflict.remote.as_mut())
+        {
+            remote.game = "GZ2J".into();
+        }
+        assert!(!Dashboard::can_reconcile(&snapshot));
         Ok(())
     }
 }

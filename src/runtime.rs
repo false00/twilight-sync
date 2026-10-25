@@ -8,7 +8,7 @@ use crate::{
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
     protocol::{self, Event, Handshake, SecureWriter},
-    save_location, self_update,
+    save_data, save_location, self_update,
     textures::{self, Activation, Pack},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -47,6 +47,8 @@ pub struct Snapshot {
     pub connecting: bool,
     pub pairing_open: bool,
     pub local_hash: Option<String>,
+    pub local_save: Option<save_data::Summary>,
+    pub conflict: Option<SaveConflict>,
     pub save_profile: Option<PathBuf>,
     pub save_ready: bool,
     pub remote_hash: Option<String>,
@@ -69,6 +71,15 @@ pub struct Snapshot {
     pub shutdown: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct SaveConflict {
+    pub local_hash: String,
+    pub remote_hash: String,
+    pub base_hash: Option<String>,
+    pub base: Option<save_data::Summary>,
+    pub remote: Option<save_data::Summary>,
+}
+
 pub enum Command {
     DesktopError(String),
     DesktopRecovered(String),
@@ -84,6 +95,14 @@ pub enum Command {
     SendSave,
     AcceptSave(bool),
     Launch,
+    ContinueLocal {
+        expected: Option<String>,
+    },
+    ResolveConflict {
+        local_hash: String,
+        remote_hash: String,
+        use_remote: bool,
+    },
     Recover,
     AcceptRecovery(bool),
     SendIso,
@@ -227,6 +246,14 @@ struct PendingSave {
     deadline: Instant,
 }
 
+struct PeerPreview {
+    hash: String,
+    base: Option<String>,
+    summary: save_data::Summary,
+    base_summary: Option<save_data::Summary>,
+    bytes: Vec<u8>,
+}
+
 struct OutgoingIso {
     id: String,
     path: PathBuf,
@@ -291,6 +318,8 @@ struct Engine {
     devices: HashMap<String, Discovered>,
     link: Option<Link>,
     remote: Option<RemoteState>,
+    remote_preview: Option<PeerPreview>,
+    preview_requested: Option<(String, Instant)>,
     pairing_until: Option<Instant>,
     pairing_attempts: u8,
     connecting: Arc<AtomicBool>,
@@ -304,6 +333,7 @@ struct Engine {
     process: ProcessMonitor,
     game_running: bool,
     local_hash: Option<String>,
+    local_save: Option<save_data::Summary>,
     previous_hash: Option<String>,
     save_valid: bool,
     stable: u8,
@@ -336,7 +366,8 @@ struct Engine {
     history_cursor: Option<String>,
     migrated_backups: bool,
     self_updates: self_update::State,
-    last_self_update_check: Instant,
+    last_self_update_check: Option<Instant>,
+    first_self_update_check: Instant,
     last_self_update_cleanup: Instant,
     transfer: String,
     message: String,
@@ -483,6 +514,7 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
                 id: format!("{sequence:064x}"),
                 sequence,
                 parent: Some(format!("{:064x}", sequence - 1)),
+                merge_parent: None,
                 game: "GZ2E".into(),
                 name: "Adventure".into(),
                 hash: if sequence == 12 {
@@ -492,8 +524,12 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
                 },
                 timestamp: format!("2026-10-20T14:{sequence:02}:00Z"),
                 username: "Player".into(),
+                device: "0".repeat(64),
+                peer: None,
                 reason: history::Reason::Observed,
                 restored_from: None,
+                summary: None,
+                changes: Vec::new(),
             });
         }
         snapshot.textures.packs.push(Pack {
@@ -592,6 +628,8 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         connecting: false,
         pairing_open: false,
         local_hash: None,
+        local_save: None,
+        conflict: None,
         save_profile: None,
         save_ready: false,
         remote_hash: None,
@@ -625,7 +663,8 @@ impl Engine {
         sender: Sender<Input>,
         view: Arc<Mutex<Snapshot>>,
     ) -> Self {
-        let past = Instant::now() - Duration::from_secs(60);
+        let now = Instant::now();
+        let past = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
         Self {
             root,
             settings,
@@ -642,6 +681,8 @@ impl Engine {
             devices: HashMap::new(),
             link: None,
             remote: None,
+            remote_preview: None,
+            preview_requested: None,
             pairing_until: None,
             pairing_attempts: 0,
             connecting: Arc::new(AtomicBool::new(false)),
@@ -655,6 +696,7 @@ impl Engine {
             process: ProcessMonitor::default(),
             game_running: false,
             local_hash: None,
+            local_save: None,
             previous_hash: None,
             save_valid: false,
             stable: 0,
@@ -687,8 +729,8 @@ impl Engine {
             history_cursor: None,
             migrated_backups: false,
             self_updates: self_update::State::default(),
-            last_self_update_check: Instant::now() - self_update::CHECK_INTERVAL
-                + Duration::from_secs(15),
+            last_self_update_check: None,
+            first_self_update_check: now + Duration::from_secs(15),
             last_self_update_cleanup: Instant::now(),
             transfer: String::new(),
             message: "Loading compact history and checking your private LAN...".into(),
@@ -1523,24 +1565,35 @@ impl Engine {
                     ensure!(pending.deadline > Instant::now(), "Save approval expired");
                     self.receive_save(pending, true)?;
                 } else {
-                    ensure!(
-                        self.pending_save.take().is_some(),
-                        "No incoming save to reject"
-                    );
-                    self.send(&Event::Error {
-                        message: "The other user declined the save replacement".into(),
-                    })?;
+                    let pending = self
+                        .pending_save
+                        .take()
+                        .context("No incoming save to reject")?;
+                    self.send(&Event::SaveDeclined { hash: pending.hash })?;
                     self.message =
                         "Incoming save declined. Your local save was not changed.".into();
                 }
             }
             Command::Launch => self.request_launch()?,
+            Command::ContinueLocal { expected } => {
+                ensure!(
+                    self.current_hash()? == expected,
+                    "Your save changed; review it before playing"
+                );
+                if let Some(pending) = self.pending_save.take() {
+                    self.send(&Event::SaveDeclined { hash: pending.hash })?;
+                }
+                self.request_launch_mode(true)?;
+            }
+            Command::ResolveConflict {
+                local_hash,
+                remote_hash,
+                use_remote,
+            } => {
+                self.resolve_conflict(&local_hash, &remote_hash, use_remote)?;
+            }
             Command::Recover => {
                 self.game_running = self.process.game_running();
-                ensure!(
-                    self.ready(),
-                    "Both devices must be online for lock recovery"
-                );
                 ensure!(
                     !self.game_running && !self.remote.as_ref().is_some_and(|r| r.game),
                     "Stop every Dusklight process before recovery"
@@ -1560,6 +1613,15 @@ impl Engine {
                     .or_else(|| self.remote.as_ref().and_then(|r| r.lock.as_ref()))
                     .context("No stale play lock")?;
                 let token = lock.token.clone();
+                if !self.ready() {
+                    self.audit.record("lock-recovered-offline", None, self.local_hash.as_deref(), None,
+                        "Explicit local recovery; partner activity is unknown and divergent saves will be preserved")?;
+                    self.store(|settings| settings.play_lock = None)?;
+                    self.managed_token = None;
+                    self.release_sent = false;
+                    self.message = "Local session recovered. You can play offline; any divergent progress will need reconciliation later.".into();
+                    return Ok(());
+                }
                 self.send(&Event::Recover {
                     token: token.clone(),
                 })?;
@@ -1667,7 +1729,8 @@ impl Engine {
                 )?;
                 self.self_updates.enabled = enabled;
                 if enabled {
-                    self.last_self_update_check = Instant::now() - self_update::CHECK_INTERVAL;
+                    self.last_self_update_check = None;
+                    self.first_self_update_check = Instant::now();
                 }
             }
             Command::UpdateSelf => {
@@ -1864,6 +1927,7 @@ impl Engine {
                 self.history_candidate = None;
                 self.history_cursor = None;
                 self.local_hash = Some(hash.clone());
+                self.local_save = Some(save_data::inspect(&bytes)?);
                 self.previous_hash = Some(hash);
                 self.save_valid = true;
                 self.stable = 2;
@@ -1997,6 +2061,8 @@ impl Engine {
             }
         }
         self.remote = None;
+        self.remote_preview = None;
+        self.preview_requested = None;
         self.pending_save = None;
         self.sent_save = None;
         self.pending_recovery = None;
@@ -2318,6 +2384,33 @@ impl Engine {
                         "Invalid remote play lock"
                     );
                 }
+                if !game
+                    && lock.is_none()
+                    && !self.game_running
+                    && self.child.is_none()
+                    && self
+                        .settings
+                        .play_lock
+                        .as_ref()
+                        .is_some_and(|held| held.owner == peer)
+                {
+                    self.audit.record(
+                        "peer-session-completed-offline",
+                        None,
+                        hash.as_deref(),
+                        Some(&peer),
+                        "Owner reports no active session; saves still require normal reconciliation",
+                    )?;
+                    self.store(|settings| settings.play_lock = None)?;
+                    self.send_state()?;
+                }
+                if self
+                    .remote_preview
+                    .as_ref()
+                    .is_some_and(|preview| Some(&preview.hash) != hash.as_ref())
+                {
+                    self.remote_preview = None;
+                }
                 self.remote = Some(RemoteState {
                     hash,
                     save_ready,
@@ -2329,7 +2422,7 @@ impl Engine {
                 hash,
                 base,
                 expected,
-                manual,
+                manual: _,
                 lease,
                 bytes,
             } => {
@@ -2351,6 +2444,7 @@ impl Engine {
                     &identity,
                 )?;
                 self.ensure_save_receive_allowed(lease.as_deref())?;
+                self.ensure_save_profile_current()?;
                 ensure!(
                     self.pending_save.is_none()
                         && self.incoming_iso.is_none()
@@ -2362,8 +2456,9 @@ impl Engine {
                     current == expected,
                     "Local save changed since the offer was prepared"
                 );
-                let automatic =
-                    current.is_none() || current.as_ref() == Some(&hash) || current == base;
+                let automatic = current.is_none()
+                    || current.as_ref() == Some(&hash)
+                    || (current == base && self.settings.sync_base == base);
                 let pending = PendingSave {
                     hash,
                     expected,
@@ -2374,12 +2469,9 @@ impl Engine {
                 if automatic {
                     self.receive_save(pending, false)?;
                 } else {
-                    ensure!(
-                        manual,
-                        "Both saves changed; automatic sync refuses to choose a winner"
-                    );
+                    self.preserve_preview(pending.hash.clone(), base, pending.bytes.clone())?;
                     self.pending_save = Some(pending);
-                    self.message = "Save conflict: review and approve replacement locally. A backup will be kept.".into();
+                    self.message = "Save fork detected. Both versions are preserved; compare progress before choosing a branch.".into();
                 }
             }
             Event::Saved { hash } => {
@@ -2397,12 +2489,106 @@ impl Engine {
                     Some(&peer),
                     "Peer validated and atomically committed the save",
                 )?;
+                if let Some(other_hash) = self
+                    .remote_preview
+                    .as_ref()
+                    .map(|preview| preview.hash.clone())
+                    .filter(|other| other != &hash)
+                    && self.current_hash()?.as_ref() == Some(&hash)
+                {
+                    let path = self
+                        .settings
+                        .save_file
+                        .clone()
+                        .context("Missing save location")?;
+                    let bytes = files::read_save(&path)?;
+                    ensure!(
+                        files::sha256(&bytes) == hash,
+                        "Local save changed during reconciliation acknowledgement"
+                    );
+                    self.ensure_history()?;
+                    let captured = self
+                        .history
+                        .as_mut()
+                        .context("History is unavailable")?
+                        .record_local_resolution(&bytes, &path, &peer, &other_hash)?;
+                    self.audit.record(
+                        "save-fork-reconciled",
+                        Some(&path),
+                        Some(&hash),
+                        Some(&peer),
+                        &captured.id,
+                    )?;
+                    self.history_cursor = None;
+                    self.refresh_history()?;
+                }
                 self.store(|s| s.sync_base = Some(hash.clone()))?;
                 if let Some(remote) = &mut self.remote {
                     remote.hash = Some(hash);
                 }
                 self.sent_save = None;
+                self.transfer.clear();
                 self.message = "Save synced, verified, and backed up.".into();
+            }
+            Event::SavePreviewRequest { hash } => {
+                ensure!(valid_hash(&hash), "Invalid preview request hash");
+                if self.game_running
+                    || !self.save_valid
+                    || self.stable < 2
+                    || self.local_hash.as_deref() != Some(hash.as_str())
+                {
+                    self.send_state()?;
+                    return Ok(());
+                }
+                self.ensure_save_profile_current()?;
+                let path = self
+                    .settings
+                    .save_file
+                    .as_deref()
+                    .context("Missing save location")?;
+                let bytes = files::read_save(path)?;
+                if files::sha256(&bytes) != hash {
+                    self.send_state()?;
+                    return Ok(());
+                }
+                self.send(&Event::SavePreview {
+                    hash,
+                    base: self.settings.sync_base.clone(),
+                    bytes,
+                })?;
+            }
+            Event::SavePreview { hash, base, bytes } => {
+                ensure!(
+                    valid_hash(&hash) && base.as_deref().is_none_or(valid_hash),
+                    "Invalid preview hashes"
+                );
+                ensure!(
+                    files::sha256(&bytes) == hash,
+                    "Save preview SHA-256 mismatch"
+                );
+                if self
+                    .preview_requested
+                    .as_ref()
+                    .is_none_or(|(requested, _)| requested != &hash)
+                    || self
+                        .remote
+                        .as_ref()
+                        .is_none_or(|remote| remote.hash.as_ref() != Some(&hash))
+                {
+                    return Ok(());
+                }
+                self.preserve_preview(hash, base, bytes)?;
+                self.preview_requested = None;
+            }
+            Event::SaveDeclined { hash } => {
+                ensure!(valid_hash(&hash), "Invalid declined save hash");
+                if let Some((sent, _)) = &self.sent_save {
+                    ensure!(sent == &hash, "Decline does not match the offered save");
+                    self.sent_save = None;
+                    self.transfer.clear();
+                    self.message =
+                        "Partner kept their save. Both branches remain unchanged.".into();
+                }
             }
             Event::LeaseRequest { token, hash } => {
                 ensure!(valid_hash(&token), "Invalid play-lock token");
@@ -2486,43 +2672,7 @@ impl Engine {
                     "Save changed while waiting for the play-lock grant"
                 );
                 self.launch_pending = None;
-                let executable = self
-                    .settings
-                    .game_exe
-                    .as_ref()
-                    .context("Select or install Dusklight")?;
-                ensure!(
-                    self.save_profile.as_ref()
-                        == Some(&save_location::profile(
-                            &self.default_profile,
-                            Some(executable),
-                        )?),
-                    "Dusklight's profile changed while waiting for play approval; retry after automatic detection completes"
-                );
-                ensure!(
-                    save_location::binding_is_current(
-                        self.save_profile
-                            .as_deref()
-                            .context("Missing save profile")?,
-                        self.settings
-                            .save_file
-                            .as_deref()
-                            .context("Missing save location")?,
-                    )?,
-                    "Dusklight's memory-card format changed while waiting for play approval"
-                );
-                self.managed_token = Some(token);
-                let child = play::launch(executable)?;
-                self.child = Some(child);
-                self.game_running = true;
-                self.audit.record(
-                    "game-started",
-                    Some(executable),
-                    self.local_hash.as_deref(),
-                    Some(&peer),
-                    "Both devices durably reserved the same exclusive-play lock",
-                )?;
-                self.send_state()?;
+                self.start_game(Some(token))?;
             }
             Event::LeaseDenied { token, reason } => {
                 ensure!(
@@ -2773,9 +2923,7 @@ impl Engine {
         Ok(())
     }
 
-    fn receive_save(&mut self, pending: PendingSave, manual: bool) -> Result<()> {
-        self.game_running = self.process.game_running();
-        self.ensure_save_receive_allowed(pending.lease.as_deref())?;
+    fn ensure_save_profile_current(&self) -> Result<()> {
         if self.settings.play_lock.is_none() {
             ensure!(
                 self.save_profile.as_ref()
@@ -2798,6 +2946,17 @@ impl Engine {
                 "Dusklight's memory-card format changed after the save offer; retry after detection completes"
             );
         }
+        Ok(())
+    }
+
+    fn receive_save(&mut self, pending: PendingSave, manual: bool) -> Result<()> {
+        self.commit_save(pending, manual, true)
+    }
+
+    fn commit_save(&mut self, pending: PendingSave, manual: bool, acknowledge: bool) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.ensure_save_receive_allowed(pending.lease.as_deref())?;
+        self.ensure_save_profile_current()?;
         let path = self.save_destination(&pending.bytes)?;
         save_location::prepare(&path)?;
         self.audit.record(
@@ -2827,6 +2986,7 @@ impl Engine {
             )?;
         self.store(|s| s.sync_base = Some(hash.clone()))?;
         self.local_hash = Some(hash.clone());
+        self.local_save = Some(save_data::inspect(&pending.bytes)?);
         self.previous_hash = Some(hash.clone());
         self.save_valid = true;
         self.stable = 2;
@@ -2842,7 +3002,9 @@ impl Engine {
             Some(&self.peer_key()?),
             &format!("Validated, snapshotted, atomically replaced, and re-read; commit {}; {} old commits pruned", capture.id, capture.pruned),
         )?;
-        self.send(&Event::Saved { hash })?;
+        if acknowledge {
+            self.send(&Event::Saved { hash })?;
+        }
         self.send_state()?;
         self.message =
             "Received save committed safely; previous version retained in compact history.".into();
@@ -2921,11 +3083,170 @@ impl Engine {
             bytes,
         })?;
         self.sent_save = Some((hash, Instant::now() + Duration::from_secs(120)));
+        self.transfer = "Waiting for partner save approval...".into();
         self.message = "Save sent; waiting for validated commit or conflict approval.".into();
         Ok(())
     }
 
+    fn preserve_preview(
+        &mut self,
+        hash: String,
+        base: Option<String>,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        ensure!(files::sha256(&bytes) == hash, "Save preview hash differs");
+        self.ensure_save_profile_current()?;
+        let summary = save_data::inspect(&bytes)?;
+        let profile = self
+            .save_profile
+            .as_deref()
+            .context("Missing save profile")?;
+        save_location::path_for_identity(profile, &files::validate_save(&bytes)?)?;
+        let path = self
+            .settings
+            .save_file
+            .clone()
+            .context("Missing local save location")?;
+        let peer = self.peer_key()?;
+        self.ensure_history()?;
+        let history = self.history.as_mut().context("History is unavailable")?;
+        if !self.game_running
+            && self.save_valid
+            && let Some(current) = files::read_optional_save(&path)?
+        {
+            history.capture(&current, &path, history::Reason::Observed, None)?;
+        }
+        let base_summary = if self.settings.sync_base == base {
+            base.as_deref()
+                .map(|hash| history.summary_for_hash(hash))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let captured = history.capture_branch(&bytes, &path, &peer, base.as_deref())?;
+        self.audit.record(
+            "save-branch-preserved",
+            Some(&path),
+            Some(&hash),
+            Some(&peer),
+            &captured.id,
+        )?;
+        self.remote_preview = Some(PeerPreview {
+            hash,
+            base,
+            summary,
+            base_summary,
+            bytes,
+        });
+        self.history_cursor = None;
+        self.refresh_history()?;
+        Ok(())
+    }
+
+    fn save_conflict(&self) -> Option<SaveConflict> {
+        let local = self.local_hash.as_ref()?;
+        let remote = self
+            .pending_save
+            .as_ref()
+            .map(|pending| &pending.hash)
+            .or_else(|| self.remote.as_ref().and_then(|remote| remote.hash.as_ref()))?;
+        if local == remote
+            || (self.pending_save.is_none()
+                && (Some(local) == self.settings.sync_base.as_ref()
+                    || Some(remote) == self.settings.sync_base.as_ref()))
+        {
+            return None;
+        }
+        let preview = self
+            .remote_preview
+            .as_ref()
+            .filter(|preview| &preview.hash == remote);
+        let common_base = preview.is_none_or(|preview| preview.base == self.settings.sync_base);
+        Some(SaveConflict {
+            local_hash: local.clone(),
+            remote_hash: remote.clone(),
+            base_hash: common_base
+                .then(|| self.settings.sync_base.clone())
+                .flatten(),
+            base: preview
+                .filter(|_| common_base)
+                .and_then(|preview| preview.base_summary.clone()),
+            remote: preview.map(|preview| preview.summary.clone()),
+        })
+    }
+
+    fn resolve_conflict(
+        &mut self,
+        local_hash: &str,
+        remote_hash: &str,
+        use_remote: bool,
+    ) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
+        ensure!(
+            self.ready(),
+            "Reconnect to reconcile saves; your local branch is preserved"
+        );
+        ensure!(
+            self.current_hash()?.as_deref() == Some(local_hash),
+            "Your save changed; review the new comparison"
+        );
+        ensure!(
+            self.remote
+                .as_ref()
+                .is_some_and(|remote| remote.hash.as_deref() == Some(remote_hash)),
+            "Partner's save changed; review the new comparison"
+        );
+        ensure!(
+            self.sent_save.is_none()
+                && self.incoming_iso.is_none()
+                && self.outgoing_iso.is_none()
+                && self.iso_offer.is_none()
+                && !self.iso_preparing
+                && self.iso_verifying.is_none(),
+            "Finish other transfers before reconciling saves"
+        );
+        if use_remote {
+            if let Some(pending) = self.pending_save.take() {
+                ensure!(
+                    pending.hash == remote_hash && pending.deadline > Instant::now(),
+                    "Incoming save changed or expired"
+                );
+                return self.receive_save(pending, true);
+            }
+            let preview = self
+                .remote_preview
+                .as_ref()
+                .filter(|preview| preview.hash == remote_hash)
+                .context("Wait for the verified partner preview")?;
+            let pending = PendingSave {
+                hash: preview.hash.clone(),
+                expected: Some(local_hash.into()),
+                bytes: preview.bytes.clone(),
+                lease: None,
+                deadline: Instant::now() + Duration::from_secs(120),
+            };
+            self.commit_save(pending, true, false)
+        } else {
+            ensure!(
+                self.remote_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.hash == remote_hash),
+                "Wait for both branches to be preserved before choosing"
+            );
+            if let Some(pending) = self.pending_save.take() {
+                self.send(&Event::SaveDeclined { hash: pending.hash })?;
+            }
+            self.offer_save(true)
+        }
+    }
+
     fn request_launch(&mut self) -> Result<()> {
+        self.request_launch_mode(false)
+    }
+
+    fn request_launch_mode(&mut self, local_only: bool) -> Result<()> {
         self.ensure_history()?;
         if !self.textures_loaded && !self.texture_busy {
             self.reload_textures()?;
@@ -2933,10 +3254,6 @@ impl Engine {
         ensure!(
             !self.texture_state.recovery_needed,
             "Recover the interrupted texture switch before launching"
-        );
-        ensure!(
-            self.ready(),
-            "Strict play protection requires your paired device online"
         );
         self.require_idle()?;
         ensure!(
@@ -2956,6 +3273,33 @@ impl Engine {
             "Dusklight was already launched outside this manager"
         );
         self.refresh_save()?;
+        ensure!(
+            self.save_valid && self.stable >= 2,
+            "Wait for a stable, valid local save profile before playing"
+        );
+        let path = self
+            .settings
+            .save_file
+            .clone()
+            .context("Missing save location")?;
+        let current = files::read_optional_save(&path)?;
+        ensure!(
+            current.as_deref().map(files::sha256).as_ref() == self.local_hash.as_ref(),
+            "Local save changed before playing; retry after it stabilizes"
+        );
+        if let Some(bytes) = current {
+            self.history
+                .as_mut()
+                .context("History is unavailable")?
+                .capture(&bytes, &path, history::Reason::Observed, None)?;
+            self.history_last_hash = self.local_hash.clone();
+            self.history_candidate = None;
+            self.history_cursor = None;
+            self.refresh_history()?;
+        }
+        if local_only || !self.ready() {
+            return self.start_game(None);
+        }
         let remote = self
             .remote
             .as_ref()
@@ -2992,6 +3336,63 @@ impl Engine {
         Ok(())
     }
 
+    fn start_game(&mut self, lease: Option<String>) -> Result<()> {
+        let executable = self
+            .settings
+            .game_exe
+            .as_ref()
+            .context("Select or install Dusklight")?;
+        ensure!(
+            self.save_profile.as_ref()
+                == Some(&save_location::profile(
+                    &self.default_profile,
+                    Some(executable),
+                )?),
+            "Dusklight's profile changed while waiting for play approval; retry after automatic detection completes"
+        );
+        ensure!(
+            save_location::binding_is_current(
+                self.save_profile
+                    .as_deref()
+                    .context("Missing save profile")?,
+                self.settings
+                    .save_file
+                    .as_deref()
+                    .context("Missing save location")?,
+            )?,
+            "Dusklight's memory-card format changed while waiting for play approval"
+        );
+        let child = play::launch(executable)?;
+        let protected = lease.is_some();
+        self.managed_token = lease;
+        self.child = Some(child);
+        self.game_running = true;
+        self.audit.record(
+            "game-started",
+            Some(executable),
+            self.local_hash.as_deref(),
+            self.settings
+                .peer
+                .as_ref()
+                .map(|peer| peer.public_key.as_str()),
+            if protected {
+                "Both devices durably reserved the same exclusive-play lock"
+            } else {
+                "Independent local play; progress retained for later reconciliation"
+            },
+        )?;
+        self.send_state()?;
+        self.message = if protected {
+            "Dusklight is running with online play protection."
+        } else if self.ready() {
+            "Playing this PC's save branch. Other progress remains preserved for reconciliation."
+        } else {
+            "Playing offline. Progress stays on this PC until your partner reconnects."
+        }
+        .into();
+        Ok(())
+    }
+
     fn send_state(&mut self) -> Result<()> {
         if self.ready() {
             self.send(&Event::State {
@@ -3022,6 +3423,7 @@ impl Engine {
                 })?;
             }
             self.local_hash = None;
+            self.local_save = None;
             self.previous_hash = None;
             self.save_valid = false;
             self.stable = 0;
@@ -3094,6 +3496,7 @@ impl Engine {
                 s.sync_base = None;
             })?;
             self.local_hash = None;
+            self.local_save = None;
             self.previous_hash = None;
             self.save_valid = false;
             self.stable = 0;
@@ -3140,6 +3543,24 @@ impl Engine {
                 }
                 self.previous_hash = hash.clone();
                 let changed = !was_valid || self.local_hash != hash;
+                if changed {
+                    self.local_save = match &hash {
+                        Some(expected) => {
+                            let bytes = files::read_save(
+                                self.settings
+                                    .save_file
+                                    .as_deref()
+                                    .context("Missing save location")?,
+                            )?;
+                            ensure!(
+                                files::sha256(&bytes) == *expected,
+                                "Save changed during inspection; retrying shortly"
+                            );
+                            Some(save_data::inspect(&bytes)?)
+                        }
+                        None => None,
+                    };
+                }
                 self.local_hash = hash;
                 if changed {
                     self.send_state()?;
@@ -3151,6 +3572,7 @@ impl Engine {
                 self.stable = 0;
                 self.stable_since = Instant::now();
                 self.local_hash = None;
+                self.local_save = None;
                 self.send_state()?;
                 Err(error).context("Save validation failed; no data was transferred or overwritten")
             }
@@ -3193,7 +3615,8 @@ impl Engine {
             "A Twilight Sync update operation is already running"
         );
         ensure!(
-            self.last_self_update_check.elapsed() >= Duration::from_secs(10),
+            self.last_self_update_check
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(10)),
             "Update checks are rate limited; retry shortly"
         );
         self.audit.record(
@@ -3203,7 +3626,7 @@ impl Engine {
             None,
             "Official GitHub stable-release metadata only; no automatic download or installation",
         )?;
-        self.last_self_update_check = Instant::now();
+        self.last_self_update_check = Some(Instant::now());
         self.self_updates.checking = true;
         self.self_updates.error = None;
         self.self_updates.message = "Checking official Twilight Sync releases...".into();
@@ -3348,9 +3771,13 @@ impl Engine {
                 ),
             )?;
         }
+        self.local_hash = Some(hash.clone());
+        self.local_save = Some(save_data::inspect(&bytes)?);
+        self.save_valid = true;
         self.history_last_hash = Some(hash);
         self.history_cursor = None;
         self.refresh_history()?;
+        self.send_state()?;
         Ok(())
     }
 
@@ -3358,7 +3785,10 @@ impl Engine {
         if self.self_updates.enabled
             && !self.self_updates.checking
             && !self.self_updates.preparing
-            && self.last_self_update_check.elapsed() >= self_update::CHECK_INTERVAL
+            && self.last_self_update_check.map_or_else(
+                || Instant::now() >= self.first_self_update_check,
+                |last| last.elapsed() >= self_update::CHECK_INTERVAL,
+            )
         {
             self.begin_self_update_check()?;
         }
@@ -3553,6 +3983,9 @@ impl Engine {
             self.stable = 0;
             self.stable_since = Instant::now();
             self.release_sent = false;
+            if self.managed_token.is_none() {
+                self.message = "Game stopped. Local progress will sync or be compared when your partner is available.".into();
+            }
         }
         if self.game_running && self.child.is_none() {
             self.message = "Dusklight was launched outside Twilight Sync. Save writes are blocked; exclusive play cannot be enforced for this launch.".into();
@@ -3573,6 +4006,36 @@ impl Engine {
     }
 
     fn sync_tick(&mut self) -> Result<()> {
+        if (!self.ready() || self.save_conflict().is_some())
+            && !self.game_running
+            && self.child.is_none()
+            && self.save_valid
+            && self.stable >= 2
+            && self.managed_token.as_deref().is_some_and(|token| {
+                play::matches(
+                    self.settings.play_lock.as_ref(),
+                    &self.identity.public,
+                    token,
+                )
+            })
+        {
+            ensure!(
+                self.current_hash()? == self.local_hash,
+                "Final local save changed"
+            );
+            self.audit.record(
+                "play-session-completed-offline",
+                self.settings.save_file.as_deref(),
+                self.local_hash.as_deref(),
+                None,
+                "Final save retained locally; reconnect will reconcile before any replacement",
+            )?;
+            self.store(|settings| settings.play_lock = None)?;
+            self.managed_token = None;
+            self.release_sent = false;
+            self.message = "Game stopped. Progress is saved on this PC and will sync when your partner returns.".into();
+            self.send_state()?;
+        }
         if !self.ready() || self.game_running || !self.save_valid || self.stable < 2 {
             return Ok(());
         }
@@ -3580,6 +4043,21 @@ impl Engine {
             return Ok(());
         };
         if remote.game || !remote.save_ready {
+            return Ok(());
+        }
+        if let Some(conflict) = self.save_conflict() {
+            if self.no_transfer()
+                && self.remote_preview.is_none()
+                && self.preview_requested.as_ref().is_none_or(|(hash, sent)| {
+                    hash != &conflict.remote_hash || sent.elapsed() >= Duration::from_secs(10)
+                })
+            {
+                self.send(&Event::SavePreviewRequest {
+                    hash: conflict.remote_hash.clone(),
+                })?;
+                self.preview_requested = Some((conflict.remote_hash, Instant::now()));
+            }
+            self.message = "Save fork: both PCs have different progress. Compare the branches or continue your local save.".into();
             return Ok(());
         }
         if self.local_hash == remote.hash {
@@ -3897,6 +4375,8 @@ impl Engine {
             connecting: self.connecting.load(Ordering::Acquire),
             pairing_open: self.pairing_open(),
             local_hash: self.local_hash.clone(),
+            local_save: self.local_save.clone(),
+            conflict: self.save_conflict(),
             save_profile: self.save_profile.clone(),
             save_ready: self.save_valid,
             remote_hash: self.remote.as_ref().and_then(|r| r.hash.clone()),
@@ -3949,6 +4429,298 @@ mod tests {
         let mut bytes = save_location::tests::stock_save("GZ2E");
         bytes[0x100] = marker;
         bytes
+    }
+
+    fn fork_harness() -> Result<Harness> {
+        let mut left = save_data::tests::populated(true)?;
+        left[8..40].fill(0);
+        left[8..16].copy_from_slice(b"gczelda2");
+        let mut right = left.clone();
+        for offset in [0x4048, 0x6048] {
+            right[offset + 4..offset + 6].copy_from_slice(&456_u16.to_be_bytes());
+        }
+        files::tests::reseal(&mut right)?;
+        let mut harness = Harness::new(Some(left), Some(right))?;
+        harness.pair()?;
+        harness.left.sync_tick()?;
+        harness.pump_until(|harness| harness.left.remote_preview.is_some())?;
+        Ok(harness)
+    }
+
+    #[test]
+    fn fork_preview_preserves_both_branches_without_overwriting() -> Result<()> {
+        let harness = fork_harness()?;
+        let conflict = harness.left.save_conflict().context("Missing conflict")?;
+        assert_eq!(
+            harness
+                .left
+                .local_save
+                .as_ref()
+                .context("Missing local summary")?
+                .slots[0]
+                .rupees,
+            321
+        );
+        assert_eq!(
+            conflict.remote.context("Missing partner summary")?.slots[0].rupees,
+            456
+        );
+        assert!(harness.left.pending_save.is_none());
+        let history = harness.left.history.as_ref().context("Missing history")?;
+        for hash in [&conflict.local_hash, &conflict.remote_hash] {
+            let id = history
+                .find_hash(hash)?
+                .context("Branch was not preserved")?;
+            assert_eq!(files::sha256(&history.read(&id)?), *hash);
+        }
+        assert_eq!(
+            harness.left.current_hash()?.as_ref(),
+            Some(&conflict.local_hash)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fork_selecting_partner_reconciles_locally_and_retains_original() -> Result<()> {
+        let mut harness = fork_harness()?;
+        let conflict = harness.left.save_conflict().context("Missing conflict")?;
+        harness
+            .left
+            .resolve_conflict(&conflict.local_hash, &conflict.remote_hash, true)?;
+        harness.pump_until(|harness| {
+            harness
+                .right
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.hash == harness.right.local_hash)
+        })?;
+        harness.right.sync_tick()?;
+        assert_eq!(harness.left.current_hash()?, harness.right.current_hash()?);
+        assert!(harness.left.save_conflict().is_none());
+        let history = harness.left.history.as_ref().context("Missing history")?;
+        assert!(history.find_hash(&conflict.local_hash)?.is_some());
+        assert!(history.page(None)?.entries[0].merge_parent.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_selecting_local_still_requires_partner_consent() -> Result<()> {
+        let mut harness = fork_harness()?;
+        let conflict = harness.left.save_conflict().context("Missing conflict")?;
+        harness
+            .left
+            .resolve_conflict(&conflict.local_hash, &conflict.remote_hash, false)?;
+        harness.pump_until(|harness| harness.right.pending_save.is_some())?;
+        assert_eq!(
+            harness.right.current_hash()?.as_ref(),
+            Some(&conflict.remote_hash)
+        );
+        harness.right.command(Command::AcceptSave(true))?;
+        harness.pump_until(|harness| harness.left.sent_save.is_none())?;
+        assert_eq!(
+            harness.right.current_hash()?.as_ref(),
+            Some(&conflict.local_hash)
+        );
+        assert!(harness.left.history_page.entries[0].merge_parent.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_can_continue_local_play_without_matching_or_replacing_partner() -> Result<()> {
+        let mut harness = fork_harness()?;
+        let before = harness.right.current_hash()?;
+        let executable = harness.left.root.join("dusklight.exe");
+        fs::write(&executable, b"Not an executable")?;
+        harness.left.settings.game_exe = Some(executable);
+        let expected = harness.left.local_hash.clone();
+        let error = harness
+            .left
+            .command(Command::ContinueLocal { expected })
+            .err()
+            .context("Invalid executable accepted")?;
+        assert!(
+            format!("{error:#}").contains("Launching Dusklight"),
+            "{error:#}"
+        );
+        assert!(harness.left.settings.play_lock.is_none());
+        assert!(harness.left.sent_save.is_none());
+        assert_eq!(harness.right.current_hash()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn fork_with_completed_online_lease_does_not_deadlock_reconciliation() -> Result<()> {
+        let mut harness = fork_harness()?;
+        let lease = PlayLock {
+            owner: harness.left.identity.public.clone(),
+            token: token(),
+        };
+        harness.left.managed_token = Some(lease.token.clone());
+        harness.left.settings.play_lock = Some(lease.clone());
+        harness.right.settings.play_lock = Some(lease);
+        harness.left.sync_tick()?;
+        harness.pump_until(|harness| harness.right.settings.play_lock.is_none())?;
+        assert!(harness.left.settings.play_lock.is_none());
+        assert!(harness.left.save_conflict().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_progress_refreshes_only_after_a_stable_valid_autosave() -> Result<()> {
+        let mut harness = fork_harness()?;
+        harness.left.game_running = true;
+        let path = harness
+            .left
+            .settings
+            .save_file
+            .clone()
+            .context("Missing save")?;
+        let mut bytes = files::read_save(&path)?;
+        for offset in [0x4048, 0x6048] {
+            bytes[offset + 4..offset + 6].copy_from_slice(&777_u16.to_be_bytes());
+        }
+        files::tests::reseal(&mut bytes)?;
+        files::atomic_write(&path, &bytes)?;
+        harness.left.snapshot_tick()?;
+        assert_eq!(
+            harness
+                .left
+                .local_save
+                .as_ref()
+                .context("Missing progress")?
+                .slots[0]
+                .rupees,
+            321
+        );
+        harness
+            .left
+            .history_candidate
+            .as_mut()
+            .context("Missing candidate")?
+            .1 = Instant::now() - Duration::from_secs(2);
+        harness.left.snapshot_tick()?;
+        assert_eq!(
+            harness
+                .left
+                .local_save
+                .as_ref()
+                .context("Missing progress")?
+                .slots[0]
+                .rupees,
+            777
+        );
+        assert!(harness.left.sent_save.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_automatic_offer_with_disagreeing_bases_requires_consent() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(2)), Some(variant(3)))?;
+        harness.pair()?;
+        let original = harness.right.current_hash()?;
+        harness.left.settings.sync_base = original.clone();
+        harness.right.settings.sync_base = Some(files::sha256(&variant(1)));
+        harness.left.sync_tick()?;
+        harness.pump_until(|harness| harness.right.pending_save.is_some())?;
+        assert_eq!(harness.right.current_hash()?, original);
+        assert!(harness.right.save_conflict().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn fork_stale_comparison_or_running_game_never_replaces_a_save() -> Result<()> {
+        let mut harness = fork_harness()?;
+        let conflict = harness.left.save_conflict().context("Missing conflict")?;
+        harness.left.process = ProcessMonitor::for_test(true);
+        assert!(
+            harness
+                .left
+                .resolve_conflict(&conflict.local_hash, &conflict.remote_hash, true)
+                .is_err()
+        );
+        assert_eq!(
+            harness.left.current_hash()?.as_ref(),
+            Some(&conflict.local_hash)
+        );
+        harness.left.process = ProcessMonitor::for_test(false);
+        let path = harness
+            .left
+            .settings
+            .save_file
+            .clone()
+            .context("Missing save")?;
+        let mut changed = files::read_save(&path)?;
+        changed[0x100] ^= 1;
+        files::atomic_write(&path, &changed)?;
+        assert!(
+            harness
+                .left
+                .resolve_conflict(&conflict.local_hash, &conflict.remote_hash, true)
+                .is_err()
+        );
+        assert_eq!(files::read_save(&path)?, changed);
+        Ok(())
+    }
+
+    #[test]
+    fn offline_launch_needs_no_peer_or_network_and_failure_leaves_no_lock() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let engine = &mut harness.left;
+        engine.disconnect("Offline launch test");
+        engine.network = None;
+        engine.settings.peer = None;
+        let executable = engine.root.join("dusklight.exe");
+        fs::write(&executable, b"Not an executable")?;
+        engine.settings.game_exe = Some(executable);
+        let error = engine
+            .request_launch()
+            .err()
+            .context("Invalid executable was accepted")?;
+        assert!(
+            format!("{error:#}").contains("Launching Dusklight"),
+            "{error:#}"
+        );
+        assert!(engine.settings.play_lock.is_none());
+        assert!(engine.managed_token.is_none());
+        assert!(engine.launch_pending.is_none());
+        assert!(engine.child.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_completion_releases_only_the_finished_local_session() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        let lease = token();
+        let owner = harness.left.identity.public.clone();
+        harness.left.settings.play_lock = Some(PlayLock {
+            owner: owner.clone(),
+            token: lease.clone(),
+        });
+        harness.left.managed_token = Some(lease.clone());
+        harness.right.settings.play_lock = Some(PlayLock {
+            owner,
+            token: lease,
+        });
+        harness.left.disconnect("Connection lost during play");
+        harness.left.game_running = true;
+        harness.left.sync_tick()?;
+        assert!(harness.left.settings.play_lock.is_some());
+        harness.left.game_running = false;
+        harness.left.stable = 0;
+        harness.left.sync_tick()?;
+        assert!(harness.left.settings.play_lock.is_some());
+        harness.left.stable = 2;
+        harness.left.sync_tick()?;
+        assert!(harness.left.settings.play_lock.is_none());
+        assert!(harness.left.managed_token.is_none());
+        harness.right.authenticated_event(Event::State {
+            hash: harness.left.local_hash.clone(),
+            save_ready: true,
+            game: false,
+            lock: None,
+        })?;
+        assert!(harness.right.settings.play_lock.is_none());
+        Ok(())
     }
 
     fn native_variant(marker: u8) -> Vec<u8> {

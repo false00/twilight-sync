@@ -97,6 +97,18 @@ pub enum Event {
         hash: String,
         size: u64,
     },
+    SavePreviewRequest {
+        hash: String,
+    },
+    SavePreview {
+        hash: String,
+        base: Option<String>,
+        #[serde(deserialize_with = "bounded_bytes")]
+        bytes: Vec<u8>,
+    },
+    SaveDeclined {
+        hash: String,
+    },
 }
 
 fn bounded_bytes<'de, D: de::Deserializer<'de>>(
@@ -299,6 +311,46 @@ impl SecureReader {
 mod tests {
     use super::*;
     use std::{net::TcpListener, thread};
+
+    #[test]
+    fn save_previews_append_bounded_events_without_renumbering() -> Result<()> {
+        for (index, event) in [
+            (
+                21,
+                Event::SavePreviewRequest {
+                    hash: "a".repeat(64),
+                },
+            ),
+            (
+                22,
+                Event::SavePreview {
+                    hash: "a".repeat(64),
+                    base: None,
+                    bytes: crate::files::fixture_save(),
+                },
+            ),
+            (
+                23,
+                Event::SaveDeclined {
+                    hash: "a".repeat(64),
+                },
+            ),
+        ] {
+            let bytes = postcard::to_allocvec(&event)?;
+            assert_eq!(bytes[0], index);
+            assert!(bytes.len() < MAX_FRAME - 16);
+            let decoded: Event = postcard::from_bytes(&bytes)?;
+            assert_eq!(postcard::to_allocvec(&decoded)?, bytes);
+        }
+        let oversized = Event::SavePreview {
+            hash: "a".repeat(64),
+            base: None,
+            bytes: vec![0; SAVE_SIZE + 1],
+        };
+        assert!(postcard::from_bytes::<Event>(&postcard::to_allocvec(&oversized)?).is_err());
+        assert_eq!(postcard::to_allocvec(&Event::Ping)?, vec![19]);
+        Ok(())
+    }
 
     #[test]
     fn bilateral_encrypted_session_and_rekey() -> Result<()> {

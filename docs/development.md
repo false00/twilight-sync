@@ -38,6 +38,26 @@ The normal game launch is retained so Dusklight can handle its own profile
 migrations and preferences. The read-only `--check-save-location` diagnostic
 accepts no custom directory and does not initialize startup or write settings.
 
+### Offline play, forks, and progress
+
+```powershell
+cargo test --lib --locked -- save_data::tests history::tests runtime::tests ui::tests ui::saves::tests
+```
+
+The read-only decoder uses synthetic, checksum-valid PC/console saves matching
+the pinned Dusklight layout. Tests cover slot identity, primary-bank selection,
+field units, clock rates, corruption rejection, and recorded gains/losses. Actor
+tests exercise offline launch/finalization, independent local continuation,
+verified previews, common-base disagreement, receiver consent, stale choices,
+and prevention of writes during play or after a profile change. Fork history
+tests reopen and reconstruct both branches and two-parent resolutions.
+
+Native egui tests inspect text geometry and emitted shapes, without screenshots,
+at narrow, short, high-DPI, and desktop logical sizes in light/dark appearances.
+They cover complete comparison dialogs, each selection state, no default winner,
+and reconciliation without a local game installation. These synthetic tests do
+not launch a real Dusklight build or read/write real user profiles.
+
 ### Raw memory cards
 
 ```powershell

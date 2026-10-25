@@ -366,7 +366,7 @@ pub(crate) fn fixture_native_save() -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -468,7 +468,7 @@ mod tests {
         Ok(())
     }
 
-    fn reseal(bytes: &mut [u8]) -> Result<()> {
+    pub(crate) fn reseal(bytes: &mut [u8]) -> Result<()> {
         for offset in [0x4040, 0x6040] {
             let sector = &mut bytes[offset..offset + 0x2000];
             for slot in 0..3 {
@@ -488,8 +488,13 @@ mod tests {
                 .sum();
             let high = (sum & 0xffff) as u16;
             let low = 0_u16.wrapping_sub(0xffe).wrapping_sub(high);
-            sector[0x1ffc..]
-                .copy_from_slice(&((u32::from(high) << 16) | u32::from(low)).to_be_bytes());
+            let checksum = (u32::from(high) << 16) | u32::from(low);
+            let encoded = if sector[4..8] == [6, 0, 0, 0] {
+                checksum.to_le_bytes()
+            } else {
+                checksum.to_be_bytes()
+            };
+            sector[0x1ffc..].copy_from_slice(&encoded);
         }
         Ok(())
     }

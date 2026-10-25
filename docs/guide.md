@@ -26,9 +26,10 @@ It does not include game assets, saves, disc images, or a copy of Dusklight.
 | Two-sided pairing | Both devices open pairing and independently approve a matching, session-specific code |
 | Encrypted events | `twilightProto/1` uses Noise XX, pinned device keys, authenticated encryption, and periodic rekeying |
 | Save sync | Automatically sync a changed save when the other copy still matches the common base |
-| Conflict safety | No last-writer-wins: the receiver must approve a conflicting replacement |
-| Save history | Compressed, shared 4 KiB blocks with parent-linked commits and a 64 MiB retention budget |
-| Exclusive play | Both devices durably reserve a play lock before a managed game launch |
+| Conflict safety | Verified read-only branch previews, progress comparison, explicit selection, and receiver consent |
+| Save history | Shared 4 KiB blocks, fork and reconciliation parents, progress changes, and a 64 MiB retention budget |
+| Play | Offline sessions are allowed; matching online saves retain coordinated play locks |
+| Progress | Read-only decoding of quest slots, dates, play time, hearts, equipment, items, and milestone records |
 | Native desktop | Dark dashboard, discovery/pairing screens, system-tray status and actions |
 | Windows startup | Enabled on the first normal launch; toggle in the tray or settings |
 | Private audit trail | Rotating JSON-lines logs under your home `.twilight-sync` directory |
@@ -87,10 +88,11 @@ The startup entry is per-user, not a scheduled task or administrator service.
 7. Save detection is automatic. Sync follows Dusklight's active profile and
    standard Card A save; there are no save-path controls. Each PC can have a
    different local profile location.
-8. If both saves exist and differ initially, use **Send this save** on the copy
-   you want. The other device must approve replacement; its old copy is backed up.
-9. Launch with **Play Dusklight**. Both managers must be online and their save
-   states must match. After exit, the final save is synced before play is unlocked.
+8. If both saves have divergent progress, compare the branches. Select a whole
+  save explicitly, or keep both and continue the local branch. Both versions
+  are preserved; the receiving user must approve replacing their save.
+9. Launch with **Play Dusklight**, including offline. Matching online saves use
+  the coordinated lock. Offline progress is synced or compared on reconnect.
 
 For a new game, an automatically resolved empty destination is distinguished from
 an unavailable profile or an invalid save. The manager can reserve exclusive play
@@ -326,24 +328,45 @@ Corrupt or incompatible existing destinations are not silently overwritten.
 The oldest history commits are pruned to keep the managed store within its
 64 MiB budget; shared blocks are deleted only when no retained commit needs them.
 
+When both copies have diverged, an authenticated, bounded read-only preview
+request retrieves the partner's full validated GCI without installing it. The
+local copy and partner branch are captured before presenting a choice. Preview
+hashes must match the advertised state; unsolicited/stale responses are ignored.
+The active profile and card binding are rechecked before inspection and before
+replacement. Automatic replacement of an existing changed save requires both
+devices to agree on the common base; disagreement falls back to explicit review.
+
+The prompt has no default winner. **Use partner's save on this PC** replaces
+only the local copy after its expected hash is rechecked. **Offer this PC's save
+to partner** still requires the partner's approval. **Keep both; play this PC**
+leaves both branches intact and starts an independent local session when idle.
+Choosing either complete save records both parents on the resolving history
+where those branches are retained. There is no byte-wise merge of quest flags,
+inventory, or individual slots. Both PCs must run this build for preview frames.
+
 **Checksums are not a malware scanner.** An attacker can calculate valid game
 checksums. There is no general test for the absence of all executable sequences
 or all game-engine exploits inside arbitrary binary data. These checks reduce
 the accepted attack surface, including overlong name fields; they do not prove
 semantic safety or replace game updates, OS security, or an independent review.
 
-## One game at a time: consistency over availability
+## Offline play and online coordination
 
 The **Dusklight (Twilight Sync)** desktop shortcut is created or refreshed by
 managed Dusklight installs and updates, including verification/reuse of an
-existing installation. It opens the manager's protected Play controls with
+existing installation. It opens the manager's Play controls with
 `--open-dusklight`; an already-running manager is shown instead of starting a
-second instance. It does not launch the game or bypass bilateral play locks.
+second instance. It does not launch the game directly or bypass local checks.
 Its icon follows the selected installed version. A private hash receipt prevents
 overwriting unrelated or independently modified shortcuts; deleting an owned
 shortcut allows the next install/update to recreate it.
 
 There is no lease TTL that could expire during a long game or network partition.
+An offline launch does not request a partner lease. It validates the detected
+profile, card binding, stable save (or intentional empty destination), executable,
+and idle local state, then captures existing progress before starting Dusklight.
+It never fabricates an initial save. Offline play cannot guarantee that the
+other PC is not playing independently.
 
 ```text
 Both save states agree and both managers are online
@@ -357,13 +380,21 @@ Both save states agree and both managers are online
     -> requester clears its lock
 ```
 
-If the game exits without creating its first save, both intentional empty
-destinations can also be reconciled and unlocked. If a launch, disk operation,
-connection, or process crashes, saved locks remain. Reconnect, stop every game
-process, and use **Request crash recovery**. The other user must explicitly
-approve recovery too. There is no unilateral offline force-unlock button.
+If the game exits without creating its first save, intentional empty destinations
+can also be reconciled and unlocked. A session that finishes disconnected may
+retire its own lock once its final local save is stable. A connected session
+that encounters a fork also retires its completed reservation so reconciliation
+can proceed. The peer clears a matching owner reservation only after receiving
+authenticated state reporting no running game and no lock. This never clears
+an active game or selects a save winner.
 
-**This guarantee applies to launches through Twilight Sync.** The manager checks
+After a crash, saved locks remain until recovery. Stop every local Dusklight
+process, then use **Request recovery**. Online recovery still requires the other
+user's approval. Offline recovery requires a local confirmation, leaves partner
+progress untouched, and permits independent local play with reconciliation on
+reconnect. A still-running local game, pending launch, or transfer blocks recovery.
+
+**Coordinated exclusivity applies only while both managers participate.** The manager checks
 for `dusklight.exe` before granting/starting play and before committing saves,
 and polls for outside launches while running. It does not inject into Dusklight,
 install a kernel driver, or terminate games automatically. A direct/renamed
@@ -557,9 +588,10 @@ validated stable GCI
     -> atomically publish the retained commit index
 ```
 
-Commits record sequence, parent, game/save identity, timestamp, username, device,
-source path, reason, full save hash, and block references. Repeated unchanged
-saves add nothing. Image/header pages and unchanged quest data are shared
+Commits record sequence, parent, optional reconciliation parent, game/save
+identity, timestamp, username, device, source path, reason, full save hash, and
+block references. Ordinary repeated unchanged saves add nothing; an explicit
+reconciliation may add ancestry without changing bytes. Image/header pages and unchanged quest data are shared
 between revisions. There is no fragile delta chain: reconstructing a retained
 snapshot requires only its own referenced blocks.
 
@@ -577,6 +609,35 @@ snapshot requires only its own referenced blocks.
   destination must be moved aside first rather than silently overwritten.
 - History is browsable in pages of 50 commits. Pruned parents may be shown as
   boundary IDs; retained snapshots do not depend on those deleted commits.
+- A partner preview branches from the retained common save when available; it
+  never becomes the parent of subsequent local play. Selection records both
+  retained branches. Existing version-1 commits without the optional second
+  parent remain readable and keep their original content hashes.
+
+### Read-only progress inspection
+
+Home, the fork prompt, and history decode the reconstructed validated GCI, not
+file modification times or guessed progress. The decoder follows Dusklight
+v2.0.3's [player layout](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/include/d/d_save.h),
+[serialization](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/d/d_save.cpp),
+[item IDs](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/include/d/d_item_data.h),
+and [primary/backup-bank behavior](https://github.com/TwilitRealm/dusklight/blob/v2.0.3/src/m_Do/m_Do_MemCardRWmng.cpp).
+
+Each occupied quest slot exposes player/horse names, in-save dates (shown as
+UTC), total time, capacity/current health, heart pieces, rupees, saved stage/room
+and form, carried items, recorded equipment, arrows/bombs, Poe souls, golden
+insects, Fused Shadows, mirror shards, boss-clear records, deaths, and clear count.
+Quest integers remain big-endian inside either sector envelope. Capacity uses
+five stored units per heart; current health uses quarter-heart units. Play time
+and in-save dates use GameCube/Wii tick rates and the 2000 epoch. Empty slots,
+missing clocks, unknown item IDs, and legacy-encoded names are identified rather
+than invented. The inspector does not change game data or bypass checksums.
+
+Summaries describe only recorded milestones, not a reconstructed story or a
+complete activity log. Comparisons report decoded gains and losses from the
+common retained save, or from the other branch when no verified base remains.
+Timestamps are informational; clock skew, mods, resets, and non-monotonic game
+progress make neither newest date nor greatest play time a safe automatic winner.
 
 The **64 MiB per-device budget** includes managed compressed objects, commit
 files, and index bytes. Oldest commits are pruned first, and garbage collection

@@ -1,4 +1,7 @@
-use crate::files::{self, SAVE_SIZE, ensure_safe_path, sha256, valid_hash};
+use crate::{
+    files::{self, SAVE_SIZE, ensure_safe_path, sha256, valid_hash},
+    save_data,
+};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use serde::{Deserialize, Serialize};
@@ -26,6 +29,8 @@ pub enum Reason {
     BeforeRestore,
     Restored,
     LegacyBackup,
+    PeerBranch,
+    Reconciled,
 }
 
 impl Reason {
@@ -37,6 +42,8 @@ impl Reason {
             Self::BeforeRestore => "Before restore",
             Self::Restored => "Restored snapshot",
             Self::LegacyBackup => "Migrated backup",
+            Self::PeerBranch => "Preserved partner branch",
+            Self::Reconciled => "Reconciled local branch",
         }
     }
 }
@@ -54,6 +61,8 @@ struct Commit {
     version: u8,
     sequence: u64,
     parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merge_parent: Option<String>,
     stream: String,
     game: String,
     name: String,
@@ -101,13 +110,18 @@ pub struct Entry {
     pub id: String,
     pub sequence: u64,
     pub parent: Option<String>,
+    pub merge_parent: Option<String>,
     pub game: String,
     pub name: String,
     pub hash: String,
     pub timestamp: String,
     pub username: String,
+    pub device: String,
+    pub peer: Option<String>,
     pub reason: Reason,
     pub restored_from: Option<String>,
+    pub summary: Option<save_data::Summary>,
+    pub changes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +164,13 @@ pub struct Capture {
 struct Prepared {
     reference: Reference,
     added: bool,
+}
+
+#[derive(Default)]
+struct Provenance<'a> {
+    peer: Option<&'a str>,
+    restored_from: Option<&'a str>,
+    base: Option<&'a str>,
 }
 
 struct Accounting {
@@ -278,6 +299,7 @@ impl History {
         );
         ensure!(
             commit.parent.as_deref().is_none_or(valid_id)
+                && commit.merge_parent.as_deref().is_none_or(valid_id)
                 && commit.restored_from.as_deref().is_none_or(valid_id),
             "Invalid snapshot ancestry"
         );
@@ -321,7 +343,13 @@ impl History {
             "Invalid snapshot sequence counter"
         );
         let mut ids = HashSet::new();
-        let mut heads: HashMap<&str, &str> = HashMap::new();
+        let retained: HashSet<&str> = self
+            .index
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let mut seen: HashMap<&str, &str> = HashMap::new();
         let mut previous_sequence = 0;
         for reference in &self.index.entries {
             ensure!(
@@ -338,18 +366,21 @@ impl History {
                 commit.sequence == reference.sequence && commit.stream == reference.stream,
                 "Snapshot index differs from commit"
             );
-            if let Some(parent) = heads.get(reference.stream.as_str()) {
-                ensure!(
-                    commit.parent.as_deref() == Some(*parent),
-                    "Snapshot parent chain is broken"
-                );
-            } else if self.index.pruned == 0 {
-                ensure!(
-                    commit.parent.is_none(),
-                    "Unexpected missing snapshot parent"
-                );
+            for parent in [&commit.parent, &commit.merge_parent].into_iter().flatten() {
+                if retained.contains(parent.as_str()) {
+                    ensure!(
+                        seen.get(parent.as_str()) == Some(&reference.stream.as_str()),
+                        "Snapshot parent is not an earlier commit in the same save stream"
+                    );
+                } else {
+                    ensure!(self.index.pruned > 0, "Unexpected missing snapshot parent");
+                }
             }
-            heads.insert(&reference.stream, &reference.id);
+            ensure!(
+                commit.merge_parent.is_none() || commit.merge_parent != commit.parent,
+                "Duplicate snapshot parents"
+            );
+            seen.insert(reference.id.as_str(), reference.stream.as_str());
             previous_sequence = reference.sequence;
         }
         Ok(())
@@ -422,27 +453,36 @@ impl History {
         bytes: &[u8],
         source: &Path,
         reason: Reason,
-        peer: Option<&str>,
-        restored_from: Option<&str>,
+        provenance: Provenance<'_>,
         timestamp: String,
     ) -> Result<Prepared> {
         let identity = files::validate_save(bytes)?;
         ensure_safe_path(source)?;
         ensure!(
-            peer.is_none_or(valid_id) && restored_from.is_none_or(valid_id),
+            provenance.peer.is_none_or(valid_id)
+                && provenance.restored_from.is_none_or(valid_id)
+                && provenance.base.is_none_or(valid_id),
             "Invalid snapshot provenance"
         );
         let stream = stream_id(&identity);
         let hash = sha256(bytes);
-        let previous = self
+        let mut previous = None;
+        for reference in self
             .index
             .entries
             .iter()
             .rev()
-            .find(|entry| entry.stream == stream)
-            .cloned();
+            .filter(|entry| entry.stream == stream)
+        {
+            if self.commit(&reference.id)?.reason != Reason::PeerBranch {
+                previous = Some(reference.clone());
+                break;
+            }
+        }
         if let Some(previous) = &previous
             && reason != Reason::Restored
+            && reason != Reason::PeerBranch
+            && reason != Reason::Reconciled
             && self.commit(&previous.id)?.hash == hash
         {
             // Verify the existing reconstruction before trusting deduplication as a backup.
@@ -454,6 +494,56 @@ impl History {
                 reference: previous.clone(),
                 added: false,
             });
+        }
+        let mut parent = if reason == Reason::PeerBranch {
+            provenance
+                .base
+                .map(|hash| self.find_hash(hash))
+                .transpose()?
+                .flatten()
+        } else {
+            previous.map(|entry| entry.id)
+        };
+        if let Some(id) = &parent
+            && self.commit(id)?.stream != stream
+        {
+            parent = None;
+        }
+        let mut merge_parent = None;
+        if reason == Reason::Received {
+            for reference in self
+                .index
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| entry.stream == stream)
+            {
+                let candidate = self.commit(&reference.id)?;
+                if candidate.reason == Reason::PeerBranch
+                    && candidate.hash == hash
+                    && candidate.peer.as_deref() == provenance.peer
+                {
+                    merge_parent = Some(reference.id.clone());
+                    break;
+                }
+            }
+        }
+        if reason == Reason::Reconciled {
+            merge_parent = provenance
+                .base
+                .map(|hash| self.find_hash(hash))
+                .transpose()?
+                .flatten();
+            ensure!(
+                merge_parent.is_some() && merge_parent != parent,
+                "Reconciliation requires two retained branches"
+            );
+        }
+        if let Some(id) = &merge_parent {
+            ensure!(
+                self.commit(id)?.stream == stream,
+                "Cannot reconcile different save identities"
+            );
         }
         self.dirty = true;
         let mut blocks = Vec::new();
@@ -479,7 +569,8 @@ impl History {
         let commit = Commit {
             version: 1,
             sequence: self.index.next_sequence,
-            parent: previous.map(|entry| entry.id),
+            parent,
+            merge_parent,
             stream: stream.clone(),
             game: identity.game,
             name: identity.name,
@@ -490,8 +581,8 @@ impl History {
             device: self.device.clone(),
             source: source.into(),
             reason,
-            peer: peer.map(str::to_owned),
-            restored_from: restored_from.map(str::to_owned),
+            peer: provenance.peer.map(str::to_owned),
+            restored_from: provenance.restored_from.map(str::to_owned),
         };
         let bytes = serde_json::to_vec(&commit)?;
         ensure!(
@@ -576,8 +667,86 @@ impl History {
             bytes,
             source,
             reason,
-            peer,
-            None,
+            Provenance {
+                peer,
+                ..Provenance::default()
+            },
+            OffsetDateTime::now_utc().format(&Rfc3339)?,
+        )?;
+        self.publish(prepared)
+    }
+
+    pub fn find_hash(&self, hash: &str) -> Result<Option<String>> {
+        ensure!(valid_id(hash), "Invalid snapshot save hash");
+        for reference in self.index.entries.iter().rev() {
+            if self.commit(&reference.id)?.hash == hash {
+                return Ok(Some(reference.id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn summary_for_hash(&self, hash: &str) -> Result<Option<save_data::Summary>> {
+        self.find_hash(hash)?
+            .map(|id| save_data::inspect(&self.read(&id)?))
+            .transpose()
+    }
+
+    pub fn capture_branch(
+        &mut self,
+        bytes: &[u8],
+        source: &Path,
+        peer: &str,
+        base: Option<&str>,
+    ) -> Result<Capture> {
+        self.clean_if_dirty()?;
+        files::validate_save(bytes)?;
+        ensure!(
+            valid_id(peer) && base.is_none_or(valid_id),
+            "Invalid branch provenance"
+        );
+        if let Some(id) = self.find_hash(&sha256(bytes))? {
+            ensure!(
+                self.read(&id)? == bytes,
+                "Retained branch reconstruction differs"
+            );
+            return Ok(Capture {
+                id,
+                added: false,
+                pruned: 0,
+            });
+        }
+        let prepared = self.prepare(
+            bytes,
+            source,
+            Reason::PeerBranch,
+            Provenance {
+                peer: Some(peer),
+                base,
+                ..Provenance::default()
+            },
+            OffsetDateTime::now_utc().format(&Rfc3339)?,
+        )?;
+        self.publish(prepared)
+    }
+
+    pub fn record_local_resolution(
+        &mut self,
+        bytes: &[u8],
+        source: &Path,
+        peer: &str,
+        other_hash: &str,
+    ) -> Result<Capture> {
+        self.clean_if_dirty()?;
+        let prepared = self.prepare(
+            bytes,
+            source,
+            Reason::Reconciled,
+            Provenance {
+                peer: Some(peer),
+                base: Some(other_hash),
+                ..Provenance::default()
+            },
             OffsetDateTime::now_utc().format(&Rfc3339)?,
         )?;
         self.publish(prepared)
@@ -616,8 +785,11 @@ impl History {
             bytes,
             path,
             reason,
-            peer,
-            restored_from,
+            Provenance {
+                peer,
+                restored_from,
+                ..Provenance::default()
+            },
             OffsetDateTime::now_utc().format(&Rfc3339)?,
         )?;
         ensure!(
@@ -693,17 +865,36 @@ impl History {
         let mut entries = Vec::new();
         for reference in self.index.entries[start..end].iter().rev() {
             let commit = self.commit(&reference.id)?;
+            let summary = self
+                .read(&reference.id)
+                .and_then(|bytes| save_data::inspect(&bytes))
+                .ok();
+            let previous = commit
+                .parent
+                .as_ref()
+                .and_then(|parent| self.read(parent).ok())
+                .and_then(|bytes| save_data::inspect(&bytes).ok());
+            let changes = summary
+                .as_ref()
+                .zip(previous.as_ref())
+                .map(|(current, previous)| current.changes_from(previous))
+                .unwrap_or_default();
             entries.push(Entry {
                 id: reference.id.clone(),
                 sequence: commit.sequence,
                 parent: commit.parent,
+                merge_parent: commit.merge_parent,
                 game: commit.game,
                 name: commit.name,
                 hash: commit.hash,
                 timestamp: commit.timestamp,
                 username: commit.username,
+                device: commit.device,
+                peer: commit.peer,
                 reason: commit.reason,
                 restored_from: commit.restored_from,
+                summary,
+                changes,
             });
         }
         let next = if start > 0 {
@@ -866,8 +1057,13 @@ impl History {
             );
             self.clean_if_dirty()?;
             let timestamp = OffsetDateTime::from(modified).format(&Rfc3339)?;
-            let prepared =
-                self.prepare(&bytes, &path, Reason::LegacyBackup, None, None, timestamp)?;
+            let prepared = self.prepare(
+                &bytes,
+                &path,
+                Reason::LegacyBackup,
+                Provenance::default(),
+                timestamp,
+            )?;
             let captured = self.publish(prepared)?;
             ensure!(
                 self.read(&captured.id)? == bytes,
@@ -896,6 +1092,87 @@ mod tests {
         let mut bytes = files::fixture_save();
         bytes[0x100] = marker;
         bytes
+    }
+
+    #[test]
+    fn branches_preserve_both_saves_and_reconciliation_has_two_parents() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut history = open(temp.path())?;
+        let path = temp.path().join("save.gci");
+        let peer = "b".repeat(64);
+        let base = history.capture(&version(1), &path, Reason::Observed, None)?;
+        files::atomic_write(&path, &version(2))?;
+        let local = history.capture(&version(2), &path, Reason::Observed, None)?;
+        let branch =
+            history.capture_branch(&version(3), &path, &peer, Some(&sha256(&version(1))))?;
+        assert_eq!(
+            history.commit(&branch.id)?.parent.as_deref(),
+            Some(base.id.as_str())
+        );
+        assert_eq!(files::read_save(&path)?, version(2));
+        assert!(
+            !history
+                .capture_branch(&version(3), &path, &peer, None)?
+                .added
+        );
+        let (_, resolved) = history.replace_save(
+            &path,
+            &version(3),
+            Some(&sha256(&version(2))),
+            Reason::Received,
+            Some(&peer),
+            None,
+        )?;
+        let commit = history.commit(&resolved.id)?;
+        assert_eq!(commit.parent.as_deref(), Some(local.id.as_str()));
+        assert_eq!(commit.merge_parent.as_deref(), Some(branch.id.as_str()));
+        assert_eq!(history.read(&local.id)?, version(2));
+        assert_eq!(history.read(&branch.id)?, version(3));
+        drop(history);
+        let reopened = open(temp.path())?;
+        assert_eq!(reopened.read(&resolved.id)?, version(3));
+        Ok(())
+    }
+
+    #[test]
+    fn local_progress_does_not_descend_from_a_read_only_peer_preview() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut history = open(temp.path())?;
+        let path = temp.path().join("save.gci");
+        let local = history.capture(&version(1), &path, Reason::Observed, None)?;
+        history.capture_branch(&version(2), &path, &"b".repeat(64), None)?;
+        let continued = history.capture(&version(3), &path, Reason::Observed, None)?;
+        assert_eq!(
+            history.commit(&continued.id)?.parent.as_deref(),
+            Some(local.id.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_claimed_base_from_another_region_never_breaks_history_ancestry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut history = open(temp.path())?;
+        let path = temp.path().join("save.gci");
+        let original = version(1);
+        history.capture(&original, &path, Reason::Observed, None)?;
+        let mut other_region = version(2);
+        other_region[..4].copy_from_slice(b"GZ2J");
+        let branch = history.capture_branch(
+            &other_region,
+            &path,
+            &"b".repeat(64),
+            Some(&sha256(&original)),
+        )?;
+        assert!(history.commit(&branch.id)?.parent.is_none());
+        assert!(
+            history
+                .record_local_resolution(&original, &path, &"b".repeat(64), &sha256(&other_region))
+                .is_err()
+        );
+        drop(history);
+        assert_eq!(open(temp.path())?.read(&branch.id)?, other_region);
+        Ok(())
     }
 
     #[test]
