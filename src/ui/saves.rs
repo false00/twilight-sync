@@ -193,7 +193,7 @@ fn fork_diagram(ui: &mut egui::Ui, base: Option<&str>) {
         for (position, color) in [(local, palette.accent), (remote, palette.warning)] {
             painter.add(egui::Shape::line(
                 vec![root, Pos2::new(root.x, root.y + 12.0), position],
-                Stroke::new(2.0, color),
+                Stroke::new(2.0_f32, color),
             ));
         }
         painter.circle_filled(root, 4.0, palette.secondary);
@@ -478,7 +478,7 @@ pub(super) fn history_graph(
                         Pos2::new(parent.x, position.y + 14.0),
                         *parent,
                     ],
-                    Stroke::new(1.5, color),
+                    Stroke::new(1.5_f32, color),
                 ));
             }
         }
@@ -494,7 +494,7 @@ pub(super) fn history_graph(
             };
             ui.painter().circle_filled(*position, 5.0, color);
             ui.painter()
-                .circle_stroke(*position, 8.0, Stroke::new(1.0, color));
+                .circle_stroke(*position, 8.0, Stroke::new(1.0_f32, color));
         }
     }
 }
