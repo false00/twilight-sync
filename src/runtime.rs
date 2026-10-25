@@ -467,6 +467,50 @@ pub fn start() -> Result<Backend> {
 }
 
 #[cfg(any(debug_assertions, test))]
+fn ui_smoke_save(hearts: u16, rupees: u16, play_seconds: u64) -> save_data::Summary {
+    save_data::Summary {
+        game: "GZ2E".into(),
+        file_name: "gczelda2".into(),
+        modified_at: Some("2026-10-25T14:15:00Z".into()),
+        slots: vec![save_data::Slot {
+            number: 1,
+            player: "Link".into(),
+            horse: "Epona".into(),
+            play_seconds: Some(play_seconds),
+            saved_at: Some("2026-10-25T14:15:00Z".into()),
+            life_quarters: hearts * 4,
+            hearts,
+            heart_pieces: 2,
+            rupees,
+            stage: "F_SP116".into(),
+            room: 0,
+            wolf: false,
+            items: [0x40, 0x43, 0x44, 0x45, 0x48, 0x60]
+                .into_iter()
+                .map(|id| save_data::Item {
+                    id,
+                    name: save_data::item_name(id),
+                })
+                .collect(),
+            equipment: vec![
+                "Master Sword".into(),
+                "Hylian Shield".into(),
+                "Hero's Clothes".into(),
+            ],
+            arrows: 30,
+            bombs: [24, 10, 0],
+            poes: 9,
+            insects: 2,
+            fused_shadows: 3,
+            mirror_shards: 1,
+            boss_clears: 4,
+            deaths: 7,
+            clears: 0,
+        }],
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
 pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
     ensure!(
         matches!(
@@ -505,7 +549,11 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
             Some(PathBuf::from(r"C:\Users\Player\AppData\Roaming\Dusklight"));
         snapshot.selected_release = Some("v2.0.3".into());
         snapshot.local_hash = Some("a".repeat(64));
-        snapshot.history.stats.commits = 12;
+        let common_save = ui_smoke_save(8, 230, 54_000);
+        let local_save = ui_smoke_save(9, 450, 61_500);
+        let partner_save = ui_smoke_save(10, 180, 65_400);
+        snapshot.local_save = Some(local_save.clone());
+        snapshot.history.stats.commits = 3;
         snapshot.history.stats.blocks = 24;
         snapshot.history.stats.stored_bytes = 104_256;
         snapshot.history.stats.logical_bytes = 12 * files::SAVE_SIZE as u64;
@@ -513,23 +561,37 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
             snapshot.history.entries.push(history::Entry {
                 id: format!("{sequence:064x}"),
                 sequence,
-                parent: Some(format!("{:064x}", sequence - 1)),
+                parent: (sequence > 10).then(|| format!("{:064x}", 10)),
                 merge_parent: None,
                 game: "GZ2E".into(),
                 name: "Adventure".into(),
                 hash: if sequence == 12 {
                     "a".repeat(64)
+                } else if sequence == 11 {
+                    "b".repeat(64)
                 } else {
                     format!("{sequence:064x}")
                 },
                 timestamp: format!("2026-10-20T14:{sequence:02}:00Z"),
                 username: "Player".into(),
                 device: "0".repeat(64),
-                peer: None,
-                reason: history::Reason::Observed,
+                peer: (sequence == 11).then(|| "b".repeat(64)),
+                reason: if sequence == 11 {
+                    history::Reason::PeerBranch
+                } else {
+                    history::Reason::Observed
+                },
                 restored_from: None,
-                summary: None,
-                changes: Vec::new(),
+                summary: Some(match sequence {
+                    12 => local_save.clone(),
+                    11 => partner_save.clone(),
+                    _ => common_save.clone(),
+                }),
+                changes: match sequence {
+                    12 => local_save.changes_from(&common_save),
+                    11 => partner_save.changes_from(&common_save),
+                    _ => Vec::new(),
+                },
             });
         }
         snapshot.textures.packs.push(Pack {
@@ -562,8 +624,16 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
         }
         if scenario == "attention" {
             snapshot.pending_save = true;
-            snapshot.error =
-                Some("Preview: the two save copies differ. Choose which copy to keep.".into());
+            snapshot.remote_hash = Some("b".repeat(64));
+            snapshot.conflict = Some(SaveConflict {
+                local_hash: "a".repeat(64),
+                remote_hash: "b".repeat(64),
+                base_hash: Some(format!("{:064x}", 10)),
+                base: Some(common_save),
+                remote: Some(partner_save),
+            });
+            snapshot.message =
+                "Both PCs made progress since the last sync. Both branches are preserved.".into();
         }
     }
     let view = Arc::new(Mutex::new(snapshot));
@@ -4416,6 +4486,44 @@ mod tests {
     use super::*;
     use crate::files::ISO_SIZE;
     use std::fs;
+
+    #[test]
+    fn ui_smoke_previews_show_save_progress_and_preserved_forks() -> Result<()> {
+        for scenario in ["ready", "attention"] {
+            let backend = ui_smoke_backend(scenario)?;
+            let snapshot = backend.snapshot()?;
+            backend.command(Command::Shutdown)?;
+            assert_eq!(
+                snapshot
+                    .local_save
+                    .as_ref()
+                    .context("Missing preview save")?
+                    .slots[0]
+                    .hearts,
+                9
+            );
+            assert!(
+                snapshot
+                    .history
+                    .entries
+                    .iter()
+                    .all(|entry| entry.summary.is_some())
+            );
+            assert!(
+                snapshot
+                    .history
+                    .entries
+                    .iter()
+                    .any(|entry| entry.reason == history::Reason::PeerBranch)
+            );
+            if scenario == "attention" {
+                let conflict = snapshot.conflict.context("Missing preview conflict")?;
+                assert!(conflict.base.is_some() && conflict.remote.is_some());
+                assert_ne!(conflict.local_hash, conflict.remote_hash);
+            }
+        }
+        Ok(())
+    }
 
     struct Harness {
         left: Engine,

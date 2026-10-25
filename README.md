@@ -1,14 +1,34 @@
+<img src="assets/app-icon-256.png" align="right" width="72" height="72" alt="Twilight Sync moon icon">
+
 # Twilight Sync
 
-**Your adventure, in step. No save cloud required.**
+**Your Twilight Princess adventure, across your desktop and handheld.**
 
 Keep your [Dusklight](https://twilitrealm.dev/) saves in sync between two Windows
-PCs on your private home network. Pair your devices, launch the game safely,
-and pick up where you left off.
+PCs over your home network. Play offline, pick up on the other PC when you
+reconnect, and compare your progress before resolving a save conflict. No cloud
+account, subscription, or administrator access required.
 
 [Download for Windows](https://github.com/false00/twilight-sync/releases/latest) ·
 [Report an issue](https://github.com/false00/twilight-sync/issues) ·
 [Technical guide](docs/guide.md)
+
+**Windows 10/11 x64** | **Encrypted LAN sync** | **Offline play** | **MIT licensed**
+
+![Twilight Sync Home showing a paired Legion Go and a quest's hearts, play time, rupees, and collectibles](docs/images/dashboard.png)
+
+*The native Windows app, shown with example save and device data. Light and dark
+themes are included. No game assets or real save files are bundled.*
+
+## Built for picking up where you left off
+
+- **Desktop to handheld:** pair two PCs once and sync over your home network.
+- **No connection required to play:** keep playing offline, then sync or compare
+   your progress when both PCs are back online.
+- **See what you are choosing:** compare hearts, play time, items, collectibles,
+   and recorded milestones before replacing a save.
+- **Keep a way back:** preserved branches and compact snapshots let you restore
+   an earlier version. Different progress never silently picks a winner.
 
 ## Install with one PowerShell command
 
@@ -24,6 +44,14 @@ account, or administrator access is required for the downloaded app.
 
 Windows PowerShell 5.1 and PowerShell 7 are both supported, including 32-bit
 PowerShell on x64 Windows handhelds such as the Legion Go.
+
+**The app is currently unsigned.** Windows may show an unfamiliar-publisher
+warning, and some managed devices block unsigned apps. Only run the installer
+if you trust this repository; [read it first](install.ps1) or use the manual
+download instructions below.
+
+<details>
+<summary>Installer details, manual download, and Windows security</summary>
 
 The installer:
 
@@ -63,6 +91,8 @@ entirely, including with error **4551**. A valid checksum does not satisfy a
 code-signing policy. Such devices need a build signed by a publisher trusted by
 their policy; do not replace a working installation with an unsigned build that
 your device cannot run. Twilight Sync does not bypass or change these controls.
+
+</details>
 
 ## Set up your first sync
 
@@ -114,30 +144,30 @@ The interface uses installed Windows Segoe UI fonts and system icons, with
 compact navigation for smaller windows and high-DPI handheld displays. Windows
 font files are loaded from the operating system, not bundled or redistributed.
 
-## What you get
+## Compare progress, not just file dates
 
-- **Encrypted LAN sync:** `twilightProto` uses an established Noise handshake,
-  authenticated encryption, router approval, and pinned device identities.
-- **Conflict protection:** different save changes never silently pick a winner.
-   Compare both branches and replace only with consent; originals stay in history.
-- **Offline play:** the other PC does not have to be online. When connected with
-   matching saves, both managers reserve a play lock. An active game is never
-   forcibly stopped or silently unlocked because the connection drops.
-- **Actual save progress:** all occupied quest slots, save dates, play time,
-   heart containers and pieces, rupees, inventory, equipment, collectibles, and
-   factual milestone summaries decoded directly from validated save bytes.
-- **Compact save history:** shared compressed blocks, parent-linked commits,
-   visible forks and reconciliation, restore-as-a-new-commit, and a 64 MiB
-   managed-data budget.
-- **Texture management:** install complete Henriko or TP Definitive Edition+
-  archives, detect the game profile, and activate the selected pack in one step.
-- **Official Dusklight updater:** verified, side-by-side program updates that
-  preserve your user profile and saves.
-- **Tray app updates:** optional automatic GitHub version checks, with a
-  confirmation before downloading or installing Twilight Sync itself.
-- **Optional ISO / RVZ transfer:** separately approved transfers of verified,
-  unmodified GameCube images you own. RVZ files stay compressed; no game
-  downloads are included.
+Played on both PCs since the last sync? See both branches side by side, with
+their actual quest progress. Choose a complete save explicitly, or keep both
+and play the local branch. Replacing your partner's save requires their consent.
+
+![A save conflict showing each PC's quest, hearts, play time, rupees, and an explicit choice to keep both and play locally](docs/images/save-comparison.png)
+
+No default winner, no last-writer-wins, and no splicing quest flags into a hybrid
+save. All three quest slots travel together. Both PCs need v0.9.0 or newer for
+the preview and reconciliation workflow.
+
+## Also included
+
+| Tool | What it does |
+| --- | --- |
+| Encrypted LAN sync | Noise encryption, router approval, and pinned device identities; no save-cloud account. |
+| Texture library | Import authorized Henriko or TP Definitive Edition+ archives and switch installed packs. |
+| Dusklight installer | Verified, side-by-side official game-program updates that preserve your profile and saves. |
+| App updates | Optional version checks; downloading and installing always require confirmation. |
+| ISO / RVZ transfer | Separately approved transfers of verified disc images you own; RVZ stays compressed. |
+
+<details>
+<summary>Texture packs and disc-image transfer</summary>
 
 ### Textures
 
@@ -168,12 +198,16 @@ checked against the same original-disc catalog as ISOs, without writing an
 expanded ISO. Scrubbed or modified images that cannot reproduce an approved
 original disc are rejected.
 
-### Save history
+</details>
+
+## Follow your save history
 
 Open **Save history** to browse and restore earlier valid saves. Unchanged
 blocks are reused rather than copied for every revision. Oldest commits are
 pruned when the managed store reaches 64 MiB; filesystem allocation overhead,
 textures, and game installations are separate.
+
+![Dark-theme save history showing local and partner branches connected to a common save, with play-time, heart, and rupee changes](docs/images/save-history.png)
 
 The timeline connects local and preserved partner branches. Each snapshot shows
 decoded progress and gains/losses since its parent. The comparison prompt shows
@@ -218,6 +252,9 @@ retain their private logs/backups under `.twilight-sync\updates` for review.
 Portable builds update their existing executable path; the PowerShell installer
 continues to manage its normal per-user location.
 
+<details>
+<summary>Manual updates, installation options, and recovery</summary>
+
 For versions that predate tray updates, stop Dusklight, **quit Twilight Sync
 from its tray menu**, then rerun the one-line command.
 
@@ -230,17 +267,19 @@ For a specific release, or to install without opening the app, download and
 review [install.ps1](install.ps1), then run:
 
 ```powershell
-.\install.ps1 -Version v0.3.0 -NoLaunch
+.\install.ps1 -Version v0.9.0 -NoLaunch
 ```
 
 Optional parameters:
 
 | Parameter | Purpose |
 | --- | --- |
-| `-Version v0.3.0` | Install a specific published stable release |
+| `-Version v0.9.0` | Install a specific published stable release |
 | `-InstallDirectory 'D:\Apps\TwilightSync'` | Choose a local per-user installation folder |
 | `-NoLaunch` | Do not open the app after installation |
 | `-NoShortcut` | Do not create or update a Start-menu shortcut |
+
+</details>
 
 ## Important limits
 

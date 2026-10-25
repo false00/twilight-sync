@@ -123,6 +123,23 @@ The supplied v1.2.0 archive selects exactly 5,456 native texture keys and
 restored configuration values only inside an owned temporary profile. Original
 JSON formatting is not a save-setting value and is not assumed to be stable.
 
+## README screenshots
+
+The README images are captures of the native Windows app with synthetic preview
+data, not live profiles, network details, or real save files. To refresh them
+when screenshots are explicitly requested:
+
+```powershell
+cargo build --locked
+.\scripts\Capture-Readme.ps1
+```
+
+The helper starts only the isolated 20-second `--ui-smoke` previews, verifies
+window ownership and title, captures their client areas at physical pixel sizes,
+and rejects blank images. It never captures the desktop or attaches to an
+existing manager. Images are written to `docs/images`; inspect readability and
+framing before committing them. Do not substitute private app captures.
+
 ## Windows release packaging
 
 The checked-in Cargo configuration statically links the MSVC C runtime for the
