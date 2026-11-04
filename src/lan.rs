@@ -109,6 +109,7 @@ pub struct Discovered {
     pub address: SocketAddr,
     pub pairing: bool,
     pub seen: Instant,
+    pub game_channels_seen: Option<Instant>,
 }
 
 pub fn decode_advertisement(
@@ -127,7 +128,8 @@ pub fn decode_advertisement(
     );
     let ad: Advertisement = serde_json::from_slice(bytes)?;
     ensure!(
-        ad.magic == "twilightProto/1" && ad.network == network.fingerprint,
+        matches!(ad.magic.as_str(), "twilightProto/1" | "twilightProto/2")
+            && ad.network == network.fingerprint,
         "Discovery network mismatch"
     );
     ensure!(
@@ -140,6 +142,7 @@ pub fn decode_advertisement(
         address: SocketAddr::from((*source.ip(), PORT)),
         pairing: ad.pairing,
         seen: Instant::now(),
+        game_channels_seen: (ad.magic == "twilightProto/2").then(Instant::now),
     })
 }
 

@@ -8,8 +8,9 @@ use crate::{
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
     protocol::{self, Event, Handshake, SecureWriter},
-    save_data, save_location, self_update,
+    save_data, save_location, self_update, sync_policy,
     textures::{self, Activation, Pack},
+    totk,
 };
 use anyhow::{Context, Result, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -66,6 +67,7 @@ pub struct Snapshot {
     pub textures: textures::State,
     pub history: history::Page,
     pub self_updates: self_update::State,
+    pub totk: totk::Status,
     pub message: String,
     pub error: Option<String>,
     pub shutdown: bool,
@@ -94,6 +96,28 @@ pub enum Command {
     SetStartup(bool),
     SendSave,
     AcceptSave(bool),
+    RefreshTotk,
+    SendTotk,
+    AcceptTotk(bool),
+    SetTotkExecutable(PathBuf),
+    LaunchTotk {
+        local_only: bool,
+    },
+    ContinueTotk {
+        expected: Option<String>,
+    },
+    ResolveTotk {
+        local_hash: String,
+        remote_hash: String,
+        use_remote: bool,
+    },
+    TotkHistoryPage(Option<String>),
+    RestoreTotk {
+        id: String,
+        expected: Option<String>,
+    },
+    RecoverTotk,
+    AcceptTotkRecovery(bool),
     Launch,
     ContinueLocal {
         expected: Option<String>,
@@ -228,6 +252,7 @@ struct Link {
     ready: bool,
     deadline: Instant,
     last_seen: Instant,
+    game_channels: bool,
 }
 
 #[derive(Clone)]
@@ -369,6 +394,7 @@ struct Engine {
     last_self_update_check: Option<Instant>,
     first_self_update_check: Instant,
     last_self_update_cleanup: Instant,
+    totk: totk::Channel,
     transfer: String,
     message: String,
     error: Option<String>,
@@ -457,6 +483,16 @@ pub fn start() -> Result<Backend> {
                 engine.report(error);
             }
             if let Err(error) = engine.initialize_self_updates() {
+                engine.report(error);
+            }
+            if let Err(error) = engine.totk.refresh() {
+                engine.report(error);
+            }
+            if let Some(install) = engine.totk.status.install_path.clone()
+                && engine.totk.status.installed
+                && let Err(error) =
+                    crate::desktop::install_totk_shortcut(&engine.root, &install.join("totk.exe"))
+            {
                 engine.report(error);
             }
             engine.message = "Local stores checked. Checking your private LAN...".into();
@@ -717,6 +753,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         textures: textures::State::default(),
         history: history::Page::default(),
         self_updates: self_update::State::default(),
+        totk: totk::Status::default(),
         message: "Loading compact history and checking your private LAN...".into(),
         error: None,
         shutdown: false,
@@ -735,6 +772,8 @@ impl Engine {
     ) -> Self {
         let now = Instant::now();
         let past = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
+        let mut totk = totk::Channel::new(root.join("totk-transfers"), totk::default_install());
+        totk.identify(&identity.public, audit.username());
         Self {
             root,
             settings,
@@ -802,6 +841,7 @@ impl Engine {
             last_self_update_check: None,
             first_self_update_check: now + Duration::from_secs(15),
             last_self_update_cleanup: Instant::now(),
+            totk,
             transfer: String::new(),
             message: "Loading compact history and checking your private LAN...".into(),
             error: None,
@@ -1063,16 +1103,8 @@ impl Engine {
                         return Err(error);
                     }
                 };
-                self.game_running = self.process.game_running();
                 let safe = (|| -> Result<()> {
-                    self.require_idle()?;
-                    ensure!(
-                        self.no_transfer()
-                            && !self.iso_preparing
-                            && self.child.is_none()
-                            && self.launch_pending.is_none(),
-                        "Finish all gameplay and transfers before updating"
-                    );
+                    self.require_self_update_idle()?;
                     self.audit.record("app-update-handoff", None, None, None, "Verified helper acknowledged readiness; clean shutdown requested. Persistent state is unchanged")?;
                     Ok(())
                 })();
@@ -1334,6 +1366,21 @@ impl Engine {
         self.link.as_ref().is_some_and(|l| l.ready)
     }
 
+    fn game_channels_ready(&self) -> bool {
+        self.ready() && self.link.as_ref().is_some_and(|link| link.game_channels)
+    }
+
+    fn require_self_update_idle(&mut self) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
+        self.totk.require_update_idle()?;
+        ensure!(
+            self.no_transfer() && self.child.is_none() && self.launch_pending.is_none(),
+            "Finish gameplay and transfers before updating"
+        );
+        Ok(())
+    }
+
     fn peer_key(&self) -> Result<String> {
         Ok(self
             .link
@@ -1477,6 +1524,96 @@ impl Engine {
         match command {
             Command::DesktopError(detail) => bail!("{detail}"),
             Command::DesktopRecovered(detail) => clear_desktop_error(&mut self.error, &detail),
+            Command::RefreshTotk => {
+                self.totk.refresh()?;
+                if self.game_channels_ready() {
+                    self.send_totk_frames(vec![Event::TotkRequest])?;
+                } else if self.ready() {
+                    self.totk.status.message = "Update both managers for TotK sync; the legacy Dusklight channel remains available.".into();
+                }
+            }
+            Command::SendTotk => {
+                ensure!(
+                    self.game_channels_ready(),
+                    "Connect an updated paired manager before sending TotK saves"
+                );
+                let frames = self.totk.offer()?;
+                self.send_totk_frames(frames)?;
+            }
+            Command::AcceptTotk(approved) => {
+                ensure!(self.ready(), "The paired device is no longer connected");
+                self.audit.record(
+                    "totk-save-consent",
+                    None,
+                    None,
+                    Some(&self.peer_key()?),
+                    if approved {
+                        "Receiver approved a complete TotK save replacement with a rollback copy"
+                    } else {
+                        "Receiver kept local TotK progress"
+                    },
+                )?;
+                let frames = self.totk.accept(approved)?;
+                self.send_totk_frames(frames)?;
+            }
+            Command::SetTotkExecutable(path) => {
+                self.totk.set_executable(&path)?;
+                crate::desktop::install_totk_shortcut(&self.root, &path)?;
+            }
+            Command::LaunchTotk { local_only } => {
+                ensure!(
+                    !self.self_updates.preparing,
+                    "Wait for the current app update"
+                );
+                let frames = self.totk.launch(self.game_channels_ready(), local_only)?;
+                self.send_totk_frames(frames)?;
+            }
+            Command::ContinueTotk { expected } => {
+                ensure!(
+                    !self.self_updates.preparing,
+                    "Wait for the current app update"
+                );
+                let frames = self
+                    .totk
+                    .continue_local(self.game_channels_ready(), expected.as_deref())?;
+                self.send_totk_frames(frames)?;
+            }
+            Command::ResolveTotk {
+                local_hash,
+                remote_hash,
+                use_remote,
+            } => {
+                ensure!(
+                    self.game_channels_ready(),
+                    "Reconnect the updated paired manager before resolving TotK branches"
+                );
+                let frames = self.totk.resolve(&local_hash, &remote_hash, use_remote)?;
+                self.send_totk_frames(frames)?;
+            }
+            Command::TotkHistoryPage(before) => self.totk.history_page(before.as_deref())?,
+            Command::RestoreTotk { id, expected } => {
+                ensure!(
+                    !self.self_updates.preparing,
+                    "Wait for the current app update"
+                );
+                self.totk.restore(&id, expected.as_deref())?;
+            }
+            Command::RecoverTotk => {
+                if self.game_channels_ready() {
+                    let frames = self.totk.recover()?;
+                    self.send_totk_frames(frames)?;
+                } else {
+                    self.totk.recover_offline()?;
+                }
+            }
+            Command::AcceptTotkRecovery(approved) => {
+                ensure!(
+                    self.game_channels_ready(),
+                    "Reconnect both managers for TotK session recovery"
+                );
+                let frames = self.totk.approve_recovery(approved)?;
+                self.send_totk_frames(frames)?;
+            }
             Command::TrustNetwork => {
                 self.require_idle()?;
                 let network = self
@@ -1804,18 +1941,10 @@ impl Engine {
                 }
             }
             Command::UpdateSelf => {
-                self.game_running = self.process.game_running();
-                self.require_idle()?;
+                self.require_self_update_idle()?;
                 ensure!(
                     !self.self_updates.checking,
                     "Wait for the current update check"
-                );
-                ensure!(
-                    self.no_transfer()
-                        && !self.iso_preparing
-                        && self.child.is_none()
-                        && self.launch_pending.is_none(),
-                    "Finish gameplay and transfers before updating"
                 );
                 ensure!(
                     self.self_updates.available(),
@@ -2035,6 +2164,7 @@ impl Engine {
             }
             Command::Unpair => {
                 self.require_idle()?;
+                self.totk.require_update_idle()?;
                 ensure!(
                     self.no_transfer(),
                     "Finish pending transfers before unpairing"
@@ -2053,6 +2183,12 @@ impl Engine {
                 })?;
             }
             Command::Shutdown => {
+                ensure!(
+                    !self.totk.game_running()
+                        && !self.totk.status.busy
+                        && !self.totk.status.launch_pending,
+                    "Stop TotK and finish its transfers before quitting; the window can remain in the tray"
+                );
                 ensure!(
                     !self.game_running && self.child.is_none(),
                     "Stop Dusklight before quitting; close the window to the tray instead"
@@ -2131,6 +2267,7 @@ impl Engine {
             }
         }
         self.remote = None;
+        self.totk.reset();
         self.remote_preview = None;
         self.preview_requested = None;
         self.pending_save = None;
@@ -2247,6 +2384,11 @@ impl Engine {
             false
         };
         self.cancel_transfer = Arc::new(AtomicBool::new(false));
+        let game_channels = self
+            .devices
+            .get(&session.remote_key)
+            .and_then(|device| device.game_channels_seen)
+            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(8));
         self.link = Some(Link {
             id,
             key: session.remote_key,
@@ -2259,6 +2401,7 @@ impl Engine {
             ready: false,
             deadline: Instant::now() + Duration::from_secs(120),
             last_seen: Instant::now(),
+            game_channels,
         });
         self.remote = None;
         self.send(&Event::Hello {
@@ -2304,10 +2447,17 @@ impl Engine {
     fn send(&mut self, event: &Event) -> Result<()> {
         let result = {
             let link = self.link.as_ref().context("No secure channel")?;
+            let scoped = if link.game_channels
+                && protocol::allowed_in_game(protocol::GameId::Dusklight, event)
+            {
+                Some(protocol::game_packet(protocol::GameId::Dusklight, event)?)
+            } else {
+                None
+            };
             link.writer
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Channel writer lock poisoned"))?
-                .send(event)
+                .send(scoped.as_ref().unwrap_or(event))
         };
         if let Err(error) = result {
             self.disconnect("Secure channel write failed");
@@ -2436,6 +2586,50 @@ impl Engine {
     fn authenticated_event(&mut self, event: Event) -> Result<()> {
         let peer = self.peer_key()?;
         match event {
+            Event::GamePacket { game, bytes } => {
+                ensure!(
+                    self.link.as_ref().is_some_and(|link| link.game_channels),
+                    "Game channels were not negotiated with this peer"
+                );
+                let event = protocol::game_event(&bytes)?;
+                ensure!(
+                    protocol::allowed_in_game(game, &event),
+                    "Save event belongs to another game channel"
+                );
+                match game {
+                    protocol::GameId::Dusklight => self.authenticated_event(event)?,
+                    protocol::GameId::Totk => {
+                        self.totk
+                            .identify(&self.identity.public, self.audit.username());
+                        self.totk.bind_peer(&peer)?;
+                        let frames = self.totk.handle(event)?;
+                        self.send_totk_frames(frames)?;
+                    }
+                }
+            }
+            event @ (Event::TotkRequest
+            | Event::TotkState { .. }
+            | Event::TotkOffer { .. }
+            | Event::TotkAccept { .. }
+            | Event::TotkChunk { .. }
+            | Event::TotkDone { .. }
+            | Event::TotkSaved { .. }
+            | Event::TotkDeclined { .. }) => {
+                if let Event::TotkDone { hash } = &event {
+                    self.audit.record(
+                        "totk-save-commit-request",
+                        None,
+                        Some(hash),
+                        Some(&peer),
+                        "Verifying the approved complete save before transactional replacement",
+                    )?;
+                }
+                self.totk
+                    .identify(&self.identity.public, self.audit.username());
+                self.totk.bind_peer(&peer)?;
+                let frames = self.totk.handle(event)?;
+                self.send_totk_frames(frames)?;
+            }
             Event::State {
                 hash,
                 save_ready,
@@ -2526,9 +2720,12 @@ impl Engine {
                     current == expected,
                     "Local save changed since the offer was prepared"
                 );
-                let automatic = current.is_none()
-                    || current.as_ref() == Some(&hash)
-                    || (current == base && self.settings.sync_base == base);
+                let automatic = sync_policy::fast_forward(
+                    current.as_deref(),
+                    &hash,
+                    self.settings.sync_base.as_deref(),
+                    base.as_deref(),
+                );
                 let pending = PendingSave {
                     hash,
                     expected,
@@ -3463,6 +3660,59 @@ impl Engine {
         Ok(())
     }
 
+    fn send_totk_frames(&mut self, frames: Vec<Event>) -> Result<()> {
+        let scoped = self.link.as_ref().is_some_and(|link| link.game_channels);
+        let frames: Vec<_> = frames
+            .into_iter()
+            .map(|event| {
+                if scoped {
+                    protocol::game_packet(protocol::GameId::Totk, &event)
+                } else {
+                    Ok(event)
+                }
+            })
+            .collect::<Result<_>>()?;
+        if frames.len() <= 1 {
+            for frame in frames {
+                self.send(&frame)?;
+            }
+            return Ok(());
+        }
+        let link = self
+            .link
+            .as_ref()
+            .context("No paired TotK transfer channel")?;
+        let writer = link.writer.clone();
+        let id = link.id;
+        let sender = self.sender.clone();
+        thread::Builder::new()
+            .name("totk-save-send".into())
+            .spawn(move || {
+                let result = (|| -> Result<()> {
+                    for frame in frames {
+                        writer
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("TotK channel lock poisoned"))?
+                            .send(&frame)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result
+                    && sender
+                        .send(Input::Disconnected {
+                            id,
+                            reason: format!("TotK transfer failed: {error:#}"),
+                        })
+                        .is_err()
+                {
+                    eprintln!(
+                        "Twilight Sync stopped before the TotK sender could report its failure"
+                    );
+                }
+            })?;
+        Ok(())
+    }
+
     fn send_state(&mut self) -> Result<()> {
         if self.ready() {
             self.send(&Event::State {
@@ -3938,6 +4188,17 @@ impl Engine {
             self.refresh_save()?;
             self.snapshot_tick()?;
             self.sync_tick()?;
+            let supported = self.game_channels_ready();
+            if supported {
+                self.totk.bind_peer(&self.peer_key()?)?;
+            }
+            match self.totk.tick(supported) {
+                Ok(frames) if !frames.is_empty() => self.send_totk_frames(frames)?,
+                Ok(_) => {}
+                Err(error) => {
+                    self.totk.status.message = format!("TotK sync needs attention: {error:#}")
+                }
+            }
         }
         Ok(())
     }
@@ -3948,15 +4209,17 @@ impl Engine {
             .retain(|_, d| d.seen.elapsed() < Duration::from_secs(8));
         if self.last_discovery.elapsed() >= Duration::from_secs(2) {
             self.last_discovery = Instant::now();
-            let bytes = serde_json::to_vec(&Advertisement {
-                magic: "twilightProto/1".into(),
-                network: network.fingerprint.clone(),
-                key: self.identity.public.clone(),
-                name: self.settings.name.clone(),
-                pairing: self.pairing_open(),
-            })?;
-            if let Some(socket) = &self.discovery {
-                socket.send_to(&bytes, (network.broadcast(), protocol::DISCOVERY_PORT))?;
+            for magic in ["twilightProto/1", "twilightProto/2"] {
+                let bytes = serde_json::to_vec(&Advertisement {
+                    magic: magic.into(),
+                    network: network.fingerprint.clone(),
+                    key: self.identity.public.clone(),
+                    name: self.settings.name.clone(),
+                    pairing: self.pairing_open(),
+                })?;
+                if let Some(socket) = &self.discovery {
+                    socket.send_to(&bytes, (network.broadcast(), protocol::DISCOVERY_PORT))?;
+                }
             }
         }
         if let Some(socket) = &self.discovery {
@@ -3969,8 +4232,21 @@ impl Engine {
                         &network,
                         &self.identity.public,
                     ) {
-                        Ok(device) => {
+                        Ok(mut device) => {
+                            if device.game_channels_seen.is_none() {
+                                device.game_channels_seen = self
+                                    .devices
+                                    .get(&device.key)
+                                    .and_then(|previous| previous.game_channels_seen)
+                                    .filter(|seen| seen.elapsed() < Duration::from_secs(8));
+                            }
                             if self.devices.contains_key(&device.key) || self.devices.len() < 32 {
+                                if let Some(link) = &mut self.link
+                                    && link.key == device.key
+                                    && device.game_channels_seen.is_some()
+                                {
+                                    link.game_channels = true;
+                                }
                                 self.devices.insert(device.key.clone(), device);
                             }
                         }
@@ -4163,7 +4439,11 @@ impl Engine {
         });
         if self.no_transfer()
             && allowed_lock
-            && (remote.hash.is_none() || remote.hash == self.settings.sync_base)
+            && sync_policy::reconcile(
+                self.local_hash.as_deref(),
+                remote.hash.as_deref(),
+                self.settings.sync_base.as_deref(),
+            ) == sync_policy::Decision::Send
         {
             self.offer_save(false)?;
         }
@@ -4429,6 +4709,7 @@ impl Engine {
     }
 
     fn publish(&mut self) {
+        self.totk.expire();
         let link = self.link.as_ref();
         let snapshot = Snapshot {
             settings: self.settings.clone(),
@@ -4464,6 +4745,7 @@ impl Engine {
             textures: self.texture_state.clone(),
             history: self.history_page.clone(),
             self_updates: self.self_updates.clone(),
+            totk: self.totk.status.clone(),
             message: self.message.clone(),
             error: self.error.clone(),
             shutdown: self.shutdown,
@@ -4901,6 +5183,13 @@ mod tests {
                 let view = Arc::new(Mutex::new(initial_snapshot(&settings, &identity.public)));
                 let mut engine =
                     Engine::new(root, settings, profile, identity, audit, sender, view);
+                engine.totk = totk::Channel::new(
+                    engine.root.join("totk-transfers"),
+                    Ok(engine.root.join("TotKRecomp")),
+                );
+                engine
+                    .totk
+                    .identify(&engine.identity.public, engine.audit.username());
                 engine.network = Some(network);
                 engine.last_verified = Instant::now();
                 engine.process = ProcessMonitor::for_test(false);
@@ -4973,6 +5262,16 @@ mod tests {
                 right_session,
                 Some(self.left.identity.public.clone()),
             )?;
+            self.left
+                .link
+                .as_mut()
+                .context("Missing test link")?
+                .game_channels = true;
+            self.right
+                .link
+                .as_mut()
+                .context("Missing test link")?
+                .game_channels = true;
             Ok(())
         }
 
@@ -5027,6 +5326,62 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_totk_transfer_requires_consent_and_leaves_dusklight_unchanged() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        harness.pair()?;
+        let left_install = harness.left.root.join("TotKRecomp");
+        let right_install = harness.right.root.join("TotKRecomp");
+        for install in [&left_install, &right_install] {
+            fs::create_dir_all(install.join("profile"))?;
+            fs::write(install.join("totk.exe"), b"fixture, never executed")?;
+            fs::write(install.join("profile/account.uid"), 1_u128.to_le_bytes())?;
+        }
+        fs::write(
+            right_install.join("profile/account.uid"),
+            2_u128.to_le_bytes(),
+        )?;
+        let slot = left_install.join("profile/save/00000000000000000000000000000001/slot_00");
+        fs::create_dir_all(&slot)?;
+        fs::write(slot.join("progress.sav"), vec![7; CHUNK_SIZE * 4])?;
+        harness.left.totk = totk::Channel::new(
+            harness.left.root.join("totk-transfers"),
+            Ok(left_install.clone()),
+        );
+        harness.right.totk = totk::Channel::new(
+            harness.right.root.join("totk-transfers"),
+            Ok(right_install.clone()),
+        );
+        let left_dusklight = harness.left.current_hash()?;
+        let right_dusklight = harness.right.current_hash()?;
+        let left_settings = fs::read(harness.left.root.join("settings.json"))?;
+        let right_settings = fs::read(harness.right.root.join("settings.json"))?;
+        harness.left.command(Command::RefreshTotk)?;
+        harness.pump_until(|harness| harness.left.totk.status.peer_checked)?;
+        harness.left.command(Command::SendTotk)?;
+        harness.pump_until(|harness| harness.right.totk.status.pending)?;
+        assert!(totk::snapshot(&right_install.join("profile"))?.is_none());
+        harness.right.command(Command::AcceptTotk(true))?;
+        harness.pump_until(|harness| {
+            !harness.left.totk.status.busy && !harness.right.totk.status.busy
+        })?;
+        assert_eq!(
+            totk::snapshot(&left_install.join("profile"))?.map(|save| save.hash),
+            totk::snapshot(&right_install.join("profile"))?.map(|save| save.hash)
+        );
+        assert_eq!(harness.left.current_hash()?, left_dusklight);
+        assert_eq!(harness.right.current_hash()?, right_dusklight);
+        assert_eq!(
+            fs::read(harness.left.root.join("settings.json"))?,
+            left_settings
+        );
+        assert_eq!(
+            fs::read(harness.right.root.join("settings.json"))?,
+            right_settings
+        );
+        Ok(())
+    }
+
+    #[test]
     fn app_update_opt_out_and_network_failures_do_not_change_save_settings() -> Result<()> {
         let mut h = Harness::new(Some(variant(1)), None)?;
         let original = fs::read(h.left.root.join("settings.json"))?;
@@ -5062,6 +5417,15 @@ mod tests {
         h.left.process = ProcessMonitor::for_test(false);
         assert!(h.left.command(Command::UpdateSelf).is_err());
         assert!(!h.left.self_updates.preparing);
+        h.left.totk.status.busy = true;
+        let error = h
+            .left
+            .require_self_update_idle()
+            .err()
+            .context("Updater accepted an active TotK transfer")?;
+        assert!(format!("{error:#}").contains("TotK"));
+        h.left.totk.status.busy = false;
+        assert!(h.left.require_self_update_idle().is_ok());
         assert!(
             !h.left.root.join("updates").try_exists()?,
             "No available release means no download or staging"

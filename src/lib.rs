@@ -13,6 +13,8 @@ pub mod runtime;
 pub mod save_data;
 pub mod save_location;
 pub mod self_update;
+pub mod sync_policy;
 pub mod textures;
+pub mod totk;
 #[cfg(windows)]
 pub mod ui;

@@ -2,12 +2,12 @@
 
 # Twilight Sync
 
-**Your Twilight Princess adventure, across your desktop and handheld.**
+**Your Zelda saves, across your desktop and handheld.**
 
-Keep your [Dusklight](https://twilitrealm.dev/) saves in sync between two Windows
-PCs over your home network. Play offline, pick up on the other PC when you
-reconnect, and compare your progress before resolving a save conflict. No cloud
-account, subscription, or administrator access required.
+Keep your [Dusklight](https://twilitrealm.dev/) and native TotK Recomp saves in
+sync between two Windows PCs over your home network. Play offline and transfer
+your progress when you reconnect. No cloud account, subscription, or
+administrator access required.
 
 [Download for Windows](https://github.com/false00/twilight-sync/releases/latest) ·
 [Report an issue](https://github.com/false00/twilight-sync/issues) ·
@@ -129,6 +129,75 @@ discovery. The app does not open router ports or create public firewall rules.
 Closing the window keeps the app in the system tray. Double-click its moon icon
 to reopen it. Use the tray's **Quit** action after stopping the game.
 
+### Native Tears of the Kingdom saves
+
+Update both PCs to **v0.10.0 or newer**. Choose **Dusklight** or
+**Tears of the Kingdom** on Home, Games, or Save history. Play, Sync, comparison,
+history and tray commands follow that selection; network approval and pairing
+remain shared. The game selection is remembered locally. Older managers keep
+their existing Dusklight protocol; TotK channels are enabled only for peers
+that advertise support.
+
+TotK is discovered at `%USERPROFILE%\Games\TotKRecomp` by default, or select
+its native `totk.exe` under **Games**. Twilight Sync does not download the game,
+game assets or console keys. A separate **Tears of the Kingdom (Twilight Sync)**
+desktop shortcut opens its protected Play controls in the existing manager.
+Unrelated and modified desktop shortcuts are never overwritten.
+
+The two games use the same authenticated Noise connection, bounded game-scoped
+protocol envelopes, common-base reconciliation rules, content-addressed history
+implementation and exclusive-play helpers. Their saves, bases, history,
+reservations and recovery state are separate. A TotK event cannot enter the
+Dusklight channel or release its lock.
+
+| Workflow | Dusklight | Native TotK Recomp |
+| --- | --- | --- |
+| Stable-save observation and safe one-sided automatic sync | Yes | Yes |
+| Different progress requires an explicit complete-branch choice | Yes | Yes |
+| Keep both branches and continue this PC, including offline | Yes | Yes |
+| Compact snapshots, retained partner branches and restore | Yes | Yes |
+| Online play grant, durable reservation, release and recovery | Yes | Yes |
+| Managed desktop shortcut and game-aware tray controls | Yes | Yes |
+| Decoded hearts, quests, play time and inventory | Verified game-specific decoder | Not decoded; verified slot/file revisions and album counts |
+| Game-program installation and texture management | Dusklight tools | Existing native installation only |
+
+Matching saves establish a common base. After playing on one PC, close the game
+and let the connected managers sync the safe one-sided change. If both PCs
+changed since that base, neither branch wins automatically: compare the
+retained snapshots, choose **Keep this PC's save**, **Use partner's save**, or
+**Keep both; play this PC**. Replacing divergent partner progress still needs
+their approval. TotK's slot comparisons are verified against the complete
+snapshot; they do not guess quest state from file timestamps or sizes.
+
+Online **Play Tears of the Kingdom** waits for matching saves and the other
+manager's play grant. Both reservations are persisted before the game launches.
+Completed sessions release them through the same game-scoped lease protocol.
+Interrupted sessions require explicit recovery; offline recovery can release
+only this PC's own reservation and retains the partner's reservation until
+reconnection. Offline play cannot guarantee exclusivity across disconnected PCs.
+
+TotK transfers include the complete active-account committed save: every slot,
+options and album file. Each PC retains its own `profile\account.uid`; incoming
+paths are mapped to that local identity. Inactive accounts, graphics INI files,
+mods, GPU caches and transaction working directories are not transferred.
+Running games, changed progress, expired offers, unsafe paths, unfinished game
+commits or failed checksums prevent replacement. Recover an unfinished native
+commit by launching and closing TotK normally before syncing.
+
+TotK uses the same deduplicated history engine with a separate **256 MiB**
+managed budget; Dusklight retains its **64 MiB** budget. History restore creates
+a new commit and retains the previous branch. Transaction rollback copies also
+remain under `profile\save-sync-backups`; these are outside managed history and
+are not automatically pruned. A full branch choice is never a hybrid merge of
+quest flags or inventory. Existing README images show the Dusklight workflow.
+
+Read-only inspection is also available with `twilight-sync --check-totk-save`.
+For controlled setup, `--export-totk-save ABSOLUTE_PATH` creates a new bundle
+without changing progress, and `--import-totk-save ABSOLUTE_PATH --expected HASH`
+requires the receiving save's current canonical hash. `--expected missing` is
+only for an empty receiving account. These commands do not bypass the game,
+path, checksum or stale-progress guards.
+
 **Startup is enabled by default on the first normal launch.** Turn it off in
 **Settings** or the tray menu if you prefer. The installer does not
 override a startup preference you already changed.
@@ -153,8 +222,9 @@ and play the local branch. Replacing your partner's save requires their consent.
 ![A save conflict showing each PC's quest, hearts, play time, rupees, and an explicit choice to keep both and play locally](docs/images/save-comparison.png)
 
 No default winner, no last-writer-wins, and no splicing quest flags into a hybrid
-save. All three quest slots travel together. Both PCs need v0.9.0 or newer for
-the preview and reconciliation workflow.
+save. All three Dusklight quest slots travel together. Both PCs need v0.9.0 or
+newer for Dusklight's decoded preview and reconciliation workflow; TotK's
+game-scoped workflow requires v0.10.0 on both PCs.
 
 ## Also included
 

@@ -35,31 +35,46 @@ impl ProcessMonitor {
     }
 
     pub fn game_running(&mut self) -> bool {
+        self.named_game_running("dusklight.exe")
+    }
+
+    pub fn named_game_running(&mut self, executable: &str) -> bool {
         #[cfg(test)]
         if let Some(running) = self.fake_running {
             return running;
         }
         self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.system.processes().values().any(|p| {
-            p.name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("dusklight.exe")
-        })
+        self.system
+            .processes()
+            .values()
+            .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(executable))
     }
 }
 
 pub fn launch(path: &Path) -> Result<Child> {
+    launch_game(path, crate::protocol::GameId::Dusklight)
+}
+
+pub fn launch_game(path: &Path, game: crate::protocol::GameId) -> Result<Child> {
+    let executable = match game {
+        crate::protocol::GameId::Dusklight => "dusklight.exe",
+        crate::protocol::GameId::Totk => "totk.exe",
+    };
+    let context = match game {
+        crate::protocol::GameId::Dusklight => "Launching Dusklight",
+        crate::protocol::GameId::Totk => "Launching Tears of the Kingdom",
+    };
     ensure_safe_path(path)?;
     ensure!(
         path.file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("dusklight.exe")),
-        "Select the official dusklight.exe"
+            .is_some_and(|name| name.eq_ignore_ascii_case(executable)),
+        "Select the matching game executable"
     );
-    ensure!(path.is_file(), "Dusklight executable was not found");
+    ensure!(path.is_file(), "Game executable was not found");
     Command::new(path)
         .current_dir(path.parent().context("Executable has no directory")?)
         .spawn()
-        .context("Launching Dusklight")
+        .context(context)
 }
 
 pub fn acquire(

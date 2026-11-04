@@ -20,6 +20,7 @@ fn main() {
             a == "--background"
                 || a == "--apply-update"
                 || a == twilight_sync::desktop::OPEN_ARGUMENT
+                || a == twilight_sync::desktop::OPEN_TOTK_ARGUMENT
         }) {
             rfd::MessageDialog::new()
                 .set_title("Twilight Sync - action needed")
@@ -58,7 +59,23 @@ fn run() -> Result<()> {
         println!(
             "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save-location\n                                Show the automatically detected Dusklight save\n  twilight-sync --check-save PATH\n                                Validate a GCI or raw-card save without changes\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
+        println!(
+            "\nTotK saves:\n  twilight-sync --open-totk       Open protected TotK Play controls\n  twilight-sync --check-totk-save\n  twilight-sync --export-totk-save ABSOLUTE_PATH\n  twilight-sync --import-totk-save ABSOLUTE_PATH --expected HASH|missing\n\nChoose a game on Home, Games, or Save history. Both updated PCs share the encrypted protocol, safe automatic sync, branch choices, compact history and game-scoped play protection."
+        );
         return Ok(());
+    }
+    #[cfg(windows)]
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == twilight_sync::desktop::OPEN_TOTK_ARGUMENT)
+    {
+        if arguments.next().is_some() {
+            bail!("Unexpected desktop shortcut arguments");
+        }
+        if twilight_sync::ui::open_totk_controls()? {
+            return Ok(());
+        }
+        return twilight_sync::ui::run_totk(twilight_sync::runtime::start()?);
     }
     #[cfg(windows)]
     if first
@@ -78,6 +95,96 @@ fn run() -> Result<()> {
             bail!("Unexpected extra arguments");
         }
         println!("{PROJECT_LICENSE}\n\n{DEPENDENCY_NOTICES}");
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--check-totk-save")
+    {
+        if arguments.next().is_some() {
+            bail!("TotK save discovery does not accept a custom profile");
+        }
+        twilight_sync::totk::ensure_stopped()?;
+        let profile = twilight_sync::totk::default_install()?.join("profile");
+        let save = twilight_sync::totk::snapshot(&profile)?;
+        println!(
+            "{}",
+            serde_json::json!({"game": "totk", "profile": profile, "hash": save.as_ref().map(|save| &save.hash), "files": save.as_ref().map_or(0, |save| save.files), "bytes": save.as_ref().map_or(0, |save| save.bytes.len()), "changed": false})
+        );
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--export-totk-save")
+    {
+        use std::io::Write;
+        let destination = PathBuf::from(
+            arguments
+                .next()
+                .context("Missing TotK export destination")?,
+        );
+        if arguments.next().is_some() {
+            bail!("Unexpected TotK export arguments");
+        }
+        twilight_sync::files::ensure_safe_path(&destination)?;
+        twilight_sync::totk::ensure_stopped()?;
+        let profile = twilight_sync::totk::default_install()?.join("profile");
+        let save = twilight_sync::totk::snapshot(&profile)?.context("No committed TotK save")?;
+        let mut file = std::fs::File::create_new(&destination)?;
+        file.write_all(&save.bytes)?;
+        file.sync_all()?;
+        twilight_sync::totk::ensure_stopped()?;
+        anyhow::ensure!(
+            twilight_sync::totk::snapshot(&profile)?
+                .is_some_and(|current| current.hash == save.hash),
+            "TotK progress changed during export; do not import this bundle"
+        );
+        println!(
+            "{}",
+            serde_json::json!({"game": "totk", "hash": save.hash, "files": save.files, "bytes": save.bytes.len(), "export": destination, "save_changed": false})
+        );
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--import-totk-save")
+    {
+        use std::io::Read;
+        let source = PathBuf::from(arguments.next().context("Missing TotK import bundle")?);
+        anyhow::ensure!(
+            arguments
+                .next()
+                .as_deref()
+                .is_some_and(|argument| argument == "--expected"),
+            "TotK import requires --expected HASH or --expected missing"
+        );
+        let expected = arguments
+            .next()
+            .context("Missing expected TotK save hash")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Expected hash must be UTF-8"))?;
+        anyhow::ensure!(
+            expected == "missing" || twilight_sync::files::valid_hash(&expected),
+            "Invalid expected TotK hash"
+        );
+        if arguments.next().is_some() {
+            bail!("Unexpected TotK import arguments");
+        }
+        twilight_sync::files::ensure_safe_path(&source)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&source)?
+            .take(twilight_sync::totk::MAX_BUNDLE_SIZE as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        let profile = twilight_sync::totk::default_install()?.join("profile");
+        let backup = twilight_sync::totk::apply(
+            &profile,
+            &bytes,
+            (expected != "missing").then_some(expected.as_str()),
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({"game": "totk", "hash": twilight_sync::files::sha256(&bytes), "backup": backup, "status": "imported_and_verified"})
+        );
         return Ok(());
     }
     #[cfg(all(windows, debug_assertions))]

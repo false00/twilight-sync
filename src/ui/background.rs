@@ -33,7 +33,8 @@ struct Pump {
     attention: Cell<bool>,
     error: RefCell<Option<String>>,
     open_message: u32,
-    open_game_controls: Cell<bool>,
+    game_message: u32,
+    open_game_controls: Cell<Option<crate::protocol::GameId>>,
 }
 
 pub(super) struct BackgroundGuard {
@@ -52,10 +53,11 @@ pub(super) fn reveal(window: NonZeroIsize, context: &egui::Context) {
 }
 
 fn open_message() -> std::io::Result<u32> {
-    let name: Vec<u16> = "TwilightSync.OpenDusklightControls.v1"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    register_message("TwilightSync.OpenDusklightControls.v1")
+}
+
+fn register_message(name: &str) -> std::io::Result<u32> {
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
     if message == 0 {
         return Err(std::io::Error::last_os_error());
@@ -64,6 +66,10 @@ fn open_message() -> std::io::Result<u32> {
 }
 
 pub(super) fn open_game_controls(title: &str) -> Result<bool> {
+    open_selected_game(title, crate::protocol::GameId::Dusklight)
+}
+
+pub(super) fn open_selected_game(title: &str, game: crate::protocol::GameId) -> Result<bool> {
     let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
     let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
     if window.is_null() {
@@ -74,8 +80,16 @@ pub(super) fn open_game_controls(title: &str) -> Result<bool> {
         unsafe {
             SendMessageTimeoutW(
                 window,
-                open_message()?,
-                0,
+                if game == crate::protocol::GameId::Dusklight {
+                    open_message()?
+                } else {
+                    register_message("TwilightSync.OpenGameControls.v2")?
+                },
+                if game == crate::protocol::GameId::Totk {
+                    1
+                } else {
+                    0
+                },
                 0,
                 SMTO_ABORTIFHUNG | SMTO_BLOCK,
                 2000,
@@ -107,7 +121,8 @@ impl BackgroundGuard {
             attention: Cell::new(false),
             error: RefCell::new(None),
             open_message: open_message()?,
-            open_game_controls: Cell::new(false),
+            game_message: register_message("TwilightSync.OpenGameControls.v2")?,
+            open_game_controls: Cell::new(None),
         });
         PUMP.with(|cell| *cell.borrow_mut() = Some(pump.clone()));
         if unsafe { SetWindowSubclass(window.get() as HWND, Some(window_message), TIMER_ID, 0) }
@@ -141,8 +156,8 @@ impl BackgroundGuard {
         self.pump.error.borrow().clone()
     }
 
-    pub(super) fn take_open_game_controls(&self) -> bool {
-        self.pump.open_game_controls.replace(false)
+    pub(super) fn take_open_game_controls(&self) -> Option<crate::protocol::GameId> {
+        self.pump.open_game_controls.take()
     }
 }
 
@@ -176,9 +191,14 @@ unsafe extern "system" fn window_message(
 ) -> LRESULT {
     let pump = PUMP.with(|cell| cell.borrow().clone());
     if let Some(pump) = pump
-        && message == pump.open_message
+        && (message == pump.open_message || (message == pump.game_message && wparam <= 1))
     {
-        pump.open_game_controls.set(true);
+        pump.open_game_controls
+            .set(Some(if message == pump.game_message && wparam == 1 {
+                crate::protocol::GameId::Totk
+            } else {
+                crate::protocol::GameId::Dusklight
+            }));
         reveal(pump.window, &pump.context);
         return 1;
     }
@@ -195,6 +215,13 @@ impl Pump {
         let snapshot = self.backend.snapshot()?;
         let status = if snapshot.error.is_some() || snapshot.textures.recovery_needed {
             "Action needed - open dashboard"
+        } else if snapshot.totk.pending || snapshot.totk.recovery_pending || snapshot.totk.conflict
+        {
+            "TotK progress needs your choice - open dashboard"
+        } else if snapshot.totk.running {
+            "Playing TotK here - save writes paused"
+        } else if snapshot.totk.remote_running {
+            "Partner playing TotK - save writes paused"
         } else if snapshot.game_running {
             "Playing here - save writes paused"
         } else if snapshot.remote_game {
@@ -233,6 +260,12 @@ impl Pump {
             && !snapshot.self_updates.preparing
             && !snapshot.game_running
             && !snapshot.remote_game
+            && !snapshot.totk.running
+            && !snapshot.totk.remote_running
+            && !snapshot.totk.busy
+            && !snapshot.totk.launch_pending
+            && snapshot.totk.lock.is_none()
+            && snapshot.totk.remote_lock.is_none()
             && snapshot.settings.play_lock.is_none()
             && !snapshot.install_busy
             && !snapshot.texture_busy;
@@ -259,6 +292,9 @@ impl Pump {
             *self.last_status.borrow_mut() = status.into();
         }
         let attention = snapshot.pending_save
+            || snapshot.totk.pending
+            || snapshot.totk.recovery_pending
+            || snapshot.totk.conflict
             || snapshot.pending_iso
             || snapshot.pending_recovery
             || snapshot.textures.recovery_needed

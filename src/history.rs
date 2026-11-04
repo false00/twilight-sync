@@ -1,6 +1,6 @@
 use crate::{
     files::{self, SAVE_SIZE, ensure_safe_path, sha256, valid_hash},
-    save_data,
+    save_data, totk,
 };
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -16,7 +16,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const BUDGET: u64 = 64 * 1024 * 1024;
 pub const BLOCK_SIZE: usize = 4096;
-const MAX_COMMIT: u64 = 64 * 1024;
+const MAX_COMMIT: u64 = 4 * 1024 * 1024;
 const MAX_INDEX: u64 = 4 * 1024 * 1024;
 const PAGE_SIZE: usize = 50;
 
@@ -180,6 +180,7 @@ struct Accounting {
 
 pub struct History {
     root: PathBuf,
+    format: SaveFormat,
     username: String,
     device: String,
     index: Index,
@@ -187,6 +188,40 @@ pub struct History {
     accounting: HashMap<String, Accounting>,
     object_sizes: HashMap<String, u64>,
     dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SaveFormat {
+    Dusklight,
+    Totk,
+}
+
+impl SaveFormat {
+    fn identity(self, bytes: &[u8]) -> Result<files::SaveIdentity> {
+        match self {
+            Self::Dusklight => files::validate_save(bytes),
+            Self::Totk => {
+                let entries = totk::decode(bytes)?;
+                ensure!(
+                    entries
+                        .keys()
+                        .all(|name| name.starts_with("00000000000000000000000000000001/")),
+                    "TotK history requires a canonical active-account bundle"
+                );
+                Ok(files::SaveIdentity {
+                    game: "TOTK".into(),
+                    name: "active-account".into(),
+                })
+            }
+        }
+    }
+
+    fn size_limit(self) -> usize {
+        match self {
+            Self::Dusklight => SAVE_SIZE,
+            Self::Totk => totk::MAX_BUNDLE_SIZE,
+        }
+    }
 }
 
 fn valid_id(value: &str) -> bool {
@@ -232,6 +267,19 @@ fn immutable_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 impl History {
     pub fn open(application_root: &Path, username: &str, device: &str) -> Result<Self> {
+        Self::open_format(application_root, username, device, SaveFormat::Dusklight)
+    }
+
+    pub fn open_totk(application_root: &Path, username: &str, device: &str) -> Result<Self> {
+        Self::open_format(application_root, username, device, SaveFormat::Totk)
+    }
+
+    fn open_format(
+        application_root: &Path,
+        username: &str,
+        device: &str,
+        format: SaveFormat,
+    ) -> Result<Self> {
         ensure!(valid_id(device), "Invalid snapshot device identity");
         ensure!(
             !username.is_empty() && username.len() <= 256,
@@ -258,10 +306,15 @@ impl History {
         };
         let mut history = Self {
             root,
+            format,
             username: username.into(),
             device: device.into(),
             index,
-            budget: BUDGET,
+            budget: if matches!(format, SaveFormat::Totk) {
+                256 * 1024 * 1024
+            } else {
+                BUDGET
+            },
             accounting: HashMap::new(),
             object_sizes: HashMap::new(),
             dirty: false,
@@ -311,12 +364,33 @@ impl History {
             commit.username.len() <= 256 && commit.name.len() <= 31 && commit.game.len() == 4,
             "Invalid snapshot metadata"
         );
+        let length = commit.blocks.iter().try_fold(0_usize, |length, block| {
+            ensure!(
+                block.length > 0 && block.length <= BLOCK_SIZE,
+                "Invalid snapshot block size"
+            );
+            length
+                .checked_add(block.length)
+                .context("Snapshot size overflow")
+        })?;
         ensure!(
-            commit.blocks.len() == SAVE_SIZE.div_ceil(BLOCK_SIZE),
+            length > 0 && length <= self.format.size_limit(),
+            "Invalid snapshot size"
+        );
+        if matches!(self.format, SaveFormat::Dusklight) {
+            ensure!(length == SAVE_SIZE, "Invalid Dusklight snapshot size");
+        } else {
+            ensure!(
+                commit.game == "TOTK" && commit.name == "active-account",
+                "Snapshot belongs to another game"
+            );
+        }
+        ensure!(
+            commit.blocks.len() == length.div_ceil(BLOCK_SIZE),
             "Invalid snapshot block count"
         );
         for (index, block) in commit.blocks.iter().enumerate() {
-            let expected = (SAVE_SIZE - index * BLOCK_SIZE).min(BLOCK_SIZE);
+            let expected = (length - index * BLOCK_SIZE).min(BLOCK_SIZE);
             ensure!(
                 valid_id(&block.hash) && block.length == expected,
                 "Invalid snapshot block reference"
@@ -411,7 +485,7 @@ impl History {
             "Snapshot is not retained in this history"
         );
         let commit = self.commit(id)?;
-        let mut bytes = Vec::with_capacity(SAVE_SIZE);
+        let mut bytes = Vec::with_capacity(commit.blocks.iter().map(|block| block.length).sum());
         for block in &commit.blocks {
             bytes.extend_from_slice(&self.block(block)?);
         }
@@ -419,7 +493,7 @@ impl History {
             sha256(&bytes) == commit.hash,
             "Reconstructed snapshot SHA-256 mismatch"
         );
-        let identity = files::validate_save(&bytes)?;
+        let identity = self.format.identity(&bytes)?;
         ensure!(
             identity.game == commit.game && identity.name == commit.name,
             "Reconstructed save identity differs"
@@ -456,7 +530,7 @@ impl History {
         provenance: Provenance<'_>,
         timestamp: String,
     ) -> Result<Prepared> {
-        let identity = files::validate_save(bytes)?;
+        let identity = self.format.identity(bytes)?;
         ensure_safe_path(source)?;
         ensure!(
             provenance.peer.is_none_or(valid_id)
@@ -676,6 +750,30 @@ impl History {
         self.publish(prepared)
     }
 
+    pub fn capture_restored(
+        &mut self,
+        bytes: &[u8],
+        source: &Path,
+        restored_from: &str,
+    ) -> Result<Capture> {
+        ensure!(
+            self.read(restored_from)? == bytes,
+            "Restored bytes differ from the selected snapshot"
+        );
+        self.clean_if_dirty()?;
+        let prepared = self.prepare(
+            bytes,
+            source,
+            Reason::Restored,
+            Provenance {
+                restored_from: Some(restored_from),
+                ..Provenance::default()
+            },
+            OffsetDateTime::now_utc().format(&Rfc3339)?,
+        )?;
+        self.publish(prepared)
+    }
+
     pub fn find_hash(&self, hash: &str) -> Result<Option<String>> {
         ensure!(valid_id(hash), "Invalid snapshot save hash");
         for reference in self.index.entries.iter().rev() {
@@ -700,7 +798,7 @@ impl History {
         base: Option<&str>,
     ) -> Result<Capture> {
         self.clean_if_dirty()?;
-        files::validate_save(bytes)?;
+        self.format.identity(bytes)?;
         ensure!(
             valid_id(peer) && base.is_none_or(valid_id),
             "Invalid branch provenance"
@@ -837,7 +935,21 @@ impl History {
             commits: index.entries.len(),
             blocks: objects.len(),
             stored_bytes: stored,
-            logical_bytes: index.entries.len() as u64 * SAVE_SIZE as u64,
+            logical_bytes: index
+                .entries
+                .iter()
+                .map(|reference| {
+                    self.commit(&reference.id).map(|commit| {
+                        commit
+                            .blocks
+                            .iter()
+                            .map(|block| block.length as u64)
+                            .sum::<u64>()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .sum(),
             budget: self.budget,
             pruned: index.pruned,
         })
@@ -865,15 +977,22 @@ impl History {
         let mut entries = Vec::new();
         for reference in self.index.entries[start..end].iter().rev() {
             let commit = self.commit(&reference.id)?;
-            let summary = self
-                .read(&reference.id)
-                .and_then(|bytes| save_data::inspect(&bytes))
-                .ok();
-            let previous = commit
-                .parent
-                .as_ref()
-                .and_then(|parent| self.read(parent).ok())
-                .and_then(|bytes| save_data::inspect(&bytes).ok());
+            let summary = if matches!(self.format, SaveFormat::Dusklight) {
+                self.read(&reference.id)
+                    .and_then(|bytes| save_data::inspect(&bytes))
+                    .ok()
+            } else {
+                None
+            };
+            let previous = if matches!(self.format, SaveFormat::Dusklight) {
+                commit
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| self.read(parent).ok())
+                    .and_then(|bytes| save_data::inspect(&bytes).ok())
+            } else {
+                None
+            };
             let changes = summary
                 .as_ref()
                 .zip(previous.as_ref())

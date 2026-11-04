@@ -19,6 +19,12 @@ pub const MAX_FRAME: usize = 65_535;
 const REKEY_INTERVAL: u64 = 4096;
 const PREFACE: &[u8; 4] = b"TWP1";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameId {
+    Dusklight,
+    Totk,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Event {
     Hello {
@@ -109,13 +115,76 @@ pub enum Event {
     SaveDeclined {
         hash: String,
     },
+    TotkRequest,
+    TotkState {
+        installed: bool,
+        running: bool,
+        hash: Option<String>,
+        files: usize,
+        size: u64,
+    },
+    TotkOffer {
+        hash: String,
+        expected: Option<String>,
+        files: usize,
+        size: u64,
+    },
+    TotkAccept {
+        hash: String,
+    },
+    TotkChunk {
+        hash: String,
+        #[serde(deserialize_with = "bounded_bytes")]
+        bytes: Vec<u8>,
+    },
+    TotkDone {
+        hash: String,
+    },
+    TotkSaved {
+        hash: String,
+    },
+    TotkDeclined {
+        hash: String,
+    },
+    GamePacket {
+        game: GameId,
+        #[serde(deserialize_with = "bounded_game_packet")]
+        bytes: Vec<u8>,
+    },
+    SaveOffer {
+        hash: String,
+        base: Option<String>,
+        expected: Option<String>,
+        manual: bool,
+        lease: Option<String>,
+        files: usize,
+        size: u64,
+        preview: bool,
+    },
+    SavePull {
+        hash: String,
+        expected: Option<String>,
+        preview: bool,
+    },
 }
 
 fn bounded_bytes<'de, D: de::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Vec<u8>, D::Error> {
-    struct Bounded;
-    impl<'de> Visitor<'de> for Bounded {
+    bounded_payload::<D, SAVE_SIZE>(deserializer)
+}
+
+fn bounded_game_packet<'de, D: de::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u8>, D::Error> {
+    bounded_payload::<D, { MAX_FRAME - 1024 }>(deserializer)
+}
+
+fn bounded_payload<'de, D: de::Deserializer<'de>, const LIMIT: usize>(
+    deserializer: D,
+) -> std::result::Result<Vec<u8>, D::Error> {
+    struct Bounded<const LIMIT: usize>;
+    impl<'de, const LIMIT: usize> Visitor<'de> for Bounded<LIMIT> {
         type Value = Vec<u8>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("a bounded binary payload")
@@ -124,12 +193,12 @@ fn bounded_bytes<'de, D: de::Deserializer<'de>>(
             self,
             mut seq: A,
         ) -> std::result::Result<Self::Value, A::Error> {
-            if seq.size_hint().is_some_and(|size| size > SAVE_SIZE) {
+            if seq.size_hint().is_some_and(|size| size > LIMIT) {
                 return Err(de::Error::custom("binary payload exceeds limit"));
             }
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(SAVE_SIZE));
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(LIMIT));
             while let Some(byte) = seq.next_element()? {
-                if bytes.len() == SAVE_SIZE {
+                if bytes.len() == LIMIT {
                     return Err(de::Error::custom("binary payload exceeds limit"));
                 }
                 bytes.push(byte);
@@ -137,7 +206,129 @@ fn bounded_bytes<'de, D: de::Deserializer<'de>>(
             Ok(bytes)
         }
     }
-    deserializer.deserialize_seq(Bounded)
+    deserializer.deserialize_seq(Bounded::<LIMIT>)
+}
+
+fn save_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::State { .. }
+            | Event::Save { .. }
+            | Event::Saved { .. }
+            | Event::LeaseRequest { .. }
+            | Event::LeaseGranted { .. }
+            | Event::LeaseDenied { .. }
+            | Event::LeaseRelease { .. }
+            | Event::LeaseReleased { .. }
+            | Event::Recover { .. }
+            | Event::RecoveryApproved { .. }
+            | Event::SavePreviewRequest { .. }
+            | Event::SavePreview { .. }
+            | Event::SaveDeclined { .. }
+            | Event::TotkRequest
+            | Event::TotkState { .. }
+            | Event::TotkOffer { .. }
+            | Event::TotkAccept { .. }
+            | Event::TotkChunk { .. }
+            | Event::TotkDone { .. }
+            | Event::TotkSaved { .. }
+            | Event::TotkDeclined { .. }
+            | Event::SaveOffer { .. }
+            | Event::SavePull { .. }
+    )
+}
+
+pub fn game_packet(game: GameId, event: &Event) -> Result<Event> {
+    ensure!(
+        allowed_in_game(game, event),
+        "Only this game's save and play-session events can enter its channel"
+    );
+    let bytes = postcard::to_allocvec(event)?;
+    ensure!(
+        bytes.len() <= MAX_FRAME - 1024,
+        "Game event exceeds its bounded frame"
+    );
+    Ok(Event::GamePacket { game, bytes })
+}
+
+pub fn game_event(bytes: &[u8]) -> Result<Event> {
+    ensure!(
+        bytes.len() <= MAX_FRAME - 1024,
+        "Game event exceeds its bounded frame"
+    );
+    let event: Event = postcard::from_bytes(bytes)?;
+    ensure!(
+        save_event(&event),
+        "Nested game channels and unrelated protocol commands are forbidden"
+    );
+    Ok(event)
+}
+
+pub fn allowed_in_game(game: GameId, event: &Event) -> bool {
+    if !save_event(event) {
+        return false;
+    }
+    if game == GameId::Dusklight {
+        !matches!(
+            event,
+            Event::TotkRequest
+                | Event::TotkState { .. }
+                | Event::TotkOffer { .. }
+                | Event::TotkAccept { .. }
+                | Event::TotkChunk { .. }
+                | Event::TotkDone { .. }
+                | Event::TotkSaved { .. }
+                | Event::TotkDeclined { .. }
+                | Event::SaveOffer { .. }
+                | Event::SavePull { .. }
+        )
+    } else {
+        !matches!(event, Event::Save { .. })
+    }
+}
+
+#[cfg(test)]
+mod game_channel_tests {
+    use super::*;
+
+    #[test]
+    fn shared_state_and_leases_are_scoped_to_their_game() -> Result<()> {
+        let packet = game_packet(
+            GameId::Totk,
+            &Event::LeaseRequest {
+                token: "a".repeat(64),
+                hash: None,
+            },
+        )?;
+        let Event::GamePacket { game, bytes } = packet else {
+            anyhow::bail!("Missing game envelope")
+        };
+        assert_eq!(game, GameId::Totk);
+        assert!(matches!(game_event(&bytes)?, Event::LeaseRequest { .. }));
+        assert!(game_packet(GameId::Totk, &Event::ApprovePairing).is_err());
+        assert!(
+            game_packet(
+                GameId::Dusklight,
+                &Event::TotkDone {
+                    hash: "a".repeat(64)
+                }
+            )
+            .is_err()
+        );
+        assert!(!allowed_in_game(
+            GameId::Totk,
+            &Event::Save {
+                hash: "a".repeat(64),
+                base: None,
+                expected: None,
+                manual: true,
+                lease: None,
+                bytes: Vec::new()
+            }
+        ));
+        assert!(game_packet(GameId::Dusklight, &Event::GamePacket { game, bytes }).is_err());
+        Ok(())
+    }
 }
 
 pub fn noise_params() -> Result<NoiseParams> {

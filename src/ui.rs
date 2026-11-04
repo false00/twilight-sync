@@ -1,3 +1,4 @@
+use crate::protocol::GameId;
 use crate::runtime::{Backend, Command, Snapshot};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
@@ -22,6 +23,7 @@ enum Page {
     Overview,
     Devices,
     Library,
+    Totk,
     Textures,
     History,
     Security,
@@ -41,7 +43,8 @@ impl Page {
         match self {
             Self::Overview => "Home",
             Self::Devices => "Devices",
-            Self::Library => "Dusklight",
+            Self::Library => "Games",
+            Self::Totk => "Tears of the Kingdom",
             Self::Textures => "Texture packs",
             Self::History => "Save history",
             Self::Security => "Settings",
@@ -52,7 +55,8 @@ impl Page {
         match self {
             Self::Overview => "Your save progress and game sessions.",
             Self::Devices => "Approve your network and pair one trusted device.",
-            Self::Library => "Install the game, manage updates, and select your own disc image.",
+            Self::Library => "",
+            Self::Totk => "",
             Self::Textures => "Import authorized texture packs and choose the active version.",
             Self::History => "Save branches, progress changes, and recovery.",
             Self::Security => "Appearance, startup, application updates, and privacy.",
@@ -64,6 +68,7 @@ impl Page {
             Self::Overview => "\u{e80f}",
             Self::Devices => "\u{e772}",
             Self::Library => "\u{e7fc}",
+            Self::Totk => "\u{e7fc}",
             Self::Textures => "\u{e91b}",
             Self::History => "\u{e81c}",
             Self::Security => "\u{e713}",
@@ -89,6 +94,8 @@ struct Tray {
     show: MenuId,
     sync: MenuId,
     launch: MenuId,
+    launch_item: MenuItem,
+    sync_item: MenuItem,
     quit: MenuId,
 }
 
@@ -96,6 +103,8 @@ struct Dashboard {
     backend: Backend,
     tray: Tray,
     page: Page,
+    game: GameId,
+    game_view_path: Option<PathBuf>,
     local_error: Option<String>,
     events: crossbeam_channel::Receiver<MenuEvent>,
     background: background::BackgroundGuard,
@@ -157,6 +166,8 @@ fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
         show: show.id().clone(),
         sync: sync.id().clone(),
         launch: launch.id().clone(),
+        launch_item: launch,
+        sync_item: sync,
         quit: quit.id().clone(),
     })
 }
@@ -177,6 +188,15 @@ pub fn open_dusklight_controls() -> Result<bool> {
     background::open_game_controls(WINDOW_TITLE)
 }
 
+pub fn open_totk_controls() -> Result<bool> {
+    background::open_selected_game(WINDOW_TITLE, GameId::Totk)
+}
+
+pub fn run_totk(backend: Backend) -> Result<()> {
+    let appearance = AppearanceStore::load(&crate::config::root_directory()?)?;
+    run_page(backend, false, Page::Totk, WINDOW_TITLE, appearance, 1.0)
+}
+
 #[cfg(debug_assertions)]
 pub fn run_smoke(
     backend: Backend,
@@ -189,6 +209,7 @@ pub fn run_smoke(
         "overview" => Page::Overview,
         "devices" => Page::Devices,
         "library" => Page::Library,
+        "totk" => Page::Totk,
         "textures" => Page::Textures,
         "history" => Page::History,
         "security" => Page::Security,
@@ -216,6 +237,26 @@ fn run_page(
     appearance: AppearanceStore,
     scale: f32,
 ) -> Result<()> {
+    let game_view_path = if title == WINDOW_TITLE {
+        Some(crate::config::root_path()?.join("game-view.json"))
+    } else {
+        None
+    };
+    let initial_game = if initial_page == Page::Totk {
+        GameId::Totk
+    } else {
+        game_view_path
+            .as_ref()
+            .and_then(|path| {
+                crate::files::ensure_safe_path(path).ok()?;
+                let metadata = std::fs::metadata(path).ok()?;
+                if metadata.len() > 4096 {
+                    return None;
+                }
+                serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+            })
+            .unwrap_or(GameId::Dusklight)
+    };
     let snapshot = backend.snapshot()?;
     icons::set_application_identity()?;
     let tray = make_tray(snapshot.settings.startup, snapshot.self_updates.enabled)?;
@@ -263,7 +304,13 @@ fn run_page(
             Ok(Box::new(Dashboard {
                 backend,
                 tray,
-                page: initial_page,
+                page: if initial_page == Page::Totk {
+                    Page::Overview
+                } else {
+                    initial_page
+                },
+                game: initial_game,
+                game_view_path,
                 local_error: None,
                 events,
                 background: background_guard,
@@ -296,9 +343,17 @@ impl Dashboard {
             if event.id == self.tray.show {
                 self.background.reveal();
             } else if event.id == self.tray.sync {
-                self.dispatch(Command::SendSave);
+                self.dispatch(if self.game == GameId::Totk {
+                    Command::SendTotk
+                } else {
+                    Command::SendSave
+                });
             } else if event.id == self.tray.launch {
-                self.dispatch(Command::Launch);
+                self.dispatch(if self.game == GameId::Totk {
+                    Command::LaunchTotk { local_only: false }
+                } else {
+                    Command::Launch
+                });
             } else if event.id == *self.tray.startup.id() {
                 self.dispatch(Command::SetStartup(self.tray.startup.is_checked()));
             } else if event.id == *self.tray.automatic_updates.id() {
@@ -400,7 +455,13 @@ impl Dashboard {
                 {
                     self.dispatch(Command::CheckSelfUpdate);
                 }
-                let safe = Self::management_available(snapshot) && !snapshot.self_updates.checking;
+                let safe = Self::management_available(snapshot)
+                    && !snapshot.self_updates.checking
+                    && !snapshot.totk.running
+                    && !snapshot.totk.busy
+                    && !snapshot.totk.launch_pending
+                    && snapshot.totk.lock.is_none()
+                    && snapshot.totk.remote_lock.is_none();
                 if Self::primary(
                     ui,
                     safe && snapshot.self_updates.available(),
@@ -652,6 +713,252 @@ impl Dashboard {
             ui.label(RichText::new(title).font(semibold(14.0)));
             Self::secondary(ui, description);
             ui.horizontal_wrapped(controls);
+        }
+    }
+
+    fn game_picker(ui: &mut egui::Ui, game: &mut GameId) -> bool {
+        let before = *game;
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(game, GameId::Dusklight, "Dusklight");
+            ui.selectable_value(game, GameId::Totk, "Tears of the Kingdom");
+        });
+        *game != before
+    }
+
+    fn totk_summary(
+        ui: &mut egui::Ui,
+        summary: &crate::totk::Summary,
+        other: Option<&crate::totk::Summary>,
+    ) {
+        Self::secondary(
+            ui,
+            format!(
+                "{} files / {:.1} MiB / {} album files",
+                summary.files,
+                summary.bytes as f64 / 1_048_576.0,
+                summary.album_files
+            ),
+        );
+        for slot in &summary.slots {
+            let matches = other
+                .and_then(|other| other.slots.iter().find(|other| other.number == slot.number))
+                .is_some_and(|other| other.hash == slot.hash);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Slot {}", slot.number + 1)).font(semibold(14.0)));
+                ui.label(format!(
+                    "{} files / {:.1} MiB",
+                    slot.files,
+                    slot.bytes as f64 / 1_048_576.0
+                ));
+                if other.is_some() {
+                    ui.label(if matches {
+                        "Matching revision"
+                    } else {
+                        "Different revision"
+                    });
+                }
+            });
+        }
+    }
+
+    fn totk_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        Self::section_title(ui, "Tears of the Kingdom");
+        if let Some(path) = &snapshot.totk.install_path {
+            ui.add(egui::Label::new(RichText::new(path.display().to_string()).monospace()).wrap());
+        }
+        ui.add_space(12.0);
+        if ui
+            .add_enabled(
+                !snapshot.totk.running && !snapshot.totk.busy && snapshot.totk.lock.is_none(),
+                egui::Button::new("Locate totk.exe..."),
+            )
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Native TotK executable")
+                .add_filter("Windows executable", &["exe"])
+                .pick_file()
+        {
+            self.dispatch(Command::SetTotkExecutable(path));
+        }
+        ui.add_space(16.0);
+        self.totk(ui, snapshot);
+    }
+
+    fn totk(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let state = &snapshot.totk;
+        let idle = state.installed
+            && !state.running
+            && !state.remote_running
+            && !state.busy
+            && !state.launch_pending
+            && state.lock.is_none()
+            && state.remote_lock.is_none()
+            && !snapshot.self_updates.preparing;
+        ui.horizontal_wrapped(|ui| {
+            if Self::primary(ui, idle && !state.conflict, "Play Tears of the Kingdom").clicked() {
+                self.dispatch(Command::LaunchTotk { local_only: false });
+            }
+            if ui.button("Save history").clicked() {
+                self.page = Page::History;
+                self.dispatch(Command::TotkHistoryPage(None));
+            }
+        });
+        if state.launch_pending {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reserving play on the paired PC...");
+            });
+        }
+        ui.add_space(16.0);
+        let local = if !state.checked {
+            "Not checked".to_owned()
+        } else if !state.installed {
+            "Not installed".to_owned()
+        } else if state.running {
+            "Game running".to_owned()
+        } else if state.local_hash.is_none() {
+            "No committed save yet".to_owned()
+        } else {
+            format!(
+                "{} files, {:.1} MiB",
+                state.local_files,
+                state.local_size as f64 / (1024.0 * 1024.0)
+            )
+        };
+        Self::section_title(ui, "This PC");
+        ui.label(local);
+        if let Some(hash) = &state.local_hash {
+            Self::secondary(ui, format!("Save: {}", &hash[..12]));
+        }
+        if let Some(summary) = &state.local_summary {
+            Self::totk_summary(ui, summary, state.remote_summary.as_ref());
+        }
+        ui.add_space(16.0);
+        Self::section_title(ui, snapshot.peer_name.as_deref().unwrap_or("Paired PC"));
+        ui.label(if !snapshot.ready {
+            "Offline".to_owned()
+        } else if !state.peer_checked {
+            "Not checked".to_owned()
+        } else if !state.remote_installed {
+            "Not installed".to_owned()
+        } else if state.remote_running {
+            "Game running".to_owned()
+        } else if state.remote_hash.is_none() {
+            "No committed save yet".to_owned()
+        } else if state.remote_hash == state.local_hash {
+            "Saves match".to_owned()
+        } else {
+            format!("{} files; different progress", state.remote_files)
+        });
+        if let Some(hash) = &state.remote_hash {
+            Self::secondary(ui, format!("Save: {}", &hash[..12]));
+        }
+        if let Some(summary) = state
+            .remote_summary
+            .as_ref()
+            .filter(|_| state.comparison_verified)
+        {
+            Self::totk_summary(ui, summary, state.local_summary.as_ref());
+        }
+        if state.conflict {
+            ui.add_space(12.0);
+            Self::section_title(ui, "Different save branches");
+            ui.horizontal_wrapped(|ui| {
+                for (label, use_remote) in [("Keep this PC's save", false), ("Use partner's save", true)] {
+                    if ui.add_enabled(idle && snapshot.ready && state.comparison_verified, egui::Button::new(label)).clicked()
+                        && let (Some(local_hash), Some(remote_hash)) = (&state.local_hash, &state.remote_hash)
+                    {
+                        let approved = rfd::MessageDialog::new().set_title("Choose complete TotK save")
+                            .set_description(if use_remote { "Replace this PC's active TotK save with the displayed partner branch? The current branch remains in history." }
+                                else { "Offer this PC's complete TotK save to the partner? Their approval is required before replacing different progress." })
+                            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                        if approved { self.dispatch(Command::ResolveTotk { local_hash: local_hash.clone(), remote_hash: remote_hash.clone(), use_remote }); }
+                    }
+                }
+                if ui.add_enabled(idle, egui::Button::new("Keep both; play this PC")).clicked() {
+                    self.dispatch(Command::ContinueTotk { expected: state.local_hash.clone() });
+                }
+            });
+        }
+        ui.add_space(16.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!state.busy, egui::Button::new(symbol("\u{e72c}", 18.0)))
+                .on_hover_text("Check TotK saves on both PCs")
+                .clicked()
+            {
+                self.dispatch(Command::RefreshTotk);
+            }
+            if Self::primary(
+                ui,
+                snapshot.ready
+                    && state.peer_checked
+                    && state.remote_installed
+                    && !state.running
+                    && !state.remote_running
+                    && !state.busy
+                    && state.local_hash.is_some(),
+                "Send this PC's saves",
+            )
+            .clicked()
+            {
+                self.dispatch(Command::SendTotk);
+            }
+        });
+        if !state.message.is_empty() {
+            ui.add_space(12.0);
+            ui.label(&state.message);
+        }
+        if state.pending {
+            ui.add_space(16.0);
+            ui.separator();
+            Self::section_title(ui, "Incoming TotK saves");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Accept partner's saves").clicked() {
+                    self.dispatch(Command::AcceptTotk(true));
+                }
+                if ui.button("Keep this PC's progress").clicked() {
+                    self.dispatch(Command::AcceptTotk(false));
+                }
+            });
+        }
+        if state.lock.is_some()
+            && !state.running
+            && !state.remote_running
+            && !state.busy
+            && ui
+                .add_enabled(
+                    snapshot.ready
+                        || state
+                            .lock
+                            .as_ref()
+                            .is_some_and(|lock| lock.owner == snapshot.public_key),
+                    egui::Button::new("Recover completed TotK session..."),
+                )
+                .clicked()
+        {
+            let approved = rfd::MessageDialog::new().set_title("Recover TotK session")
+                .set_description(if snapshot.ready {
+                    "Confirm TotK is closed on both PCs. Your partner must approve recovery of the stored play lock; saves will not be replaced."
+                } else {
+                    "Confirm this PC's TotK session has ended. Only this PC's own reservation is released; the partner's reservation remains until reconnection. Offline branches may need later comparison."
+                })
+                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+            if approved {
+                self.dispatch(Command::RecoverTotk);
+            }
+        }
+        if state.recovery_pending {
+            ui.add_space(12.0);
+            Self::section_title(ui, "Partner requests TotK session recovery");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Approve recovery").clicked() {
+                    self.dispatch(Command::AcceptTotkRecovery(true));
+                }
+                if ui.button("Keep session locked").clicked() {
+                    self.dispatch(Command::AcceptTotkRecovery(false));
+                }
+            });
         }
     }
 
@@ -1483,9 +1790,20 @@ impl Dashboard {
     }
 
     fn history(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let totk = self.game == GameId::Totk;
+        let history = if totk {
+            &snapshot.totk.history
+        } else {
+            &snapshot.history
+        };
+        let current_hash = if totk {
+            &snapshot.totk.local_hash
+        } else {
+            &snapshot.local_hash
+        };
         let p = Palette::of(ui);
         Self::card(ui, |ui| {
-            let stats = &snapshot.history.stats;
+            let stats = &history.stats;
             Self::section_title(ui, "Snapshot storage");
             ui.horizontal_wrapped(|ui| {
                 for (value, label) in [
@@ -1523,21 +1841,26 @@ impl Dashboard {
                 ui,
                 "Unchanged blocks are shared. Oldest snapshots are pruned when the budget is reached; filesystem overhead is separate.",
             );
-            if let Some(notice) = &snapshot.history.notice {
+            if let Some(notice) = &history.notice {
                 Self::notice(ui, Tone::Info, "Save history", notice);
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Refresh / latest").clicked() {
-                    self.dispatch(Command::HistoryPage(None));
+                    self.dispatch(if totk {
+                        Command::TotkHistoryPage(None)
+                    } else {
+                        Command::HistoryPage(None)
+                    });
                 }
                 if ui
-                    .add_enabled(
-                        snapshot.history.next.is_some(),
-                        egui::Button::new("Older snapshots"),
-                    )
+                    .add_enabled(history.next.is_some(), egui::Button::new("Older snapshots"))
                     .clicked()
                 {
-                    self.dispatch(Command::HistoryPage(snapshot.history.next.clone()));
+                    self.dispatch(if totk {
+                        Command::TotkHistoryPage(history.next.clone())
+                    } else {
+                        Command::HistoryPage(history.next.clone())
+                    });
                 }
             });
             ui.collapsing("How snapshots work", |ui| {
@@ -1546,20 +1869,35 @@ impl Dashboard {
             });
         });
         ui.add_space(12.0);
-        let can_restore = snapshot.settings.save_file.is_some()
-            && snapshot.save_profile.is_some()
-            && snapshot.save_ready
-            && Self::management_available(snapshot);
-        if snapshot.history.entries.is_empty() {
+        let can_restore = if totk {
+            snapshot.totk.installed
+                && !snapshot.totk.running
+                && !snapshot.totk.remote_running
+                && !snapshot.totk.busy
+                && !snapshot.totk.launch_pending
+                && snapshot.totk.lock.is_none()
+                && snapshot.totk.remote_lock.is_none()
+                && !snapshot.self_updates.preparing
+        } else {
+            snapshot.settings.save_file.is_some()
+                && snapshot.save_profile.is_some()
+                && snapshot.save_ready
+                && Self::management_available(snapshot)
+        };
+        if history.entries.is_empty() {
             Self::notice(
                 ui,
                 Tone::Info,
                 "No snapshots yet",
-                "Valid saves are recorded automatically from Dusklight's detected profile. Play and save in Dusklight, or receive your partner's save - no location setup is needed.",
+                if totk {
+                    "No committed TotK snapshots yet."
+                } else {
+                    "Valid saves are recorded automatically from Dusklight's detected profile. Play and save in Dusklight, or receive your partner's save - no location setup is needed."
+                },
             );
         }
         let mut nodes = std::collections::HashMap::new();
-        for entry in &snapshot.history.entries {
+        for entry in &history.entries {
             ui.push_id(&entry.id, |ui| { ui.horizontal_top(|ui| {
                 let (rail, response) = ui.allocate_exact_size(Vec2::new(60.0, 38.0), egui::Sense::hover());
                 let partner_branch = entry.reason == crate::history::Reason::PeerBranch;
@@ -1567,13 +1905,20 @@ impl Dashboard {
                 nodes.insert(entry.id.clone(), position);
                 response.on_hover_text(if partner_branch { "Preserved partner branch" } else if entry.merge_parent.is_some() { "Reconciled save; both parent branches retained" } else { "Local save history" });
                 ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 0.0), egui::Layout::top_down(egui::Align::Min), |ui| { Self::card(ui, |ui| {
-                let current = snapshot.local_hash.as_ref() == Some(&entry.hash);
+                let current = current_hash.as_ref() == Some(&entry.hash);
                 Self::setting_row(ui, &format!("#{}  {}", entry.sequence, if entry.merge_parent.is_some() { "Reconciled save" } else { entry.reason.label() }),
                     &format!("{}  /  {}", entry.timestamp, entry.username),
                     |ui| {
                         if current {
                             ui.label(RichText::new("Current save").color(p.success));
                         } else if ui.add_enabled(can_restore, egui::Button::new("Restore...")).clicked() {
+                            if totk {
+                                let approved = rfd::MessageDialog::new().set_title("Restore TotK snapshot")
+                                    .set_description(format!("Restore snapshot #{} from {}? The current active-account save is retained in history and rollback storage. Other local accounts and graphics settings are not changed.", entry.sequence, entry.timestamp))
+                                    .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                                if approved { self.dispatch(Command::RestoreTotk { id: entry.id.clone(), expected: current_hash.clone() }); }
+                                return;
+                            }
                             let Some(profile) = snapshot.save_profile.as_deref() else {
                                 self.local_error = Some("Automatic Dusklight profile detection is not ready.".into());
                                 return;
@@ -1591,7 +1936,7 @@ impl Dashboard {
                                 .set_description(format!("Restore {} / {} to {}?\n\nThe current valid save is snapshotted first. This creates a new commit; paired-device conflicts still need approval.", entry.game, entry.name, destination.display()))
                                 .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
                             if approved {
-                                self.dispatch(Command::RestoreSnapshot { id: entry.id.clone(), expected: snapshot.local_hash.clone() });
+                                    self.dispatch(Command::RestoreSnapshot { id: entry.id.clone(), expected: current_hash.clone() });
                             }
                         }
                     },
@@ -1619,12 +1964,7 @@ impl Dashboard {
             }); }); }); });
             ui.add_space(8.0);
         }
-        saves::history_graph(
-            ui,
-            &snapshot.history.entries,
-            &nodes,
-            snapshot.local_hash.as_deref(),
-        );
+        saves::history_graph(ui, &history.entries, &nodes, current_hash.as_deref());
     }
 
     fn security(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -1861,7 +2201,11 @@ impl Dashboard {
             ui.painter().text(
                 egui::pos2(rect.left() + 46.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                page.title(),
+                if page == Page::Totk {
+                    "TotK saves"
+                } else {
+                    page.title()
+                },
                 egui::FontId::proportional(14.0),
                 foreground,
             );
@@ -1874,6 +2218,9 @@ impl Dashboard {
         {
             response.request_focus();
             self.page = page;
+            if page == Page::Totk {
+                self.dispatch(Command::RefreshTotk);
+            }
         }
         response.on_hover_text(page.title());
     }
@@ -1881,9 +2228,13 @@ impl Dashboard {
 
 impl eframe::App for Dashboard {
     fn update(&mut self, context: &egui::Context, _: &mut eframe::Frame) {
-        if self.background.take_open_game_controls() {
+        if let Some(game) = self.background.take_open_game_controls() {
             self.start_hidden = false;
             self.page = Page::Overview;
+            self.game = game;
+            if game == GameId::Totk {
+                self.dispatch(Command::RefreshTotk);
+            }
         }
         self.tray_events();
         let snapshot = match self.backend.snapshot() {
@@ -1990,6 +2341,18 @@ impl eframe::App for Dashboard {
                     }
                 });
             });
+        self.tray
+            .launch_item
+            .set_text(if self.game == GameId::Totk {
+                "Play Tears of the Kingdom"
+            } else {
+                "Play Dusklight"
+            });
+        self.tray.sync_item.set_text(if self.game == GameId::Totk {
+            "Send TotK save to partner"
+        } else {
+            "Send Dusklight save to partner"
+        });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2009,6 +2372,36 @@ impl eframe::App for Dashboard {
                             ui.add_space(12.0);
                         } else {
                             Self::header(ui, self.page);
+                        }
+                        if matches!(
+                            self.page,
+                            Page::Overview | Page::Library | Page::History | Page::Totk
+                        ) {
+                            if Self::game_picker(ui, &mut self.game) {
+                                self.shown_fork = None;
+                                self.fork_dialog_open = false;
+                                self.fork_choice = None;
+                                if let Some(path) = &self.game_view_path {
+                                    match serde_json::to_vec(&self.game)
+                                        .map_err(anyhow::Error::from)
+                                        .and_then(|bytes| crate::files::atomic_write(path, &bytes))
+                                    {
+                                        Ok(()) => {}
+                                        Err(error) => {
+                                            self.local_error = Some(format!(
+                                                "Cannot remember selected game: {error:#}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                if self.game == GameId::Totk {
+                                    self.dispatch(Command::RefreshTotk);
+                                    self.dispatch(Command::TotkHistoryPage(None));
+                                } else if self.page == Page::History {
+                                    self.dispatch(Command::HistoryPage(None));
+                                }
+                            }
+                            ui.add_space(16.0);
                         }
                         let background_error = self.background.error();
                         let error = self
@@ -2032,8 +2425,13 @@ impl eframe::App for Dashboard {
                         }
                         self.approvals(ui, &snapshot);
                         match self.page {
+                            Page::Overview if self.game == GameId::Totk => self.totk(ui, &snapshot),
                             Page::Overview => self.overview(ui, &snapshot),
+                            Page::Totk => self.totk(ui, &snapshot),
                             Page::Devices => self.devices(ui, &snapshot),
+                            Page::Library if self.game == GameId::Totk => {
+                                self.totk_library(ui, &snapshot)
+                            }
                             Page::Library => self.library(ui, &snapshot),
                             Page::Textures => self.textures(ui, &snapshot),
                             Page::History => self.history(ui, &snapshot),
@@ -2054,7 +2452,9 @@ impl eframe::App for Dashboard {
                         ui.add_space(8.0);
                     });
             });
-        self.reconcile_prompt(context, &snapshot);
+        if self.game == GameId::Dusklight {
+            self.reconcile_prompt(context, &snapshot);
+        }
         context.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -2079,6 +2479,67 @@ mod tests {
         let snapshot = backend.snapshot()?;
         backend.command(Command::Shutdown)?;
         Ok(snapshot)
+    }
+
+    #[test]
+    fn game_selector_and_totk_comparisons_fit_light_dark_and_narrow_layouts() -> Result<()> {
+        let summary = crate::totk::Summary {
+            files: 32,
+            bytes: 17_897_203,
+            album_files: 6,
+            slots: (0..6)
+                .map(|number| crate::totk::SlotSummary {
+                    number,
+                    files: 4,
+                    bytes: 2_945_388,
+                    hash: "a".repeat(64),
+                })
+                .collect(),
+        };
+        let mut partner = summary.clone();
+        partner.slots[2].hash = "b".repeat(64);
+        for width in [260.0, 360.0, 640.0, 960.0] {
+            for dark in [false, true] {
+                let context = egui::Context::default();
+                design::install(&context)?;
+                context.set_visuals(if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                });
+                let mut game = GameId::Totk;
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width, 1200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            Dashboard::game_picker(ui, &mut game);
+                            Dashboard::totk_summary(ui, &summary, Some(&partner));
+                        });
+                    },
+                );
+                let mut text_count = 0;
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            bounds.left() >= -1.0 && bounds.right() <= width + 1.0,
+                            "Game UI overflow at {width}px: {}",
+                            text.galley.job.text
+                        );
+                        text_count += 1;
+                    }
+                }
+                assert!(text_count > 10);
+                assert_eq!(game, GameId::Totk);
+            }
+        }
+        Ok(())
     }
 
     #[test]

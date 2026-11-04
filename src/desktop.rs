@@ -7,6 +7,7 @@ use std::{
 };
 
 pub const OPEN_ARGUMENT: &str = "--open-dusklight";
+pub const OPEN_TOTK_ARGUMENT: &str = "--open-totk";
 const SHORTCUT_NAME: &str = "Dusklight (Twilight Sync).lnk";
 const RECEIPT_NAME: &str = "dusklight-desktop-shortcut.json";
 
@@ -35,6 +36,21 @@ pub fn install_dusklight_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
         .desktop_dir()
         .context("Windows did not return a desktop folder")?;
     create(root, desktop, &std::env::current_exe()?, game)
+}
+
+pub fn install_totk_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
+    ensure!(cfg!(windows), "Desktop shortcuts require Windows");
+    let user = directories::UserDirs::new().context("Cannot locate the current user's folders")?;
+    let desktop = user
+        .desktop_dir()
+        .context("Windows did not return a desktop folder")?;
+    create_game(
+        root,
+        desktop,
+        &std::env::current_exe()?,
+        game,
+        crate::protocol::GameId::Totk,
+    )
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -70,8 +86,32 @@ fn same_path(actual: &Path, expected: &Path) -> Result<bool> {
 }
 
 fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<PathBuf> {
-    let destination = desktop.join(SHORTCUT_NAME);
-    let receipt_path = root.join(RECEIPT_NAME);
+    create_game(
+        root,
+        desktop,
+        manager,
+        game,
+        crate::protocol::GameId::Dusklight,
+    )
+}
+
+fn create_game(
+    root: &Path,
+    desktop: &Path,
+    manager: &Path,
+    game: &Path,
+    selected: crate::protocol::GameId,
+) -> Result<PathBuf> {
+    let (shortcut_name, receipt_name, argument) = match selected {
+        crate::protocol::GameId::Dusklight => (SHORTCUT_NAME, RECEIPT_NAME, OPEN_ARGUMENT),
+        crate::protocol::GameId::Totk => (
+            "Tears of the Kingdom (Twilight Sync).lnk",
+            "totk-desktop-shortcut.json",
+            OPEN_TOTK_ARGUMENT,
+        ),
+    };
+    let destination = desktop.join(shortcut_name);
+    let receipt_path = root.join(receipt_name);
     for path in [root, desktop, manager, game, &destination, &receipt_path] {
         ensure_safe_path(path)?;
     }
@@ -118,13 +158,13 @@ fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<Pa
         .prefix(".desktop-shortcut-")
         .tempdir_in(root)?;
     let staged = stage.path().join("Dusklight.lnk");
-    let details = write_link(&staged, manager, game)?;
+    let details = write_link_argument(&staged, manager, game, argument)?;
     ensure!(
         same_path(&details.target, manager)?,
         "The desktop shortcut target is not the current manager"
     );
     ensure!(
-        details.arguments == OPEN_ARGUMENT,
+        details.arguments == argument,
         "The desktop shortcut arguments do not open protected Play controls"
     );
     ensure!(
@@ -190,7 +230,12 @@ fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<Pa
 }
 
 #[cfg(windows)]
-fn write_link(destination: &Path, manager: &Path, game: &Path) -> Result<LinkDetails> {
+fn write_link_argument(
+    destination: &Path,
+    manager: &Path,
+    game: &Path,
+    argument: &str,
+) -> Result<LinkDetails> {
     use std::{os::windows::process::CommandExt, process::Command};
     let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -201,10 +246,10 @@ $shortcut = $null
 try {
     $shortcut = $shell.CreateShortcut($env:TWILIGHT_LINK)
     $shortcut.TargetPath = $env:TWILIGHT_MANAGER
-    $shortcut.Arguments = '--open-dusklight'
+    $shortcut.Arguments = $env:TWILIGHT_OPEN_ARGUMENT
     $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:TWILIGHT_MANAGER)
     $shortcut.IconLocation = $env:TWILIGHT_GAME + ',0'
-    $shortcut.Description = 'Open Dusklight through Twilight Sync protected Play controls'
+    $shortcut.Description = 'Open the game through Twilight Sync protected Play controls'
     $shortcut.Save()
     $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
     $shortcut = $shell.CreateShortcut($env:TWILIGHT_LINK)
@@ -222,6 +267,7 @@ try {
     .env("TWILIGHT_LINK", destination)
     .env("TWILIGHT_MANAGER", manager)
     .env("TWILIGHT_GAME", game)
+    .env("TWILIGHT_OPEN_ARGUMENT", argument)
     .creation_flags(0x08000000)
     .output()?;
     ensure!(
@@ -233,7 +279,7 @@ try {
 }
 
 #[cfg(not(windows))]
-fn write_link(_: &Path, _: &Path, _: &Path) -> Result<LinkDetails> {
+fn write_link_argument(_: &Path, _: &Path, _: &Path, _: &str) -> Result<LinkDetails> {
     anyhow::bail!("Desktop shortcuts require Windows")
 }
 
@@ -269,6 +315,44 @@ mod tests {
             manager,
             game,
         })
+    }
+
+    #[test]
+    fn both_games_have_independent_managed_shortcuts_and_receipts() -> Result<()> {
+        let fixture = fixture()?;
+        let dusklight = create(
+            &fixture.root,
+            &fixture.desktop,
+            &fixture.manager,
+            &fixture.game,
+        )?;
+        let game = fixture
+            .game
+            .parent()
+            .context("Missing fixture folder")?
+            .join("totk.exe");
+        fs::write(&game, b"TotK fixture - never executed")?;
+        let totk = create_game(
+            &fixture.root,
+            &fixture.desktop,
+            &fixture.manager,
+            &game,
+            crate::protocol::GameId::Totk,
+        )?;
+        assert_ne!(dusklight, totk);
+        assert!(fixture.root.join(RECEIPT_NAME).is_file());
+        assert!(fixture.root.join("totk-desktop-shortcut.json").is_file());
+        assert_eq!(
+            create_game(
+                &fixture.root,
+                &fixture.desktop,
+                &fixture.manager,
+                &game,
+                crate::protocol::GameId::Totk
+            )?,
+            totk
+        );
+        Ok(())
     }
 
     #[test]
