@@ -455,13 +455,7 @@ impl Dashboard {
                 {
                     self.dispatch(Command::CheckSelfUpdate);
                 }
-                let safe = Self::management_available(snapshot)
-                    && !snapshot.self_updates.checking
-                    && !snapshot.totk.running
-                    && !snapshot.totk.busy
-                    && !snapshot.totk.launch_pending
-                    && snapshot.totk.lock.is_none()
-                    && snapshot.totk.remote_lock.is_none();
+                let safe = Self::update_blocker(snapshot).is_none();
                 if Self::primary(
                     ui,
                     safe && snapshot.self_updates.available(),
@@ -472,6 +466,11 @@ impl Dashboard {
                     self.confirm_app_update();
                 }
             });
+            if snapshot.self_updates.available()
+                && let Some(reason) = Self::update_blocker(snapshot)
+            {
+                Self::notice(ui, Tone::Info, "Update waiting", reason);
+            }
             Self::secondary(
                 ui,
                 "Automatic checks only read version metadata. Downloading and restarting always require confirmation.",
@@ -592,6 +591,32 @@ impl Dashboard {
                 }
             });
         });
+    }
+
+    fn update_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+        if snapshot.game_running
+            || snapshot.remote_game
+            || snapshot.totk.running
+            || snapshot.totk.remote_running
+        {
+            Some("Close the running game on both PCs before updating Twilight Sync.")
+        } else if snapshot.self_updates.checking {
+            Some("The release check is still running.")
+        } else if snapshot.self_updates.preparing || snapshot.install_busy || snapshot.texture_busy
+        {
+            Some("Finish the current installation or update first.")
+        } else if snapshot.pending_save
+            || snapshot.pending_iso
+            || snapshot.pending_recovery
+            || !snapshot.transfer.is_empty()
+            || snapshot.totk.busy
+            || snapshot.totk.launch_pending
+            || snapshot.totk.recovery_pending
+        {
+            Some("Finish or decline the pending save, transfer, launch, or recovery first.")
+        } else {
+            None
+        }
     }
 
     fn management_available(snapshot: &Snapshot) -> bool {
@@ -2539,6 +2564,34 @@ mod tests {
                 assert_eq!(game, GameId::Totk);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn app_update_button_ignores_stored_locks_but_explains_active_work() -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        let lock = crate::config::PlayLock {
+            owner: snapshot.public_key.clone(),
+            token: "a".repeat(64),
+        };
+        snapshot.settings.play_lock = Some(lock.clone());
+        snapshot.totk.lock = Some(lock.clone());
+        snapshot.totk.remote_lock = Some(lock);
+        assert!(Dashboard::update_blocker(&snapshot).is_none());
+        assert!(!Dashboard::management_available(&snapshot));
+        snapshot.totk.running = true;
+        assert!(
+            Dashboard::update_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("running game"))
+        );
+        snapshot.totk.running = false;
+        snapshot.totk.busy = true;
+        assert!(
+            Dashboard::update_blocker(&snapshot).is_some_and(|reason| reason.contains("pending"))
+        );
+        snapshot.totk.busy = false;
+        assert!(Dashboard::update_blocker(&snapshot).is_none());
+        assert!(snapshot.settings.play_lock.is_some() && snapshot.totk.lock.is_some());
         Ok(())
     }
 

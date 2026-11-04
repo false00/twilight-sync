@@ -256,19 +256,7 @@ impl Pump {
                 "Check Twilight Sync updates"
             });
         let can_update = snapshot.self_updates.available()
-            && !snapshot.self_updates.checking
-            && !snapshot.self_updates.preparing
-            && !snapshot.game_running
-            && !snapshot.remote_game
-            && !snapshot.totk.running
-            && !snapshot.totk.remote_running
-            && !snapshot.totk.busy
-            && !snapshot.totk.launch_pending
-            && snapshot.totk.lock.is_none()
-            && snapshot.totk.remote_lock.is_none()
-            && snapshot.settings.play_lock.is_none()
-            && !snapshot.install_busy
-            && !snapshot.texture_busy;
+            && super::Dashboard::update_blocker(&snapshot).is_none();
         self.tray.update_app.set_enabled(can_update);
         let update_text = if snapshot.self_updates.preparing {
             "Preparing verified app update...".into()

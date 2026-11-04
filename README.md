@@ -202,6 +202,25 @@ path, checksum or stale-progress guards.
 **Settings** or the tray menu if you prefer. The installer does not
 override a startup preference you already changed.
 
+### App updates and stored play reservations
+
+Use **Check for updates** followed by **Update Twilight Sync** in Settings or
+the tray. The app downloads and verifies the official stable release, waits
+for a clean shutdown, updates its executable and installer receipt, and
+restarts. No manual replacement or save migration is needed.
+
+From **v0.10.1**, a stored play reservation alone does not disable app updates.
+Reservations, pairing and saves remain intact across the restart; gameplay and
+save replacement still respect the reservations afterwards. Active games,
+launches, installations and transfers must finish first. A disabled update
+button displays its current blocking reason, and the tray uses the same rule.
+
+In **v0.9.0/v0.10.0**, an older shared management gate could disable Update
+because a completed play session left a reservation. If affected, use the
+app's normal completed-session recovery controls, then update in the app.
+Offline recovery applies only to that PC's record and warns that partner
+activity is unknown; do not reset pairing or overwrite save files to recover.
+
 ### Windows appearance
 
 The dashboard follows your Windows light/dark setting by default. Choose

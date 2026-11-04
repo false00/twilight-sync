@@ -890,6 +890,22 @@ impl Channel {
         Ok(())
     }
 
+    pub fn require_app_update_idle(&mut self) -> Result<()> {
+        ensure!(
+            !self.monitor.named_game_running("totk.exe") && !self.status.remote_running,
+            "Stop TotK on both devices before updating Twilight Sync"
+        );
+        ensure!(
+            !self.status.busy
+                && self.launch_request.is_none()
+                && self.child.is_none()
+                && self.recovery_request.is_none()
+                && self.recovery_pending.is_none(),
+            "Finish the current TotK launch, transfer, or recovery before updating Twilight Sync"
+        );
+        Ok(())
+    }
+
     pub fn game_running(&mut self) -> bool {
         self.monitor.named_game_running("totk.exe")
     }
@@ -2380,6 +2396,32 @@ mod tests {
                 .iter()
                 .any(|entry| entry.merge_parent.is_some())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_updates_preserve_durable_totk_reservations_without_unlocking_play() -> Result<()> {
+        let left_root = tempfile::tempdir()?;
+        let right_root = tempfile::tempdir()?;
+        let (mut left, mut right) = paired_channels(left_root.path(), right_root.path())?;
+        for request in left.launch(true, false)? {
+            right.handle(request)?;
+        }
+        left.reset();
+        right.reset();
+        let left_record = fs::read(left.root.join("session.json"))?;
+        let right_record = fs::read(right.root.join("session.json"))?;
+        assert!(left.require_app_update_idle().is_ok());
+        assert!(right.require_app_update_idle().is_ok());
+        assert!(left.require_update_idle().is_err());
+        assert!(right.require_update_idle().is_err());
+        assert_eq!(fs::read(left.root.join("session.json"))?, left_record);
+        assert_eq!(fs::read(right.root.join("session.json"))?, right_record);
+        left.status.busy = true;
+        assert!(left.require_app_update_idle().is_err());
+        left.status.busy = false;
+        left.monitor = ProcessMonitor::for_test(true);
+        assert!(left.require_app_update_idle().is_err());
         Ok(())
     }
 

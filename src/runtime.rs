@@ -328,6 +328,7 @@ struct DiscVerification {
 }
 
 struct Engine {
+    maintenance: bool,
     root: PathBuf,
     settings: Settings,
     default_profile: PathBuf,
@@ -441,6 +442,14 @@ fn texture_profile_stopped(
 }
 
 pub fn start() -> Result<Backend> {
+    start_with_desktop(true)
+}
+
+pub fn start_maintenance() -> Result<Backend> {
+    start_with_desktop(false)
+}
+
+fn start_with_desktop(desktop: bool) -> Result<Backend> {
     let root = config::root_directory()?;
     let instance = config::acquire_instance(&root)?;
     let settings = Settings::load(&root)?;
@@ -448,13 +457,19 @@ pub fn start() -> Result<Backend> {
     let audit = Audit::new(&root)?;
     let identity = Arc::new(Identity::load(&root)?);
     settings.persist(&root)?;
-    config::set_startup(settings.startup)?;
+    if desktop {
+        config::set_startup(settings.startup)?;
+    }
     audit.record(
         "manager-started",
         None,
         None,
         None,
-        "Startup preference applied; no network trusted implicitly",
+        if desktop {
+            "Startup preference applied; no network trusted implicitly"
+        } else {
+            "Maintenance session; desktop/startup registration left unchanged"
+        },
     )?;
     let (sender, receiver) = bounded(128);
     let mut initial = initial_snapshot(&settings, &identity.public);
@@ -469,6 +484,7 @@ pub fn start() -> Result<Backend> {
         sender.clone(),
         view.clone(),
     );
+    engine.maintenance = !desktop;
     thread::Builder::new()
         .name("twilight-manager".into())
         .spawn(move || {
@@ -488,7 +504,8 @@ pub fn start() -> Result<Backend> {
             if let Err(error) = engine.totk.refresh() {
                 engine.report(error);
             }
-            if let Some(install) = engine.totk.status.install_path.clone()
+            if desktop
+                && let Some(install) = engine.totk.status.install_path.clone()
                 && engine.totk.status.installed
                 && let Err(error) =
                     crate::desktop::install_totk_shortcut(&engine.root, &install.join("totk.exe"))
@@ -775,6 +792,7 @@ impl Engine {
         let mut totk = totk::Channel::new(root.join("totk-transfers"), totk::default_install());
         totk.identify(&identity.public, audit.username());
         Self {
+            maintenance: false,
             root,
             settings,
             default_profile,
@@ -1372,10 +1390,21 @@ impl Engine {
 
     fn require_self_update_idle(&mut self) -> Result<()> {
         self.game_running = self.process.game_running();
-        self.require_idle()?;
-        self.totk.require_update_idle()?;
         ensure!(
-            self.no_transfer() && self.child.is_none() && self.launch_pending.is_none(),
+            !self.game_running && !self.remote.as_ref().is_some_and(|remote| remote.game),
+            "Stop Dusklight on both devices before updating Twilight Sync"
+        );
+        ensure!(
+            !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
+            "Finish the current installation, texture operation, or app update"
+        );
+        self.totk.require_app_update_idle()?;
+        ensure!(
+            self.no_transfer()
+                && self.child.is_none()
+                && self.launch_pending.is_none()
+                && self.pending_recovery.is_none()
+                && self.requested_recovery.is_none(),
             "Finish gameplay and transfers before updating"
         );
         Ok(())
@@ -2585,6 +2614,14 @@ impl Engine {
 
     fn authenticated_event(&mut self, event: Event) -> Result<()> {
         let peer = self.peer_key()?;
+        ensure!(
+            !self.maintenance
+                || matches!(
+                    &event,
+                    Event::State { .. } | Event::Recover { .. } | Event::RecoveryApproved { .. }
+                ),
+            "Maintenance connections do not exchange game data or play grants"
+        );
         match event {
             Event::GamePacket { game, bytes } => {
                 ensure!(
@@ -3716,12 +3753,12 @@ impl Engine {
     fn send_state(&mut self) -> Result<()> {
         if self.ready() {
             self.send(&Event::State {
-                hash: if self.save_valid {
+                hash: if self.save_valid && !self.maintenance {
                     self.local_hash.clone()
                 } else {
                     None
                 },
-                save_ready: self.save_valid,
+                save_ready: self.save_valid && !self.maintenance,
                 game: self.game_running,
                 lock: self.settings.play_lock.clone(),
             })?;
@@ -4186,6 +4223,9 @@ impl Engine {
                 self.reload_textures()?;
             }
             self.refresh_save()?;
+            if self.maintenance {
+                return Ok(());
+            }
             self.snapshot_tick()?;
             self.sync_tick()?;
             let supported = self.game_channels_ready();
@@ -5382,6 +5422,35 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_state_never_requests_or_receives_game_data() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), Some(variant(2)))?;
+        harness.pair()?;
+        let before = harness.left.current_hash()?;
+        harness.left.maintenance = true;
+        harness.left.send_state()?;
+        harness.pump_until(|harness| {
+            harness
+                .right
+                .remote
+                .as_ref()
+                .is_some_and(|remote| !remote.save_ready)
+        })?;
+        harness.right.sync_tick()?;
+        assert!(harness.right.sent_save.is_none());
+        assert!(
+            harness
+                .left
+                .authenticated_event(Event::LeaseRequest {
+                    token: "a".repeat(64),
+                    hash: before.clone()
+                })
+                .is_err()
+        );
+        assert_eq!(harness.left.current_hash()?, before);
+        Ok(())
+    }
+
+    #[test]
     fn app_update_opt_out_and_network_failures_do_not_change_save_settings() -> Result<()> {
         let mut h = Harness::new(Some(variant(1)), None)?;
         let original = fs::read(h.left.root.join("settings.json"))?;
@@ -5430,6 +5499,24 @@ mod tests {
             !h.left.root.join("updates").try_exists()?,
             "No available release means no download or staging"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_update_guard_does_not_clear_or_block_a_durable_dusklight_reservation() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        harness.left.settings.play_lock = Some(PlayLock {
+            owner: harness.left.identity.public.clone(),
+            token: "a".repeat(64),
+        });
+        harness.left.settings.persist(&harness.left.root)?;
+        let before = fs::read(harness.left.root.join("settings.json"))?;
+        assert!(harness.left.require_self_update_idle().is_ok());
+        assert!(harness.left.require_idle().is_err());
+        assert_eq!(fs::read(harness.left.root.join("settings.json"))?, before);
+        assert!(harness.left.settings.play_lock.is_some());
+        harness.left.process = ProcessMonitor::for_test(true);
+        assert!(harness.left.require_self_update_idle().is_err());
         Ok(())
     }
 
