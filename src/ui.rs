@@ -1080,7 +1080,10 @@ impl Dashboard {
                 if matched {
                     Some(summary)
                 } else {
-                    state.remote_summary.as_ref()
+                    state
+                        .remote_summary
+                        .as_ref()
+                        .filter(|_| state.comparison_verified)
                 },
             );
         }
