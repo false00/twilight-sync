@@ -25,8 +25,10 @@ themes are included. No game assets or real save files are bundled.*
 - **Desktop to handheld:** pair two PCs once and sync over your home network.
 - **No connection required to play:** keep playing offline, then sync or compare
    your progress when both PCs are back online.
-- **See what you are choosing:** compare hearts, play time, items, collectibles,
-   and recorded milestones before replacing a save.
+- **One interface for both games:** shared Home and Games layouts, save cards,
+   comparison dialogs, approvals, and on-demand history previews.
+- **See what you are choosing:** compare hearts, rupees, and play time before
+   replacing a save, with verified game-specific details where available.
 - **Keep a way back:** preserved branches and compact snapshots let you restore
    an earlier version. Different progress never silently picks a winner.
 

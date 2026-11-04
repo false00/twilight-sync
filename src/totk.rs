@@ -705,6 +705,10 @@ impl Channel {
         Ok(())
     }
 
+    pub fn preview_history(&mut self, id: &str) -> Result<Summary> {
+        summary(&self.history()?.read(id)?)
+    }
+
     pub fn resolve(
         &mut self,
         local_hash: &str,
@@ -2231,6 +2235,50 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| entry.game == "TOTK")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn history_preview_is_read_only_for_success_and_failure() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut channel = fixture(root.path(), Some(b"retained progress"))?;
+        let profile = channel.profile()?;
+        let retained = snapshot(&profile)?.context("Missing retained save")?;
+        channel.capture(&retained, history::Reason::Observed)?;
+        let id = channel
+            .history()?
+            .find_hash(&retained.hash)?
+            .context("Missing preview entry")?;
+        fs::write(
+            profile
+                .join("save")
+                .join(ACCOUNT)
+                .join("slot_00/progress.sav"),
+            b"newer live progress",
+        )?;
+        let current = snapshot(&profile)?.context("Missing live progress")?;
+        let account = fs::read(profile.join("account.uid"))?;
+        let session = serde_json::to_value(&channel.session)?;
+        let preview = channel.preview_history(&id)?;
+        assert_eq!(
+            serde_json::to_value(&preview)?,
+            serde_json::to_value(summary(&retained.bytes)?)?
+        );
+        assert_eq!(
+            snapshot(&profile)?
+                .context("Preview changed the active save")?
+                .bytes,
+            current.bytes
+        );
+        assert_eq!(fs::read(profile.join("account.uid"))?, account);
+        assert_eq!(serde_json::to_value(&channel.session)?, session);
+        assert!(channel.preview_history("missing-history-entry").is_err());
+        assert_eq!(
+            snapshot(&profile)?
+                .context("Failed preview changed the active save")?
+                .bytes,
+            current.bytes
         );
         Ok(())
     }

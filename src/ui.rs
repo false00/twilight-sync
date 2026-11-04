@@ -13,6 +13,7 @@ const WINDOW_TITLE: &str = "Twilight Sync";
 
 mod background;
 mod design;
+mod game_view;
 mod icons;
 mod saves;
 
@@ -673,20 +674,18 @@ impl Dashboard {
     }
 
     fn reconcile_prompt(&mut self, context: &egui::Context, snapshot: &Snapshot) {
-        let Some(conflict) = &snapshot.conflict else {
+        let model = game_view::view(self.game, snapshot);
+        if !model.conflict {
             self.shown_fork = None;
             self.fork_dialog_open = false;
             self.fork_choice = None;
             return;
+        }
+        let (Some(local_hash), Some(remote_hash)) = (&model.local_hash, &model.remote_hash) else {
+            return;
         };
-        let fingerprint = (
-            conflict.local_hash.clone(),
-            conflict.remote_hash.clone(),
-            snapshot.pending_save,
-        );
-        if self.shown_fork.as_ref() != Some(&fingerprint)
-            && !snapshot.game_running
-            && !snapshot.remote_game
+        let fingerprint = (local_hash.clone(), remote_hash.clone(), model.pending);
+        if self.shown_fork.as_ref() != Some(&fingerprint) && !model.running && !model.remote_running
         {
             self.shown_fork = Some(fingerprint);
             self.fork_dialog_open = true;
@@ -695,18 +694,31 @@ impl Dashboard {
         if !self.fork_dialog_open {
             return;
         }
-        let available = Self::local_play_available(snapshot, true);
-        let (close, command) = saves::prompt(
-            context,
-            snapshot,
-            &mut self.fork_choice,
-            available,
-            Self::can_reconcile(snapshot),
-        );
+        let (close, action) = game_view::prompt(context, &model, &mut self.fork_choice);
         if close {
             self.fork_dialog_open = false;
         }
-        if let Some(command) = command {
+        if let Some(action) = action {
+            let command = match (self.game, action) {
+                (GameId::Dusklight, game_view::CompareAction::Use(use_remote)) => {
+                    Command::ResolveConflict {
+                        local_hash: local_hash.clone(),
+                        remote_hash: remote_hash.clone(),
+                        use_remote,
+                    }
+                }
+                (GameId::Totk, game_view::CompareAction::Use(use_remote)) => Command::ResolveTotk {
+                    local_hash: local_hash.clone(),
+                    remote_hash: remote_hash.clone(),
+                    use_remote,
+                },
+                (GameId::Dusklight, game_view::CompareAction::Continue) => Command::ContinueLocal {
+                    expected: Some(local_hash.clone()),
+                },
+                (GameId::Totk, game_view::CompareAction::Continue) => Command::ContinueTotk {
+                    expected: Some(local_hash.clone()),
+                },
+            };
             self.dispatch(command);
         }
     }
@@ -750,141 +762,97 @@ impl Dashboard {
         *game != before
     }
 
-    fn totk_summary(
-        ui: &mut egui::Ui,
-        summary: &crate::totk::Summary,
-        other: Option<&crate::totk::Summary>,
-    ) {
-        Self::secondary(
-            ui,
-            format!(
-                "{} files / {:.1} MiB / {} album files",
-                summary.files,
-                summary.bytes as f64 / 1_048_576.0,
-                summary.album_files
-            ),
-        );
-        let mut slots: Vec<_> = summary.slots.iter().collect();
-        slots.sort_by(|left, right| {
-            right
-                .details
-                .as_ref()
-                .and_then(|details| details.saved_at.as_deref())
-                .cmp(
-                    &left
-                        .details
-                        .as_ref()
-                        .and_then(|details| details.saved_at.as_deref()),
-                )
-                .then(left.number.cmp(&right.number))
-        });
-        for slot in slots {
-            let matches = other
-                .and_then(|other| other.slots.iter().find(|other| other.number == slot.number))
-                .is_some_and(|other| other.hash == slot.hash);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Slot {}", slot.number + 1)).font(semibold(14.0)));
-                if let Some(details) = &slot.details {
-                    if let Some(autosave) = details.autosave {
-                        ui.label(if autosave { "Autosave" } else { "Manual save" });
-                    }
-                    if let Some(saved) = &details.saved_at {
-                        ui.label(saved);
-                    }
-                } else {
-                    ui.label(format!(
-                        "{} files / {:.1} MiB",
-                        slot.files,
-                        slot.bytes as f64 / 1_048_576.0
-                    ));
-                }
-                if other.is_some() {
-                    ui.label(if matches {
-                        "Matching revision"
-                    } else {
-                        "Different revision"
-                    });
-                }
-            });
-            if let Some(details) = &slot.details {
-                let mut values = Vec::new();
-                if let Some(hearts) = details.max_hearts {
-                    values.push(if hearts.fract() == 0.0 {
-                        format!("{hearts:.0} hearts")
-                    } else {
-                        format!("{hearts:.2} hearts")
-                    });
-                }
-                if let Some(rupees) = details.rupees {
-                    values.push(format!("{rupees} rupees"));
-                }
-                if let Some(seconds) = details.play_seconds {
-                    values.push(format!(
-                        "{}h {:02}m played",
-                        seconds / 3600,
-                        seconds / 60 % 60
-                    ));
-                }
-                if let Some(stamina) = details.stamina_wheels {
-                    values.push(format!("{stamina:.1} stamina wheels"));
-                }
-                ui.add(egui::Label::new(values.join(" / ")).wrap());
-                ui.push_id(slot.number, |ui| {
-                    ui.collapsing("Location and save details", |ui| {
-                        if let Some(map) = &details.map {
-                            let location = if map == "MainField" {
-                                "Overworld"
-                            } else if map.starts_with("Dungeon") {
-                                "Shrine"
-                            } else {
-                                "Map"
-                            };
-                            ui.label(format!("{location}: {map}"));
-                        }
-                        if let Some([east, altitude, north]) = details.position {
-                            ui.label(format!(
-                                "World position: {east:.0}, {altitude:.0}, {north:.0}"
-                            ));
-                        }
-                        Self::secondary(
-                            ui,
-                            format!(
-                                "Save format {} / {} files / {:.1} MiB",
-                                details.format,
-                                slot.files,
-                                slot.bytes as f64 / 1_048_576.0
-                            ),
-                        );
-                    });
-                });
-            } else if let Some(reason) = &slot.details_error {
-                Self::secondary(ui, reason);
+    fn game_action(&mut self, snapshot: &Snapshot, game: GameId, action: game_view::Action) {
+        match action {
+            game_view::Action::Play => match game {
+                GameId::Dusklight => self.start_play(snapshot),
+                GameId::Totk => self.dispatch(Command::LaunchTotk { local_only: false }),
+            },
+            game_view::Action::Sync => self.dispatch(match game {
+                GameId::Dusklight => Command::SendSave,
+                GameId::Totk => Command::SendTotk,
+            }),
+            game_view::Action::Compare => {
+                self.fork_choice = None;
+                self.fork_dialog_open = true;
             }
-            ui.add_space(8.0);
+            game_view::Action::History => {
+                self.page = Page::History;
+                self.dispatch(match game {
+                    GameId::Dusklight => Command::HistoryPage(None),
+                    GameId::Totk => Command::TotkHistoryPage(None),
+                });
+            }
+            game_view::Action::Refresh => self.dispatch(match game {
+                GameId::Dusklight => Command::RefreshSave,
+                GameId::Totk => Command::RefreshTotk,
+            }),
+            game_view::Action::Setup => self.page = Page::Library,
+            game_view::Action::Devices => self.page = Page::Devices,
+            game_view::Action::Incoming(approved) => {
+                let confirmed = !approved || rfd::MessageDialog::new().set_title(format!("Accept {} save", game_view::title(game)))
+                    .set_description("Replace this PC's complete active save with the incoming snapshot? Existing progress is retained in history or rollback storage; the game's safety checks still apply.")
+                    .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                if confirmed {
+                    self.dispatch(game_view::incoming_command(game, approved));
+                }
+            }
+            game_view::Action::Recovery(approved) => self.dispatch(match game {
+                GameId::Dusklight => Command::AcceptRecovery(approved),
+                GameId::Totk => Command::AcceptTotkRecovery(approved),
+            }),
+            game_view::Action::Home => self.page = Page::Overview,
+            game_view::Action::Locate => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(format!("Locate {}", game_view::title(game)))
+                    .add_filter("Windows game executable", &["exe"])
+                    .pick_file()
+                {
+                    self.dispatch(match game {
+                        GameId::Dusklight => Command::SetExecutable(path),
+                        GameId::Totk => Command::SetTotkExecutable(path),
+                    });
+                }
+            }
+            game_view::Action::Recover => {
+                let approved = rfd::MessageDialog::new().set_title("Recover completed game session")
+                    .set_description(if snapshot.ready {
+                        "Confirm this game is closed on both PCs. The paired manager must approve recovery. No save will be replaced."
+                    } else {
+                        "Confirm this PC's game session has ended. Partner activity is unknown; offline recovery does not replace progress and may require branch reconciliation after reconnection."
+                    }).set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                if approved {
+                    self.dispatch(match game {
+                        GameId::Dusklight => Command::Recover,
+                        GameId::Totk => Command::RecoverTotk,
+                    });
+                }
+            }
         }
     }
 
-    fn totk_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        Self::section_title(ui, "Tears of the Kingdom");
-        if let Some(path) = &snapshot.totk.install_path {
-            ui.add(egui::Label::new(RichText::new(path.display().to_string()).monospace()).wrap());
+    fn game_home(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let model = game_view::view(self.game, snapshot);
+        if let Some(action) = game_view::home(ui, &model) {
+            self.game_action(snapshot, model.game, action);
         }
-        ui.add_space(12.0);
-        if ui
-            .add_enabled(
-                !snapshot.totk.running && !snapshot.totk.busy && snapshot.totk.lock.is_none(),
-                egui::Button::new("Locate totk.exe..."),
-            )
-            .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .set_title("Native TotK executable")
-                .add_filter("Windows executable", &["exe"])
-                .pick_file()
-        {
-            self.dispatch(Command::SetTotkExecutable(path));
+    }
+
+    fn game_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let model = game_view::view(self.game, snapshot);
+        if let Some(action) = game_view::installation(ui, &model) {
+            self.game_action(snapshot, model.game, action);
         }
-        ui.add_space(16.0);
-        self.totk(ui, snapshot);
+        if self.game == GameId::Dusklight {
+            self.library(ui, snapshot);
+        } else {
+            ui.add_space(16.0);
+            Self::section_title(ui, "Game tools");
+            Self::secondary(
+                ui,
+                "Native installation managed separately. Save sync, protected play, comparison and history are available in Save controls.",
+            );
+        }
     }
 
     fn totk_session_blocker(snapshot: &Snapshot) -> Option<&str> {
@@ -958,461 +926,6 @@ impl Dashboard {
                 None
             }
         })
-    }
-
-    fn totk(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let state = &snapshot.totk;
-        let idle = state.installed
-            && !state.running
-            && !state.remote_running
-            && !state.busy
-            && !state.launch_pending
-            && state.lock.is_none()
-            && state.remote_lock.is_none()
-            && !snapshot.self_updates.preparing;
-        let play_blocker = Self::totk_play_blocker(snapshot);
-        let sync_blocker = Self::totk_sync_blocker(snapshot);
-        let matched = snapshot.ready
-            && !state.running
-            && !state.remote_running
-            && state.remote_save_ready
-            && state.verification_error.is_none()
-            && state.local_hash.is_some()
-            && state.local_hash == state.remote_hash;
-        ui.horizontal_wrapped(|ui| {
-            if Self::primary(ui, play_blocker.is_none(), "Play Tears of the Kingdom")
-                .on_disabled_hover_text(play_blocker.unwrap_or_default())
-                .clicked()
-            {
-                self.dispatch(Command::LaunchTotk { local_only: false });
-            }
-            if ui
-                .add_enabled(sync_blocker.is_none(), egui::Button::new("Send to partner"))
-                .on_disabled_hover_text(sync_blocker.unwrap_or_default())
-                .clicked()
-            {
-                self.dispatch(Command::SendTotk);
-            }
-            if ui.button("Save history").clicked() {
-                self.page = Page::History;
-                self.dispatch(Command::TotkHistoryPage(None));
-            }
-        });
-        if let Some(reason) = play_blocker {
-            Self::secondary(ui, format!("Play unavailable: {reason}"));
-        }
-        if let Some(reason) = sync_blocker {
-            Self::secondary(ui, format!("Sync status: {reason}"));
-        }
-        if matched {
-            ui.label(
-                RichText::new("Synchronized: both committed save snapshots match.")
-                    .color(Palette::of(ui).success),
-            );
-        }
-        if let Some(verified) = &state.verified_at {
-            Self::secondary(ui, format!("Save checked: {verified}"));
-        }
-        if state.launch_pending {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Reserving play on the paired PC...");
-            });
-        }
-        ui.add_space(16.0);
-        let local = if state.verification_error.is_some() {
-            "Save verification needs attention".to_owned()
-        } else if !state.checked {
-            "Not checked".to_owned()
-        } else if !state.installed {
-            "Not installed".to_owned()
-        } else if state.running {
-            "Game running".to_owned()
-        } else if state.local_hash.is_none() {
-            "No committed save yet".to_owned()
-        } else {
-            format!(
-                "{} files, {:.1} MiB",
-                state.local_files,
-                state.local_size as f64 / (1024.0 * 1024.0)
-            )
-        };
-        Self::section_title(ui, "This PC");
-        ui.label(local);
-        if let Some(hash) = &state.local_hash {
-            Self::secondary(ui, format!("Save: {}", &hash[..12]));
-        }
-        ui.add_space(16.0);
-        Self::section_title(ui, snapshot.peer_name.as_deref().unwrap_or("Paired PC"));
-        ui.label(if !snapshot.ready {
-            "Offline".to_owned()
-        } else if !state.peer_checked {
-            "Not checked".to_owned()
-        } else if !state.remote_installed {
-            "Not installed".to_owned()
-        } else if state.remote_running {
-            "Game running".to_owned()
-        } else if state.remote_hash.is_none() {
-            "No committed save yet".to_owned()
-        } else if !state.remote_save_ready || state.verification_error.is_some() {
-            "Save verification needs attention".to_owned()
-        } else if state.remote_hash == state.local_hash {
-            "Saves match".to_owned()
-        } else {
-            format!("{} files; different progress", state.remote_files)
-        });
-        if let Some(hash) = &state.remote_hash {
-            Self::secondary(ui, format!("Save: {}", &hash[..12]));
-        }
-        ui.add_space(12.0);
-        if let Some(summary) = &state.local_summary {
-            Self::section_title(
-                ui,
-                if matched {
-                    "Saved progress on both PCs"
-                } else {
-                    "This PC's saved progress"
-                },
-            );
-            Self::totk_summary(
-                ui,
-                summary,
-                if matched {
-                    Some(summary)
-                } else {
-                    state
-                        .remote_summary
-                        .as_ref()
-                        .filter(|_| state.comparison_verified)
-                },
-            );
-        }
-        if !matched
-            && let Some(summary) = state
-                .remote_summary
-                .as_ref()
-                .filter(|_| state.comparison_verified)
-        {
-            ui.add_space(12.0);
-            Self::section_title(ui, "Partner's verified saved progress");
-            Self::totk_summary(ui, summary, state.local_summary.as_ref());
-        }
-        if state.conflict {
-            ui.add_space(12.0);
-            Self::section_title(ui, "Different save branches");
-            if !state.comparison_verified {
-                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label("The partner's complete snapshot is being verified before a branch can be chosen."); });
-            }
-            ui.horizontal_wrapped(|ui| {
-                for (label, use_remote) in [("Keep this PC's save", false), ("Use partner's save", true)] {
-                    if ui.add_enabled(idle && snapshot.ready && state.comparison_verified, egui::Button::new(label)).clicked()
-                        && let (Some(local_hash), Some(remote_hash)) = (&state.local_hash, &state.remote_hash)
-                    {
-                        let approved = rfd::MessageDialog::new().set_title("Choose complete TotK save")
-                            .set_description(if use_remote { "Replace this PC's active TotK save with the displayed partner branch? The current branch remains in history." }
-                                else { "Offer this PC's complete TotK save to the partner? Their approval is required before replacing different progress." })
-                            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
-                        if approved { self.dispatch(Command::ResolveTotk { local_hash: local_hash.clone(), remote_hash: remote_hash.clone(), use_remote }); }
-                    }
-                }
-                if ui.add_enabled(idle, egui::Button::new("Keep both; play this PC")).clicked() {
-                    self.dispatch(Command::ContinueTotk { expected: state.local_hash.clone() });
-                }
-            });
-        }
-        ui.add_space(16.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!state.busy, egui::Button::new(symbol("\u{e72c}", 18.0)))
-                .on_hover_text("Check TotK saves on both PCs")
-                .clicked()
-            {
-                self.dispatch(Command::RefreshTotk);
-            }
-        });
-        if !state.message.is_empty() {
-            ui.add_space(12.0);
-            ui.label(&state.message);
-        }
-        if state.pending {
-            ui.add_space(16.0);
-            ui.separator();
-            Self::section_title(ui, "Incoming TotK saves");
-            ui.horizontal_wrapped(|ui| {
-                let can_accept = !state.running
-                    && !state.remote_running
-                    && !snapshot.self_updates.preparing
-                    && state.verification_error.is_none()
-                    && state.lock.is_none()
-                    && state.remote_lock.is_none();
-                if ui
-                    .add_enabled(can_accept, egui::Button::new("Accept partner's saves"))
-                    .on_disabled_hover_text(
-                        play_blocker.unwrap_or(
-                            "Finish the active game or session before replacing this save.",
-                        ),
-                    )
-                    .clicked()
-                {
-                    self.dispatch(Command::AcceptTotk(true));
-                }
-                if ui.button("Keep this PC's progress").clicked() {
-                    self.dispatch(Command::AcceptTotk(false));
-                }
-            });
-        }
-        if state.lock.is_some()
-            && !state.running
-            && !state.remote_running
-            && !state.busy
-            && ui
-                .add_enabled(
-                    snapshot.ready
-                        || state
-                            .lock
-                            .as_ref()
-                            .is_some_and(|lock| lock.owner == snapshot.public_key),
-                    egui::Button::new("Recover completed TotK session..."),
-                )
-                .clicked()
-        {
-            let approved = rfd::MessageDialog::new().set_title("Recover TotK session")
-                .set_description(if snapshot.ready {
-                    "Confirm TotK is closed on both PCs. Your partner must approve recovery of the stored play lock; saves will not be replaced."
-                } else {
-                    "Confirm this PC's TotK session has ended. Only this PC's own reservation is released; the partner's reservation remains until reconnection. Offline branches may need later comparison."
-                })
-                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
-            if approved {
-                self.dispatch(Command::RecoverTotk);
-            }
-        }
-        if state.recovery_pending {
-            ui.add_space(12.0);
-            Self::section_title(ui, "Partner requests TotK session recovery");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Approve recovery").clicked() {
-                    self.dispatch(Command::AcceptTotkRecovery(true));
-                }
-                if ui.button("Keep session locked").clicked() {
-                    self.dispatch(Command::AcceptTotkRecovery(false));
-                }
-            });
-        }
-    }
-
-    fn overview(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let p = Palette::of(ui);
-        Self::card(ui, |ui| {
-            let (label, color) = if snapshot.game_running {
-                ("Dusklight is running on this PC", p.warning)
-            } else if snapshot.remote_game {
-                ("Your partner is playing", p.warning)
-            } else if snapshot.ready {
-                ("Connected securely", p.success)
-            } else if snapshot.settings.game_exe.is_some() {
-                ("Ready to play offline", p.accent)
-            } else {
-                ("Connect your other PC", p.text)
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(symbol("\u{e968}", 22.0).color(color));
-                ui.label(RichText::new(label).font(semibold(20.0)).color(color));
-            });
-            if let Some(peer) = &snapshot.settings.peer {
-                Self::secondary(ui, format!("Partner: {}", peer.name));
-            }
-            Self::secondary(ui, &snapshot.message);
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
-                    self.start_play(snapshot);
-                }
-                if snapshot.ready {
-                    if ui
-                        .add_enabled(
-                            snapshot.save_ready
-                                && snapshot.local_hash.is_some()
-                                && Self::management_available(snapshot)
-                                && snapshot.transfer.is_empty(),
-                            egui::Button::new("Send this save"),
-                        )
-                        .clicked()
-                    {
-                        self.dispatch(Command::SendSave);
-                    }
-                    if ui.button("Connection details").clicked() {
-                        self.page = Page::Devices;
-                    }
-                } else {
-                    if ui.button("Connection details").clicked() {
-                        self.page = Page::Devices;
-                    }
-                    if snapshot.settings.game_exe.is_none()
-                        && ui.button("Set up Dusklight").clicked()
-                    {
-                        self.page = Page::Library;
-                    }
-                }
-            });
-            if !snapshot.ready {
-                Self::secondary(
-                    ui,
-                    "Partner offline. Your progress stays on this PC until you reconnect.",
-                );
-            } else if snapshot.settings.game_exe.is_none() {
-                Self::secondary(
-                    ui,
-                    "Select or install Dusklight on the Dusklight page before playing.",
-                );
-            } else if snapshot.settings.save_file.is_none() {
-                Self::secondary(
-                    ui,
-                    "Automatic save detection needs attention. Check the status message; no folder selection is needed.",
-                );
-            }
-            if snapshot.ready && snapshot.settings.play_lock.is_none() {
-                Self::secondary(ui, "Protected launch allows one game session at a time.");
-            }
-        });
-
-        let network_approved = snapshot.network.as_ref().is_some_and(|network| {
-            snapshot.settings.network.as_deref() == Some(network.fingerprint.as_str())
-        });
-        if !network_approved
-            || snapshot.settings.peer.is_none()
-            || snapshot.settings.game_exe.is_none()
-        {
-            ui.add_space(12.0);
-            Self::card(ui, |ui| {
-                Self::section_title(ui, "Finish setup");
-                if !network_approved {
-                    Self::setting_row(
-                        ui,
-                        "Approve your home network",
-                        "Check the router on each PC before enabling discovery.",
-                        |ui| {
-                            if ui.button("Open devices").clicked() {
-                                self.page = Page::Devices;
-                            }
-                        },
-                    );
-                }
-                if snapshot.settings.peer.is_none() {
-                    if !network_approved {
-                        ui.separator();
-                    }
-                    Self::setting_row(
-                        ui,
-                        "Pair your other PC",
-                        "Open pairing on both. Compare codes from only one device.",
-                        |ui| {
-                            if ui.button("Pair a device").clicked() {
-                                self.page = Page::Devices;
-                            }
-                        },
-                    );
-                }
-                if snapshot.settings.game_exe.is_none() {
-                    ui.separator();
-                    Self::setting_row(
-                        ui,
-                        "Locate or install Dusklight",
-                        "Use your own game and disc image. Nothing launches automatically.",
-                        |ui| {
-                            if ui.button("Open Dusklight").clicked() {
-                                self.page = Page::Library;
-                            }
-                        },
-                    );
-                }
-            });
-        }
-        ui.add_space(12.0);
-        Self::card(ui, |ui| {
-            Self::section_title(ui, "Automatic save sync");
-            let matching =
-                snapshot.local_hash.is_some() && snapshot.local_hash == snapshot.remote_hash;
-            let (state, color) = if matching {
-                ("Both copies match", p.success)
-            } else if snapshot.local_hash.is_some() && snapshot.remote_hash.is_some() {
-                ("Different copies - approval may be required", p.warning)
-            } else if snapshot.local_hash.is_some() {
-                ("Local save is ready", p.success)
-            } else if snapshot.settings.save_file.is_some() && snapshot.save_ready {
-                (
-                    "No save yet - ready for Dusklight or your partner",
-                    p.secondary,
-                )
-            } else {
-                ("Automatic detection needs attention", p.warning)
-            };
-            Self::status(ui, "Status", state, color);
-            if let Some(summary) = &snapshot.local_save {
-                ui.add_space(8.0);
-                saves::progress(ui, summary);
-            }
-            Self::secondary(
-                ui,
-                "Uses the standard save inside Dusklight's active profile, including its own portable or custom profile. No folders to choose.",
-            );
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                if snapshot.conflict.is_some() && ui.button("Compare save branches").clicked() {
-                    self.fork_dialog_open = true;
-                }
-                if ui.button("View history").clicked() {
-                    self.page = Page::History;
-                }
-            });
-            Self::secondary(ui, "A PC without a save is ready to receive automatically.");
-            ui.collapsing("Save details", |ui| {
-                if let Some(path) = &snapshot.settings.save_file {
-                    Self::secondary(
-                        ui,
-                        if crate::files::is_raw(path) {
-                            "Storage: Raw memory card"
-                        } else {
-                            "Storage: GCI folder"
-                        },
-                    );
-                    Self::path(ui, path);
-                }
-                if let Some(hash) = &snapshot.local_hash {
-                    ui.label(RichText::new(format!("Local SHA-256: {hash}")).monospace());
-                }
-                if let Some(hash) = &snapshot.remote_hash {
-                    ui.label(RichText::new(format!("Partner SHA-256: {hash}")).monospace());
-                }
-            });
-        });
-        if snapshot.settings.play_lock.is_some() {
-            ui.add_space(12.0);
-            Self::card(ui, |ui| {
-                Self::setting_row(
-                    ui,
-                    "Previous session needs attention",
-                    "Stop Dusklight before recovery. Offline recovery keeps local progress separate from your partner's.",
-                    |ui| {
-                        if ui
-                            .add_enabled(
-                                !snapshot.game_running && !snapshot.remote_game,
-                                egui::Button::new("Request recovery"),
-                            )
-                            .clicked()
-                        {
-                            let approved = snapshot.ready || rfd::MessageDialog::new()
-                                .set_title("Recover local session offline?")
-                                .set_description("Confirm Dusklight is stopped on this PC. Partner activity is unknown. Both save branches will require reconciliation if they differ when you reconnect.")
-                                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
-                            if approved {
-                                self.dispatch(Command::Recover);
-                            }
-                        }
-                    },
-                );
-            });
-        }
     }
 
     fn devices(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -1648,42 +1161,6 @@ impl Dashboard {
     fn library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let p = Palette::of(ui);
         let available = Self::management_available(snapshot);
-        Self::card(ui, |ui| {
-            Self::section_title(ui, "Game installation");
-            if let Some(path) = &snapshot.settings.game_exe {
-                Self::path(ui, path);
-            } else {
-                Self::secondary(
-                    ui,
-                    "No game selected. Locate an existing copy or install the official Windows release.",
-                );
-            }
-            if let Some(version) = &snapshot.selected_release {
-                Self::status(ui, "Installed version", version, p.success);
-            }
-            ui.horizontal_wrapped(|ui| {
-                if Self::primary(ui, Self::can_launch(snapshot), "Play Dusklight").clicked() {
-                    self.start_play(snapshot);
-                }
-                if ui
-                    .add_enabled(available, egui::Button::new("Locate dusklight.exe..."))
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Dusklight executable", &["exe"])
-                        .pick_file()
-                {
-                    self.dispatch(Command::SetExecutable(path));
-                }
-            });
-            Self::secondary(
-                ui,
-                if snapshot.ready {
-                    "Partner connected. Online play protection is available."
-                } else {
-                    "Offline play is available. Saves remain on this PC until your partner returns."
-                },
-            );
-        });
         ui.add_space(12.0);
         Self::card(ui, |ui| {
             Self::section_title(ui, "Dusklight updates");
@@ -2148,6 +1625,9 @@ impl Dashboard {
                 Self::setting_row(ui, &format!("#{}  {}", entry.sequence, if entry.merge_parent.is_some() { "Reconciled save" } else { entry.reason.label() }),
                     &format!("{}  /  {}", entry.timestamp, entry.username),
                     |ui| {
+                        if ui.button("Preview").clicked() {
+                            self.dispatch(Command::PreviewHistory { game: self.game, id: entry.id.clone() });
+                        }
                         if current {
                             ui.label(RichText::new("Current save").color(p.success));
                         } else if ui.add_enabled(can_restore, egui::Button::new("Restore...")).clicked() {
@@ -2180,14 +1660,10 @@ impl Dashboard {
                         }
                     },
                 );
-                if let Some(summary) = &entry.summary {
-                    saves::brief(ui, summary);
-                    if !entry.changes.is_empty() {
-                        saves::changes(ui, &entry.changes);
-                    }
-                    ui.collapsing("Progress and inventory", |ui| saves::progress(ui, summary));
-                } else {
-                    Self::secondary(ui, "Progress details unavailable for this snapshot.");
+                if let Some(preview) = snapshot.history_preview.as_ref().filter(|preview| preview.game == self.game && preview.id == entry.id) {
+                    ui.add_space(10.0);
+                    game_view::history_preview(ui, preview);
+                    if ui.button("Close preview").clicked() { self.dispatch(Command::ClearHistoryPreview); }
                 }
                 ui.collapsing("Snapshot details", |ui| {
                     Self::secondary(ui, format!("Game: {} / {}", entry.game, entry.name));
@@ -2305,24 +1781,14 @@ impl Dashboard {
 
     fn approvals(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let p = Palette::of(ui);
-        if snapshot.pending_save {
-            Self::card(ui, |ui| {
-                ui.label(
-                    RichText::new("A save replacement needs your consent")
-                        .color(p.warning)
-                        .font(semibold(16.0)),
-                );
-                ui.label("Both save branches are preserved. Review the progress comparison before replacing your copy.");
-                ui.horizontal_wrapped(|ui| {
-                    if Self::primary(ui, true, "Compare branches").clicked() {
-                        self.fork_dialog_open = true;
-                    }
-                    if ui.button("Keep my save").clicked() {
-                        self.dispatch(Command::AcceptSave(false));
-                    }
-                });
-            });
-            ui.add_space(12.0);
+        for game in [GameId::Dusklight, GameId::Totk] {
+            let model = game_view::view(game, snapshot);
+            if let Some(action) = game_view::approval(ui, &model) {
+                if action == game_view::Action::Compare {
+                    self.game = game;
+                }
+                self.game_action(snapshot, game, action);
+            }
         }
         if snapshot.pending_iso {
             Self::card(ui, |ui| {
@@ -2357,28 +1823,6 @@ impl Dashboard {
                     }
                     if ui.button("Decline image").clicked() {
                         self.dispatch(Command::AcceptIso(None));
-                    }
-                });
-            });
-            ui.add_space(12.0);
-        }
-        if snapshot.pending_recovery {
-            Self::card(ui, |ui| {
-                ui.label(
-                    RichText::new("Crash recovery - check both devices")
-                        .color(p.warning)
-                        .font(semibold(16.0)),
-                );
-                ui.label("Confirm no Dusklight process is running on either device. Do not approve just because the other device disconnected.");
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("Both games are stopped - approve recovery")
-                        .clicked()
-                    {
-                        self.dispatch(Command::AcceptRecovery(true));
-                    }
-                    if ui.button("Decline recovery").clicked() {
-                        self.dispatch(Command::AcceptRecovery(false));
                     }
                 });
             });
@@ -2664,14 +2108,10 @@ impl eframe::App for Dashboard {
                         }
                         self.approvals(ui, &snapshot);
                         match self.page {
-                            Page::Overview if self.game == GameId::Totk => self.totk(ui, &snapshot),
-                            Page::Overview => self.overview(ui, &snapshot),
-                            Page::Totk => self.totk(ui, &snapshot),
+                            Page::Overview => self.game_home(ui, &snapshot),
+                            Page::Totk => self.game_home(ui, &snapshot),
                             Page::Devices => self.devices(ui, &snapshot),
-                            Page::Library if self.game == GameId::Totk => {
-                                self.totk_library(ui, &snapshot)
-                            }
-                            Page::Library => self.library(ui, &snapshot),
+                            Page::Library => self.game_library(ui, &snapshot),
                             Page::Textures => self.textures(ui, &snapshot),
                             Page::History => self.history(ui, &snapshot),
                             Page::Security => self.security(ui, &snapshot),
@@ -2691,9 +2131,7 @@ impl eframe::App for Dashboard {
                         ui.add_space(8.0);
                     });
             });
-        if self.game == GameId::Dusklight {
-            self.reconcile_prompt(context, &snapshot);
-        }
+        self.reconcile_prompt(context, &snapshot);
         context.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -2822,7 +2260,8 @@ mod tests {
                     |context| {
                         egui::CentralPanel::default().show(context, |ui| {
                             Dashboard::game_picker(ui, &mut game);
-                            Dashboard::totk_summary(ui, &summary, Some(&partner));
+                            game_view::progress(ui, &game_view::totk_cards(&summary));
+                            game_view::progress(ui, &game_view::totk_cards(&partner));
                         });
                     },
                 );

@@ -66,6 +66,7 @@ pub struct Snapshot {
     pub texture_busy: bool,
     pub textures: textures::State,
     pub history: history::Page,
+    pub history_preview: Option<HistoryPreview>,
     pub self_updates: self_update::State,
     pub totk: totk::Status,
     pub message: String,
@@ -82,6 +83,19 @@ pub struct SaveConflict {
     pub remote: Option<save_data::Summary>,
 }
 
+#[derive(Clone)]
+pub enum HistoryPreviewData {
+    Dusklight(save_data::Summary),
+    Totk(totk::Summary),
+}
+
+#[derive(Clone)]
+pub struct HistoryPreview {
+    pub game: protocol::GameId,
+    pub id: String,
+    pub data: HistoryPreviewData,
+}
+
 pub enum Command {
     DesktopError(String),
     DesktopRecovered(String),
@@ -96,6 +110,7 @@ pub enum Command {
     SetStartup(bool),
     SendSave,
     AcceptSave(bool),
+    RefreshSave,
     RefreshTotk,
     SendTotk,
     AcceptTotk(bool),
@@ -151,6 +166,11 @@ pub enum Command {
     RecoverTextures,
     RefreshTextures,
     HistoryPage(Option<String>),
+    PreviewHistory {
+        game: protocol::GameId,
+        id: String,
+    },
+    ClearHistoryPreview,
     RestoreSnapshot {
         id: String,
         expected: Option<String>,
@@ -390,6 +410,7 @@ struct Engine {
     history_candidate: Option<(String, Instant)>,
     history_last_hash: Option<String>,
     history_cursor: Option<String>,
+    history_preview: Option<HistoryPreview>,
     migrated_backups: bool,
     self_updates: self_update::State,
     last_self_update_check: Option<Instant>,
@@ -769,6 +790,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         texture_busy: false,
         textures: textures::State::default(),
         history: history::Page::default(),
+        history_preview: None,
         self_updates: self_update::State::default(),
         totk: totk::Status::default(),
         message: "Loading compact history and checking your private LAN...".into(),
@@ -854,6 +876,7 @@ impl Engine {
             history_candidate: None,
             history_last_hash: None,
             history_cursor: None,
+            history_preview: None,
             migrated_backups: false,
             self_updates: self_update::State::default(),
             last_self_update_check: None,
@@ -1553,6 +1576,10 @@ impl Engine {
         match command {
             Command::DesktopError(detail) => bail!("{detail}"),
             Command::DesktopRecovered(detail) => clear_desktop_error(&mut self.error, &detail),
+            Command::RefreshSave => {
+                self.refresh_save()?;
+                self.refresh_history()?;
+            }
             Command::RefreshTotk => {
                 self.totk.refresh()?;
                 if self.game_channels_ready() {
@@ -2112,6 +2139,25 @@ impl Engine {
                 ensure!(!self.texture_busy, "Wait for the texture operation");
                 self.reload_textures()?;
             }
+            Command::PreviewHistory { game, id } => {
+                self.history_preview = None;
+                let data = match game {
+                    protocol::GameId::Dusklight => {
+                        self.ensure_history()?;
+                        let bytes = self
+                            .history
+                            .as_ref()
+                            .context("Save history is not available")?
+                            .read(&id)?;
+                        HistoryPreviewData::Dusklight(save_data::inspect(&bytes)?)
+                    }
+                    protocol::GameId::Totk => {
+                        HistoryPreviewData::Totk(self.totk.preview_history(&id)?)
+                    }
+                };
+                self.history_preview = Some(HistoryPreview { game, id, data });
+            }
+            Command::ClearHistoryPreview => self.history_preview = None,
             Command::HistoryPage(before) => {
                 self.history_cursor = before;
                 self.refresh_history()?;
@@ -4784,6 +4830,7 @@ impl Engine {
             texture_busy: self.texture_busy,
             textures: self.texture_state.clone(),
             history: self.history_page.clone(),
+            history_preview: self.history_preview.clone(),
             self_updates: self.self_updates.clone(),
             totk: self.totk.status.clone(),
             message: self.message.clone(),
@@ -5551,6 +5598,78 @@ mod tests {
             h.left.sent_save.is_none(),
             "In-game snapshots must not send saves"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn history_preview_commands_are_read_only_game_scoped_and_fail_closed() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        harness.left.ensure_history()?;
+        harness.left.totk = totk::Channel::new(
+            harness.left.root.join("preview-only-totk"),
+            Err(anyhow::anyhow!("No synthetic TotK installation")),
+        );
+        let path = harness
+            .left
+            .settings
+            .save_file
+            .clone()
+            .context("Missing synthetic save")?;
+        let retained = harness
+            .left
+            .history
+            .as_mut()
+            .context("Missing history")?
+            .capture(&variant(1), &path, history::Reason::Observed, None)?;
+        files::atomic_write(&path, &variant(2))?;
+        harness.left.command(Command::RefreshSave)?;
+        assert_eq!(harness.left.local_hash, Some(files::sha256(&variant(2))));
+        let settings = serde_json::to_value(&harness.left.settings)?;
+        harness.left.command(Command::PreviewHistory {
+            game: protocol::GameId::Dusklight,
+            id: retained.id.clone(),
+        })?;
+        let preview = harness
+            .left
+            .history_preview
+            .as_ref()
+            .context("Missing reconstructed preview")?;
+        assert_eq!(preview.game, protocol::GameId::Dusklight);
+        assert_eq!(preview.id, retained.id);
+        assert!(matches!(preview.data, HistoryPreviewData::Dusklight(_)));
+        assert_eq!(files::read_save(&path)?, variant(2));
+        assert_eq!(serde_json::to_value(&harness.left.settings)?, settings);
+        assert!(
+            harness
+                .left
+                .command(Command::PreviewHistory {
+                    game: protocol::GameId::Totk,
+                    id: retained.id.clone()
+                })
+                .is_err()
+        );
+        assert!(
+            harness.left.history_preview.is_none(),
+            "Wrong-game preview must not retain old details"
+        );
+        assert_eq!(files::read_save(&path)?, variant(2));
+        harness.left.command(Command::PreviewHistory {
+            game: protocol::GameId::Dusklight,
+            id: retained.id.clone(),
+        })?;
+        harness.left.command(Command::ClearHistoryPreview)?;
+        assert!(harness.left.history_preview.is_none());
+        assert!(
+            harness
+                .left
+                .command(Command::PreviewHistory {
+                    game: protocol::GameId::Dusklight,
+                    id: "missing-entry".into()
+                })
+                .is_err()
+        );
+        assert!(harness.left.history_preview.is_none());
+        assert_eq!(files::read_save(&path)?, variant(2));
         Ok(())
     }
 
