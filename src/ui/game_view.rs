@@ -688,7 +688,7 @@ pub(super) fn approval(ui: &mut egui::Ui, model: &GameView) -> Option<Action> {
     let mut action = None;
     let palette = Palette::of(ui);
     if model.pending {
-        egui::Frame::new().fill(palette.alternate).stroke(Stroke::new(1.0, palette.border))
+        egui::Frame::new().fill(palette.alternate).stroke(Stroke::new(1.0_f32, palette.border))
             .corner_radius(4).inner_margin(12.0).show(ui, |ui| {
                 ui.label(RichText::new(format!("{}: incoming save", model.title)).font(semibold(16.0)).color(palette.warning));
                 ui.add(egui::Label::new("A complete save is awaiting your decision. Existing progress is retained before an approved replacement.").wrap());
@@ -703,7 +703,7 @@ pub(super) fn approval(ui: &mut egui::Ui, model: &GameView) -> Option<Action> {
         ui.add_space(12.0);
     }
     if model.recovery_pending {
-        egui::Frame::new().fill(palette.alternate).stroke(Stroke::new(1.0, palette.border))
+        egui::Frame::new().fill(palette.alternate).stroke(Stroke::new(1.0_f32, palette.border))
             .corner_radius(4).inner_margin(12.0).show(ui, |ui| {
                 ui.label(RichText::new(format!("{}: session recovery", model.title)).font(semibold(16.0)).color(palette.warning));
                 ui.add(egui::Label::new("Confirm this game is closed on both PCs. A disconnected device alone is not proof its session has ended.").wrap());
@@ -907,7 +907,7 @@ fn save_card_style(ui: &mut egui::Ui, card: &SaveCard, matching: Option<bool>, f
     let frame = if framed {
         egui::Frame::new()
             .fill(palette.surface)
-            .stroke(Stroke::new(1.0, palette.border))
+            .stroke(Stroke::new(1.0_f32, palette.border))
             .corner_radius(6)
             .inner_margin(12.0)
     } else {
