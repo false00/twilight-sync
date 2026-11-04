@@ -16,5 +16,6 @@ pub mod self_update;
 pub mod sync_policy;
 pub mod textures;
 pub mod totk;
+pub mod totk_save;
 #[cfg(windows)]
 pub mod ui;

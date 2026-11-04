@@ -158,7 +158,7 @@ Dusklight channel or release its lock.
 | Compact snapshots, retained partner branches and restore | Yes | Yes |
 | Online play grant, durable reservation, release and recovery | Yes | Yes |
 | Managed desktop shortcut and game-aware tray controls | Yes | Yes |
-| Decoded hearts, quests, play time and inventory | Verified game-specific decoder | Not decoded; verified slot/file revisions and album counts |
+| Decoded save information | Hearts, quests, play time and inventory | Hearts, rupees, stamina, play time, caption date/type and map/position for supported layouts |
 | Game-program installation and texture management | Dusklight tools | Existing native installation only |
 
 Matching saves establish a common base. After playing on one PC, close the game
@@ -168,6 +168,11 @@ retained snapshots, choose **Keep this PC's save**, **Use partner's save**, or
 **Keep both; play this PC**. Replacing divergent partner progress still needs
 their approval. TotK's slot comparisons are verified against the complete
 snapshot; they do not guess quest state from file timestamps or sizes.
+From v0.11.0, supported native saves also show each slot's manual/autosave type,
+stored save date, hearts, rupees, play time, stamina and expandable map/position.
+Matching snapshots share one compact slot list. Disabled Play/Sync controls
+show their specific reason beside the action and on hover, including pending
+choices, reservations, unverified saves and already-synchronized progress.
 
 Online **Play Tears of the Kingdom** waits for matching saves and the other
 manager's play grant. Both reservations are persisted before the game launches.
@@ -189,7 +194,11 @@ managed budget; Dusklight retains its **64 MiB** budget. History restore creates
 a new commit and retains the previous branch. Transaction rollback copies also
 remain under `profile\save-sync-backups`; these are outside managed history and
 are not automatically pruned. A full branch choice is never a hybrid merge of
-quest flags or inventory. Existing README images show the Dusklight workflow.
+quest flags or inventory. Unknown formats show details unavailable; malformed
+known metadata is rejected before live replacement. Failed refreshes invalidate
+old matching hashes instead of leaving stale verified claims.
+[Read-only format verification and compatibility](docs/totk-save-details.md).
+Existing README images show the Dusklight workflow.
 
 Read-only inspection is also available with `twilight-sync --check-totk-save`.
 For controlled setup, `--export-totk-save ABSOLUTE_PATH` creates a new bundle

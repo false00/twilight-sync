@@ -269,6 +269,8 @@ pub fn ensure_stopped() -> Result<()> {
 pub fn apply(profile: &Path, bytes: &[u8], expected: Option<&str>) -> Result<Option<PathBuf>> {
     ensure_stopped()?;
     let files = decode(bytes)?;
+    summary(bytes)
+        .context("Incoming TotK save metadata verification failed; no progress was replaced")?;
     ensure_safe_path(profile)?;
     fs::create_dir_all(profile)?;
     ensure!(
@@ -354,6 +356,9 @@ pub fn apply(profile: &Path, bytes: &[u8], expected: Option<&str>) -> Result<Opt
 pub struct Status {
     pub checked: bool,
     pub installed: bool,
+    pub verification_error: Option<String>,
+    pub verified_at: Option<String>,
+    pub remote_save_ready: bool,
     pub install_path: Option<PathBuf>,
     pub running: bool,
     pub local_hash: Option<String>,
@@ -375,6 +380,7 @@ pub struct Status {
     pub lock: Option<PlayLock>,
     pub remote_lock: Option<PlayLock>,
     pub launch_pending: bool,
+    pub release_pending: bool,
     pub recovery_pending: bool,
     pub peer_branch: Option<String>,
     pub comparison_verified: bool,
@@ -387,6 +393,10 @@ pub struct SlotSummary {
     pub files: usize,
     pub bytes: u64,
     pub hash: String,
+    #[serde(skip)]
+    pub details: Option<crate::totk_save::Details>,
+    #[serde(skip)]
+    pub details_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -428,13 +438,36 @@ pub fn summary(bytes: &[u8]) -> Result<Summary> {
         album_files,
         slots: slots
             .into_iter()
-            .map(|(number, (files, bytes, identity))| SlotSummary {
-                number,
-                files,
-                bytes,
-                hash: sha256(&identity),
+            .map(|(number, (count, size, identity))| {
+                let prefix = format!("{CANONICAL_ACCOUNT}/slot_{number:02}/");
+                let mut details = None;
+                let mut details_error = None;
+                if let Some(progress) = files.get(&(prefix.clone() + "progress.sav")) {
+                    match crate::totk_save::inspect(
+                        progress,
+                        files.get(&(prefix + "caption.sav")).map(Vec::as_slice),
+                    ) {
+                        Ok(decoded) => details = Some(decoded),
+                        Err(error) if crate::totk_save::known_layout(progress) => {
+                            return Err(error).with_context(|| {
+                                format!("Slot {} metadata verification failed", number + 1)
+                            });
+                        }
+                        Err(error) => {
+                            details_error = Some(format!("Save details unavailable: {error:#}"))
+                        }
+                    }
+                }
+                Ok(SlotSummary {
+                    number,
+                    files: count,
+                    bytes: size,
+                    hash: sha256(&identity),
+                    details,
+                    details_error,
+                })
             })
-            .collect(),
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -534,6 +567,7 @@ pub struct Channel {
     device: String,
     username: String,
     peer: Option<String>,
+    shared_peer_state: bool,
     history: Option<History>,
     history_hash: Option<String>,
     seen_hash: Option<String>,
@@ -563,6 +597,7 @@ impl Channel {
         let status = Status {
             base: session.base.clone(),
             lock: session.lock.clone(),
+            release_pending: session.release.is_some(),
             ..Status::default()
         };
         let install = session.install.clone().map(Ok).unwrap_or(install);
@@ -580,6 +615,7 @@ impl Channel {
             device: "0".repeat(64),
             username: "Local user".into(),
             peer: None,
+            shared_peer_state: false,
             history: None,
             history_hash: None,
             seen_hash: None,
@@ -639,6 +675,7 @@ impl Channel {
         }
         self.status.base = self.session.base.clone();
         self.status.lock = self.session.lock.clone();
+        self.status.release_pending = self.session.release.is_some();
         Ok(())
     }
 
@@ -810,6 +847,31 @@ impl Channel {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        let result = self.refresh_verified();
+        if let Err(error) = &result {
+            self.status.verification_error = Some(format!("{error:#}"));
+            self.status.verified_at = None;
+            self.status.local_hash = None;
+            self.status.local_files = 0;
+            self.status.local_size = 0;
+            self.status.local_summary = None;
+            self.status.conflict = false;
+            self.seen_hash = None;
+            self.stable_since = Instant::now();
+        } else {
+            self.status.verification_error = None;
+            self.status.verified_at = if self.status.running {
+                None
+            } else {
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            };
+        }
+        result
+    }
+
+    fn refresh_verified(&mut self) -> Result<()> {
         ensure!(
             self.state_error.is_none(),
             "TotK safety metadata needs attention"
@@ -852,7 +914,11 @@ impl Channel {
 
     pub fn state_event(&mut self) -> Result<Event> {
         self.refresh()?;
-        Ok(Event::TotkState {
+        Ok(self.cached_state_event())
+    }
+
+    fn cached_state_event(&self) -> Event {
+        Event::TotkState {
             installed: self.status.installed,
             running: self.status.running,
             hash: if self.status.running {
@@ -862,7 +928,7 @@ impl Channel {
             },
             files: self.status.local_files,
             size: self.status.local_size,
-        })
+        }
     }
 
     fn idle(&mut self) -> Result<()> {
@@ -939,6 +1005,10 @@ impl Channel {
         ensure!(
             self.status.peer_checked && self.status.remote_installed,
             "Wait for the partner's TotK state before protected play"
+        );
+        ensure!(
+            self.status.remote_save_ready,
+            "The paired PC's committed save is not verified and ready"
         );
         if self.status.local_hash != self.status.remote_hash {
             let decision = sync_policy::reconcile(
@@ -1062,9 +1132,16 @@ impl Channel {
     }
 
     pub fn shared_state(&self) -> Event {
+        let ready = self.status.installed
+            && self.status.verification_error.is_none()
+            && !self.status.running;
         Event::State {
-            hash: self.status.local_hash.clone(),
-            save_ready: self.status.installed,
+            hash: if ready {
+                self.status.local_hash.clone()
+            } else {
+                None
+            },
+            save_ready: ready,
             game: self.status.running,
             lock: self.session.lock.clone(),
         }
@@ -1076,7 +1153,14 @@ impl Channel {
         }
         self.last_poll = Instant::now();
         self.expire();
-        self.refresh()?;
+        if let Err(error) = self.refresh() {
+            self.status.message = format!("Save verification failed: {error:#}");
+            return if connected {
+                Ok(vec![self.shared_state()])
+            } else {
+                Err(error)
+            };
+        }
         if self
             .launch_request
             .as_ref()
@@ -1115,7 +1199,7 @@ impl Channel {
         if !connected || !self.status.installed {
             return Ok(Vec::new());
         }
-        let mut frames = vec![self.shared_state(), self.state_event()?];
+        let mut frames = vec![self.shared_state(), self.cached_state_event()];
         if let Some(token) = &self.session.release
             && !self.status.running
             && self.child.is_none()
@@ -1126,6 +1210,7 @@ impl Channel {
             });
         }
         if !self.status.peer_checked
+            || !self.status.remote_save_ready
             || self.status.running
             || self.status.remote_running
             || self.status.busy
@@ -1208,11 +1293,17 @@ impl Channel {
             "Check TotK saves on the paired device first; both PCs need TotK support"
         );
         ensure!(
+            self.status.remote_save_ready,
+            "The paired PC's committed save is not verified and ready"
+        );
+        ensure!(
             !self.status.remote_running,
             "Your partner is playing Tears of the Kingdom"
         );
         let save =
             snapshot(&self.profile()?)?.context("This PC has no committed TotK save to send")?;
+        summary(&save.bytes)
+            .context("Local TotK metadata verification failed; no save was sent")?;
         if self.status.remote_hash.as_ref() == Some(&save.hash) {
             self.status.message = "TotK saves already match.".into();
             return Ok(Vec::new());
@@ -1438,8 +1529,10 @@ impl Channel {
                     self.status.peer_branch = None;
                     self.status.comparison_verified = false;
                 }
+                self.shared_peer_state = true;
+                self.status.remote_save_ready = save_ready && !game;
                 self.status.peer_checked = true;
-                self.status.remote_installed = save_ready;
+                self.status.remote_installed |= save_ready;
                 self.status.remote_running = game;
                 self.status.remote_hash = hash;
                 self.status.remote_lock = lock;
@@ -1537,6 +1630,9 @@ impl Channel {
                     hash.is_none() || (installed && !running && files > 0 && size > 0),
                     "Invalid TotK save readiness"
                 );
+                if !self.shared_peer_state {
+                    self.status.remote_save_ready = installed && !running;
+                }
                 self.status.peer_checked = true;
                 self.status.remote_installed = installed;
                 self.status.remote_running = running;
@@ -1640,6 +1736,8 @@ impl Channel {
                     sha256(&bytes) == hash && decode(&bytes)?.len() == incoming.offer.files,
                     "TotK transfer checksum or file count mismatch"
                 );
+                let verified_summary = summary(&bytes)
+                    .context("Incoming TotK metadata verification failed before commit")?;
                 self.receive_allowed(incoming.offer.lease.as_deref())?;
                 let profile = self.profile()?;
                 if let Some(current) = snapshot(&profile)? {
@@ -1656,7 +1754,7 @@ impl Channel {
                     self.status.peer_branch = Some(capture.id);
                 }
                 if incoming.offer.preview {
-                    self.status.remote_summary = Some(summary(&bytes)?);
+                    self.status.remote_summary = Some(verified_summary);
                     self.status.comparison_verified = true;
                     self.status.history = self.history()?.page(None)?;
                     self.status.busy = false;
@@ -1766,6 +1864,8 @@ impl Channel {
         self.status.pending = false;
         self.status.busy = false;
         self.status.peer_checked = false;
+        self.shared_peer_state = false;
+        self.status.remote_save_ready = false;
         self.status.remote_hash = None;
         self.status.remote_installed = false;
         self.status.remote_running = false;
@@ -2422,6 +2522,176 @@ mod tests {
         left.status.busy = false;
         left.monitor = ProcessMonitor::for_test(true);
         assert!(left.require_app_update_idle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verification_failure_invalidates_old_hash_and_recovers_without_touching_progress()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut channel = fixture(root.path(), Some(b"existing progress"))?;
+        channel.refresh()?;
+        let before = channel.status.local_hash.clone();
+        let profile = channel.profile()?;
+        fs::remove_file(profile.join("account.uid"))?;
+        assert!(channel.refresh().is_err());
+        assert!(channel.status.local_hash.is_none() && channel.status.local_summary.is_none());
+        assert!(
+            channel.status.verification_error.is_some() && channel.status.verified_at.is_none()
+        );
+        assert!(matches!(
+            channel.shared_state(),
+            Event::State {
+                hash: None,
+                save_ready: false,
+                ..
+            }
+        ));
+        fs::write(profile.join("account.uid"), 1_u128.to_le_bytes())?;
+        channel.refresh()?;
+        assert_eq!(channel.status.local_hash, before);
+        assert!(
+            channel.status.verification_error.is_none() && channel.status.verified_at.is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_verification_failure_cannot_be_overridden_by_installation_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut channel = fixture(root.path(), Some(b"local progress"))?;
+        channel.handle(Event::State {
+            hash: None,
+            save_ready: false,
+            game: false,
+            lock: None,
+        })?;
+        channel.handle(Event::TotkState {
+            installed: true,
+            running: false,
+            hash: None,
+            files: 0,
+            size: 0,
+        })?;
+        assert!(!channel.status.remote_save_ready);
+        channel.refresh()?;
+        channel.stable_since = Instant::now() - Duration::from_secs(3);
+        channel.last_poll = Instant::now() - Duration::from_secs(4);
+        assert!(
+            !channel
+                .tick(true)?
+                .iter()
+                .any(|event| matches!(event, Event::SaveOffer { .. }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_details_are_verified_locally_without_changing_the_legacy_wire_summary() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let channel = fixture(root.path(), None)?;
+        let slot = channel
+            .profile()?
+            .join("save")
+            .join(ACCOUNT)
+            .join("slot_00");
+        fs::create_dir_all(&slot)?;
+        let (progress, caption) = crate::totk_save::tests::fixture();
+        fs::write(slot.join("progress.sav"), progress)?;
+        fs::write(slot.join("caption.sav"), caption)?;
+        let save = snapshot(&channel.profile()?)?.context("No fixture save")?;
+        let summary = summary(&save.bytes)?;
+        assert_eq!(
+            summary.slots[0]
+                .details
+                .as_ref()
+                .and_then(|details| details.max_hearts),
+            Some(4.0)
+        );
+        let wire = serde_json::to_value(&summary)?;
+        assert!(wire["slots"][0].get("details").is_none());
+        assert!(wire["slots"][0].get("details_error").is_none());
+        let decoded: Summary = serde_json::from_value(wire)?;
+        assert!(decoded.slots[0].details.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_known_progress_metadata_invalidates_readiness_instead_of_showing_old_stats()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut channel = fixture(root.path(), None)?;
+        let slot = channel
+            .profile()?
+            .join("save")
+            .join(ACCOUNT)
+            .join("slot_00");
+        fs::create_dir_all(&slot)?;
+        let (mut progress, caption) = crate::totk_save::tests::fixture();
+        fs::write(slot.join("progress.sav"), &progress)?;
+        fs::write(slot.join("caption.sav"), caption)?;
+        channel.refresh()?;
+        assert!(channel.status.local_summary.is_some());
+        progress[0x3c..0x40].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        fs::write(slot.join("progress.sav"), progress)?;
+        assert!(channel.refresh().is_err());
+        assert!(channel.status.local_hash.is_none() && channel.status.local_summary.is_none());
+        assert!(
+            channel
+                .status
+                .verification_error
+                .as_ref()
+                .is_some_and(|error| error.contains("metadata verification failed"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_known_metadata_is_rejected_before_destination_progress_is_changed() -> Result<()> {
+        let source_root = tempfile::tempdir()?;
+        let destination_root = tempfile::tempdir()?;
+        let source = fixture(source_root.path(), None)?;
+        let destination = fixture(destination_root.path(), Some(b"existing player progress"))?;
+        let slot = source.profile()?.join("save").join(ACCOUNT).join("slot_00");
+        fs::create_dir_all(&slot)?;
+        let (mut progress, caption) = crate::totk_save::tests::fixture();
+        progress[0x4c..0x50].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(slot.join("progress.sav"), progress)?;
+        fs::write(slot.join("caption.sav"), caption)?;
+        let incoming = snapshot(&source.profile()?)?.context("Missing test source")?;
+        let before = snapshot(&destination.profile()?)?.context("Missing existing progress")?;
+        let identity = fs::read(destination.profile()?.join("account.uid"))?;
+        assert!(apply(&destination.profile()?, &incoming.bytes, Some(&before.hash)).is_err());
+        assert_eq!(
+            snapshot(&destination.profile()?)?.map(|save| save.hash),
+            Some(before.hash)
+        );
+        assert_eq!(
+            fs::read(destination.profile()?.join("account.uid"))?,
+            identity
+        );
+        assert!(!destination.profile()?.join("save-sync-backups").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unverified_peer_cannot_leave_a_failed_launch_or_send_stuck_pending() -> Result<()> {
+        let left_root = tempfile::tempdir()?;
+        let right_root = tempfile::tempdir()?;
+        let (mut left, _) = paired_channels(left_root.path(), right_root.path())?;
+        left.handle(Event::State {
+            hash: None,
+            save_ready: false,
+            game: false,
+            lock: None,
+        })?;
+        let before = fs::read(left.root.join("session.json"))?;
+        assert!(left.launch(true, false).is_err());
+        assert!(left.offer().is_err());
+        assert!(!left.status.launch_pending && !left.status.busy && !left.launch_after_sync);
+        assert!(left.session.lock.is_none() && left.outgoing.is_none());
+        assert_eq!(fs::read(left.root.join("session.json"))?, before);
         Ok(())
     }
 

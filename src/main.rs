@@ -107,9 +107,22 @@ fn run() -> Result<()> {
         twilight_sync::totk::ensure_stopped()?;
         let profile = twilight_sync::totk::default_install()?.join("profile");
         let save = twilight_sync::totk::snapshot(&profile)?;
+        let summary = save
+            .as_ref()
+            .map(|save| twilight_sync::totk::summary(&save.bytes))
+            .transpose()?;
+        let slots: Vec<_> = summary
+            .as_ref()
+            .into_iter()
+            .flat_map(|summary| summary.slots.iter())
+            .map(|slot| {
+                serde_json::json!({"slot":slot.number+1,"files":slot.files,"bytes":slot.bytes,
+                "sha256":slot.hash,"details":slot.details,"details_unavailable":slot.details_error})
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::json!({"game": "totk", "profile": profile, "hash": save.as_ref().map(|save| &save.hash), "files": save.as_ref().map_or(0, |save| save.files), "bytes": save.as_ref().map_or(0, |save| save.bytes.len()), "changed": false})
+            serde_json::json!({"game": "totk", "profile": profile, "hash": save.as_ref().map(|save| &save.hash), "files": save.as_ref().map_or(0, |save| save.files), "bytes": save.as_ref().map_or(0, |save| save.bytes.len()), "slots":slots, "changed": false})
         );
         return Ok(());
     }

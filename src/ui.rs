@@ -764,17 +764,40 @@ impl Dashboard {
                 summary.album_files
             ),
         );
-        for slot in &summary.slots {
+        let mut slots: Vec<_> = summary.slots.iter().collect();
+        slots.sort_by(|left, right| {
+            right
+                .details
+                .as_ref()
+                .and_then(|details| details.saved_at.as_deref())
+                .cmp(
+                    &left
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.saved_at.as_deref()),
+                )
+                .then(left.number.cmp(&right.number))
+        });
+        for slot in slots {
             let matches = other
                 .and_then(|other| other.slots.iter().find(|other| other.number == slot.number))
                 .is_some_and(|other| other.hash == slot.hash);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("Slot {}", slot.number + 1)).font(semibold(14.0)));
-                ui.label(format!(
-                    "{} files / {:.1} MiB",
-                    slot.files,
-                    slot.bytes as f64 / 1_048_576.0
-                ));
+                if let Some(details) = &slot.details {
+                    if let Some(autosave) = details.autosave {
+                        ui.label(if autosave { "Autosave" } else { "Manual save" });
+                    }
+                    if let Some(saved) = &details.saved_at {
+                        ui.label(saved);
+                    }
+                } else {
+                    ui.label(format!(
+                        "{} files / {:.1} MiB",
+                        slot.files,
+                        slot.bytes as f64 / 1_048_576.0
+                    ));
+                }
                 if other.is_some() {
                     ui.label(if matches {
                         "Matching revision"
@@ -783,6 +806,61 @@ impl Dashboard {
                     });
                 }
             });
+            if let Some(details) = &slot.details {
+                let mut values = Vec::new();
+                if let Some(hearts) = details.max_hearts {
+                    values.push(if hearts.fract() == 0.0 {
+                        format!("{hearts:.0} hearts")
+                    } else {
+                        format!("{hearts:.2} hearts")
+                    });
+                }
+                if let Some(rupees) = details.rupees {
+                    values.push(format!("{rupees} rupees"));
+                }
+                if let Some(seconds) = details.play_seconds {
+                    values.push(format!(
+                        "{}h {:02}m played",
+                        seconds / 3600,
+                        seconds / 60 % 60
+                    ));
+                }
+                if let Some(stamina) = details.stamina_wheels {
+                    values.push(format!("{stamina:.1} stamina wheels"));
+                }
+                ui.add(egui::Label::new(values.join(" / ")).wrap());
+                ui.push_id(slot.number, |ui| {
+                    ui.collapsing("Location and save details", |ui| {
+                        if let Some(map) = &details.map {
+                            let location = if map == "MainField" {
+                                "Overworld"
+                            } else if map.starts_with("Dungeon") {
+                                "Shrine"
+                            } else {
+                                "Map"
+                            };
+                            ui.label(format!("{location}: {map}"));
+                        }
+                        if let Some([east, altitude, north]) = details.position {
+                            ui.label(format!(
+                                "World position: {east:.0}, {altitude:.0}, {north:.0}"
+                            ));
+                        }
+                        Self::secondary(
+                            ui,
+                            format!(
+                                "Save format {} / {} files / {:.1} MiB",
+                                details.format,
+                                slot.files,
+                                slot.bytes as f64 / 1_048_576.0
+                            ),
+                        );
+                    });
+                });
+            } else if let Some(reason) = &slot.details_error {
+                Self::secondary(ui, reason);
+            }
+            ui.add_space(8.0);
         }
     }
 
@@ -809,6 +887,79 @@ impl Dashboard {
         self.totk(ui, snapshot);
     }
 
+    fn totk_session_blocker(snapshot: &Snapshot) -> Option<&str> {
+        let state = &snapshot.totk;
+        if let Some(error) = &state.verification_error {
+            Some(error.as_str())
+        } else if !state.checked {
+            Some("The game installation and save are still being checked.")
+        } else if !state.installed {
+            Some("The native TotK installation was not found.")
+        } else if state.running {
+            Some("TotK is running on this PC. Save replacement is paused.")
+        } else if state.remote_running {
+            Some("The paired PC is playing TotK. Save replacement is paused.")
+        } else if state.launch_pending {
+            Some("Waiting for the paired PC to reserve the play session.")
+        } else if state.release_pending && snapshot.ready {
+            Some("The saved session is waiting for the paired PC's release acknowledgement.")
+        } else if state.pending {
+            Some("An incoming save is waiting for your Accept or Keep decision.")
+        } else if state.busy {
+            Some("A TotK save transfer or comparison is in progress.")
+        } else if state.recovery_pending {
+            Some("A completed-session recovery is waiting for your decision.")
+        } else if state.lock.is_some() || state.remote_lock.is_some() {
+            if !snapshot.ready
+                && state
+                    .lock
+                    .as_ref()
+                    .is_some_and(|lock| lock.owner != snapshot.public_key)
+            {
+                Some(
+                    "The stored reservation belongs to the paired PC. Reconnect it for completed-session recovery.",
+                )
+            } else {
+                Some("A stored TotK play reservation needs completed-session recovery.")
+            }
+        } else if snapshot.self_updates.preparing {
+            Some("Twilight Sync is preparing an app update.")
+        } else {
+            None
+        }
+    }
+
+    fn totk_play_blocker(snapshot: &Snapshot) -> Option<&str> {
+        Self::totk_session_blocker(snapshot).or_else(|| {
+            if snapshot.ready && snapshot.totk.peer_checked && snapshot.totk.remote_installed && !snapshot.totk.remote_save_ready {
+                Some("The paired PC's save is not verified yet. Protected play is waiting for its valid state.")
+            } else { snapshot.totk.conflict.then_some(
+                "Both PCs have different progress. A branch choice or Keep both is required before play."
+            ) }
+        })
+    }
+
+    fn totk_sync_blocker(snapshot: &Snapshot) -> Option<&str> {
+        Self::totk_session_blocker(snapshot).or_else(|| {
+            let state = &snapshot.totk;
+            if !snapshot.ready {
+                Some("The paired PC is offline. This PC's progress is retained locally.")
+            } else if !state.peer_checked {
+                Some("Waiting for the paired PC's TotK save status.")
+            } else if !state.remote_installed {
+                Some("The paired PC has no available native TotK installation.")
+            } else if !state.remote_save_ready {
+                Some("The paired PC's committed save is not verified and ready yet.")
+            } else if state.local_hash.is_none() {
+                Some("This PC has no committed TotK save to send.")
+            } else if state.local_hash == state.remote_hash {
+                Some("Both save snapshots already match. There is nothing to send.")
+            } else {
+                None
+            }
+        })
+    }
+
     fn totk(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let state = &snapshot.totk;
         let idle = state.installed
@@ -819,15 +970,49 @@ impl Dashboard {
             && state.lock.is_none()
             && state.remote_lock.is_none()
             && !snapshot.self_updates.preparing;
+        let play_blocker = Self::totk_play_blocker(snapshot);
+        let sync_blocker = Self::totk_sync_blocker(snapshot);
+        let matched = snapshot.ready
+            && !state.running
+            && !state.remote_running
+            && state.remote_save_ready
+            && state.verification_error.is_none()
+            && state.local_hash.is_some()
+            && state.local_hash == state.remote_hash;
         ui.horizontal_wrapped(|ui| {
-            if Self::primary(ui, idle && !state.conflict, "Play Tears of the Kingdom").clicked() {
+            if Self::primary(ui, play_blocker.is_none(), "Play Tears of the Kingdom")
+                .on_disabled_hover_text(play_blocker.unwrap_or_default())
+                .clicked()
+            {
                 self.dispatch(Command::LaunchTotk { local_only: false });
+            }
+            if ui
+                .add_enabled(sync_blocker.is_none(), egui::Button::new("Send to partner"))
+                .on_disabled_hover_text(sync_blocker.unwrap_or_default())
+                .clicked()
+            {
+                self.dispatch(Command::SendTotk);
             }
             if ui.button("Save history").clicked() {
                 self.page = Page::History;
                 self.dispatch(Command::TotkHistoryPage(None));
             }
         });
+        if let Some(reason) = play_blocker {
+            Self::secondary(ui, format!("Play unavailable: {reason}"));
+        }
+        if let Some(reason) = sync_blocker {
+            Self::secondary(ui, format!("Sync status: {reason}"));
+        }
+        if matched {
+            ui.label(
+                RichText::new("Synchronized: both committed save snapshots match.")
+                    .color(Palette::of(ui).success),
+            );
+        }
+        if let Some(verified) = &state.verified_at {
+            Self::secondary(ui, format!("Save checked: {verified}"));
+        }
         if state.launch_pending {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -835,7 +1020,9 @@ impl Dashboard {
             });
         }
         ui.add_space(16.0);
-        let local = if !state.checked {
+        let local = if state.verification_error.is_some() {
+            "Save verification needs attention".to_owned()
+        } else if !state.checked {
             "Not checked".to_owned()
         } else if !state.installed {
             "Not installed".to_owned()
@@ -855,9 +1042,6 @@ impl Dashboard {
         if let Some(hash) = &state.local_hash {
             Self::secondary(ui, format!("Save: {}", &hash[..12]));
         }
-        if let Some(summary) = &state.local_summary {
-            Self::totk_summary(ui, summary, state.remote_summary.as_ref());
-        }
         ui.add_space(16.0);
         Self::section_title(ui, snapshot.peer_name.as_deref().unwrap_or("Paired PC"));
         ui.label(if !snapshot.ready {
@@ -870,6 +1054,8 @@ impl Dashboard {
             "Game running".to_owned()
         } else if state.remote_hash.is_none() {
             "No committed save yet".to_owned()
+        } else if !state.remote_save_ready || state.verification_error.is_some() {
+            "Save verification needs attention".to_owned()
         } else if state.remote_hash == state.local_hash {
             "Saves match".to_owned()
         } else {
@@ -878,16 +1064,42 @@ impl Dashboard {
         if let Some(hash) = &state.remote_hash {
             Self::secondary(ui, format!("Save: {}", &hash[..12]));
         }
-        if let Some(summary) = state
-            .remote_summary
-            .as_ref()
-            .filter(|_| state.comparison_verified)
+        ui.add_space(12.0);
+        if let Some(summary) = &state.local_summary {
+            Self::section_title(
+                ui,
+                if matched {
+                    "Saved progress on both PCs"
+                } else {
+                    "This PC's saved progress"
+                },
+            );
+            Self::totk_summary(
+                ui,
+                summary,
+                if matched {
+                    Some(summary)
+                } else {
+                    state.remote_summary.as_ref()
+                },
+            );
+        }
+        if !matched
+            && let Some(summary) = state
+                .remote_summary
+                .as_ref()
+                .filter(|_| state.comparison_verified)
         {
+            ui.add_space(12.0);
+            Self::section_title(ui, "Partner's verified saved progress");
             Self::totk_summary(ui, summary, state.local_summary.as_ref());
         }
         if state.conflict {
             ui.add_space(12.0);
             Self::section_title(ui, "Different save branches");
+            if !state.comparison_verified {
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label("The partner's complete snapshot is being verified before a branch can be chosen."); });
+            }
             ui.horizontal_wrapped(|ui| {
                 for (label, use_remote) in [("Keep this PC's save", false), ("Use partner's save", true)] {
                     if ui.add_enabled(idle && snapshot.ready && state.comparison_verified, egui::Button::new(label)).clicked()
@@ -914,21 +1126,6 @@ impl Dashboard {
             {
                 self.dispatch(Command::RefreshTotk);
             }
-            if Self::primary(
-                ui,
-                snapshot.ready
-                    && state.peer_checked
-                    && state.remote_installed
-                    && !state.running
-                    && !state.remote_running
-                    && !state.busy
-                    && state.local_hash.is_some(),
-                "Send this PC's saves",
-            )
-            .clicked()
-            {
-                self.dispatch(Command::SendTotk);
-            }
         });
         if !state.message.is_empty() {
             ui.add_space(12.0);
@@ -939,7 +1136,21 @@ impl Dashboard {
             ui.separator();
             Self::section_title(ui, "Incoming TotK saves");
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Accept partner's saves").clicked() {
+                let can_accept = !state.running
+                    && !state.remote_running
+                    && !snapshot.self_updates.preparing
+                    && state.verification_error.is_none()
+                    && state.lock.is_none()
+                    && state.remote_lock.is_none();
+                if ui
+                    .add_enabled(can_accept, egui::Button::new("Accept partner's saves"))
+                    .on_disabled_hover_text(
+                        play_blocker.unwrap_or(
+                            "Finish the active game or session before replacing this save.",
+                        ),
+                    )
+                    .clicked()
+                {
                     self.dispatch(Command::AcceptTotk(true));
                 }
                 if ui.button("Keep this PC's progress").clicked() {
@@ -2507,6 +2718,58 @@ mod tests {
     }
 
     #[test]
+    fn disabled_totk_controls_explain_the_specific_state_without_bypassing_safety() -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        snapshot.totk.checked = true;
+        snapshot.totk.installed = true;
+        snapshot.totk.peer_checked = true;
+        snapshot.totk.remote_installed = true;
+        snapshot.totk.remote_save_ready = true;
+        snapshot.totk.local_hash = Some("a".repeat(64));
+        snapshot.totk.remote_hash = Some("a".repeat(64));
+        assert!(Dashboard::totk_play_blocker(&snapshot).is_none());
+        assert!(
+            Dashboard::totk_sync_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("already match"))
+        );
+        snapshot.totk.remote_hash = Some("b".repeat(64));
+        assert!(Dashboard::totk_sync_blocker(&snapshot).is_none());
+        snapshot.totk.pending = true;
+        assert!(
+            Dashboard::totk_play_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("decision"))
+        );
+        snapshot.totk.pending = false;
+        snapshot.totk.lock = Some(crate::config::PlayLock {
+            owner: snapshot.public_key.clone(),
+            token: "c".repeat(64),
+        });
+        assert!(
+            Dashboard::totk_sync_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("recovery"))
+        );
+        snapshot.totk.lock = None;
+        snapshot.totk.running = true;
+        assert!(
+            Dashboard::totk_play_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("running on this PC"))
+        );
+        snapshot.totk.running = false;
+        snapshot.totk.release_pending = true;
+        assert!(
+            Dashboard::totk_play_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("acknowledgement"))
+        );
+        snapshot.ready = false;
+        assert!(Dashboard::totk_play_blocker(&snapshot).is_none());
+        assert!(
+            Dashboard::totk_sync_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("offline"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn game_selector_and_totk_comparisons_fit_light_dark_and_narrow_layouts() -> Result<()> {
         let summary = crate::totk::Summary {
             files: 32,
@@ -2518,6 +2781,18 @@ mod tests {
                     files: 4,
                     bytes: 2_945_388,
                     hash: "a".repeat(64),
+                    details: Some(crate::totk_save::Details {
+                        format: "1.4".into(),
+                        max_hearts: Some(4.0),
+                        rupees: Some(81),
+                        stamina_wheels: Some(1.0),
+                        play_seconds: Some(18_293),
+                        map: Some("Dungeon136".into()),
+                        saved_at: Some("2026-11-04 14:01".into()),
+                        autosave: Some(number != 1),
+                        ..crate::totk_save::Details::default()
+                    }),
+                    details_error: None,
                 })
                 .collect(),
         };
