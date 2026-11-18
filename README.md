@@ -157,13 +157,18 @@ Choose **Build from source** in **Game setup**, then follow three focused steps:
 1. **Tools:** check prerequisites, prepare verified build tools, and review the
    exact source commit. Missing .NET/MSYS2 prerequisites offer approved setup
    actions and copyable commands.
-2. **Game files:** choose your own supported local inputs. Keys are not sent
-   to your paired PC.
+2. **Game files:** choose your own supported local inputs. Builds reuse these
+   selections; nothing is sent to your paired PC automatically.
 3. **Build:** review the settings, approve the scripts, and build your copy.
    Progress, retained logs, and safe cancellation are available.
 
 Approval applies to the exact revision and build settings. Changing either
 requires a fresh review.
+
+For manual paired transfers, open **Settings > Game-file transfers** and choose
+**Dusklight** (ISO/RVZ), **TotK** (NSP/console keys), or **OOT** (NUP). It reuses
+the build's selected files. Enable the matching permission on both PCs, then
+offer the file; the receiver approves a new destination.
 
 **Important:** slower is **not confirmed safer**. Source code, build scripts,
 compilers, and dependencies run with your Windows account's permissions.

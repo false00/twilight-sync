@@ -5607,7 +5607,7 @@ impl Engine {
         if !self.file_transfer_enabled(format) {
             let message = match format {
                 DiscFormat::Game(GameFileKind::TotkKeys) => {
-                    "Console-key transfer is disabled on the receiving PC. In Game setup > Tears of the Kingdom, enable console-key sharing on both PCs, then offer prod.keys again."
+                    "Console-key transfer is disabled on the receiving PC. In Settings > Game-file transfers > TotK, enable console-key sharing on both PCs, then offer prod.keys again."
                 }
                 DiscFormat::Game(_) => {
                     "Game-file transfer is disabled on the receiving PC. Enable game-file transfers for this game on both PCs, then offer the file again."

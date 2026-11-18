@@ -421,11 +421,19 @@ integration inside Dusklight itself.
 
 ### OOT and TotK setup inputs
 
-Open the selected game's **Game setup** on both paired PCs. Enable **I own this
-game and allow game-file transfers** on each PC, select the local input on the
-sender, and choose **Offer OOT .nup**, **Offer TotK base .nsp**, or **Offer TotK
-update .nsp**. Both managers must support `twilightProto/4` discovery (v0.16.2
-or later); legacy save and disc event encodings are unchanged.
+Open **Settings > Game-file transfers** on both paired PCs. This replaces the
+old ISO-only section: choose **Dusklight** for ISO/RVZ, **TotK** for base/update
+NSP and console keys, or **OOT** for NUP. Native game transfer controls also
+remain in **Game setup**. Enable **I own this game and allow game-file
+transfers** on each PC, select the local input on the sender, and choose
+**Offer OOT .nup**, **Offer TotK base .nsp**, or **Offer TotK update .nsp**.
+Both managers must support `twilightProto/4` discovery (v0.16.2 or later);
+legacy save and disc event encodings are unchanged.
+
+The transfer hub shows the same saved input selections used by builds,
+including an existing selected `prod.keys`; choosing or receiving a file
+updates that game's build inputs too. Selecting a game or starting a build
+never automatically offers files. Sending remains manual.
 
 The receiver approves each offer and chooses a new destination with the
 matching extension. Existing files are never overwritten. Files are staged in
@@ -443,7 +451,7 @@ Transfer logs omit key contents and key-file hashes. The chosen destination is
 an **unencrypted local file**; protect it like the original. This feature never
 shares the app's private pairing identity.
 
-On both PCs, open **Game setup > Tears of the Kingdom** and enable **Also allow
+On both PCs, open **Settings > Game-file transfers > TotK** and enable **Also allow
 my console keys to this paired PC** before choosing **Offer prod.keys**. If the
 receiver's permission is off, the offer is declined with instructions on the
 sender; pairing, the connection, and play locks remain intact. Enable the

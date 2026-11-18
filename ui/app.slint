@@ -92,6 +92,53 @@ component GameFileInput inherits Surface {
     }
 }
 
+component GameInputTransfers inherits VerticalLayout {
+    in property <int> game;
+    in property <bool> sharing;
+    in property <bool> key-sharing;
+    in property <bool> can-choose;
+    in property <bool> can-offer;
+    in property <bool> can-offer-update;
+    in property <bool> can-offer-keys;
+    in property <string> reason;
+    in property <string> input;
+    in property <string> update;
+    in property <string> keys;
+    callback offer(int);
+    callback choose(int);
+    callback sharing-toggled(bool);
+    callback keys-toggled(bool);
+    spacing: 12px;
+    Muted { text: "Send selected game inputs over encrypted twilightProto on your approved LAN. Enable the same permission on both PCs. The receiver chooses a new destination; nothing is overwritten or installed automatically."; }
+    SwitchRow { title: "I own this game and allow game-file transfers"; checked: root.sharing; toggled(value) => { root.sharing-toggled(value); } }
+    if root.reason != "": Muted { text: root.reason; color: Theme.warning; }
+    DetailBlock { title: root.game == 2 ? "OOT GAME INPUT" : "TOTK BASE GAME"; text: root.input == "" ? "No game file selected" : root.input; }
+    HorizontalLayout {
+        spacing: 10px;
+        ActionButton { text: "Choose game file"; available: root.can-choose; clicked => { root.choose(0); } }
+        ActionButton { text: root.game == 2 ? "Offer OOT .nup" : "Offer TotK base .nsp"; available: root.can-offer; clicked => { root.offer(0); } }
+    }
+    Muted { text: root.game == 2 ? "Only OOT .nup files can be transferred, not extracted folders." : "Only base/update .nsp files can be transferred. XCI, NSZ and XCZ inputs remain local-only."; }
+    if root.game == 1: VerticalLayout {
+        spacing: 12px;
+        DetailBlock { title: "TOTK UPDATE"; text: root.update == "" ? "No update selected" : root.update; }
+        HorizontalLayout {
+            spacing: 10px;
+            ActionButton { text: "Choose update file"; available: root.can-choose; clicked => { root.choose(1); } }
+            ActionButton { text: "Offer TotK update .nsp"; available: root.can-offer-update; clicked => { root.offer(1); } }
+        }
+        SwitchRow { title: "Also allow my console keys to this paired PC"; description: "Sensitive: enable this separately on both PCs before offering prod.keys. The receiver must also approve each file."; checked: root.key-sharing; toggled(value) => { root.keys-toggled(value); } }
+        DetailBlock { title: "CONSOLE KEY FILE"; text: root.keys == "" ? "No prod.keys file selected. Choose your existing key file." : root.keys; }
+        HorizontalLayout {
+            spacing: 10px;
+            ActionButton { text: "Choose key file"; available: root.can-choose; clicked => { root.choose(2); } }
+            ActionButton { text: "Offer prod.keys"; available: root.can-offer-keys; clicked => { root.offer(2); } }
+        }
+    }
+    Muted { text: "These selections are shared with Game setup and reused for builds. Sending is manual; no files are copied automatically."; }
+    Muted { text: "Container checks and SHA-256 detect transfer damage, not game ownership, title identity or authenticity. Received files become local setup inputs; review them before building."; }
+}
+
 component BranchPreview inherits Rectangle {
     in property <string> title;
     in property <string> revision;
@@ -154,6 +201,7 @@ export component MainWindow inherits Window {
     in property <[ToolRow]> tools;
     in property <bool> tools-missing;
     in-out property <bool> show-tool-details: true;
+    property <bool> game-transfers-expanded: false;
     in property <[PackCard]> packs;
     in property <string> game-title;
     in property <string> game-subtitle;
@@ -326,11 +374,13 @@ export component MainWindow inherits Window {
     changed build-complete => { root.build-result-dismissed = false; }
     changed build-needs-activation => { root.build-result-dismissed = false; }
     changed selected-game => {
-        main-scroll.content-y = 0px; root.setup-step = 0;
+        if root.section != 5 { main-scroll.content-y = 0px; }
+        root.setup-step = 0;
         root.extra-game-inputs = false;
+        root.game-transfers-expanded = false;
         root.show-other-saves = false; root.comparison-open = false;
     }
-    changed setup-step => { main-scroll.content-y = 0px; }
+    changed setup-step => { if root.section == 1 { main-scroll.content-y = 0px; } }
     changed comparison-open => { root.branch-choice = -1; root.update-modal-state(); }
     changed about-open => { root.update-modal-state(); }
     changed confirmation-open => { root.update-modal-state(); }
@@ -801,21 +851,20 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Transfer inputs to your paired PC"; }
-                                Muted { text: "Send selected game inputs over encrypted twilightProto on your approved LAN. Enable the same permission on both PCs. The receiver chooses a new destination; nothing is overwritten or installed automatically."; }
-                                SwitchRow { title: "I own this game and allow game-file transfers"; checked: root.game-file-sharing; toggled(value) => { root.toggle(Toggle.game-file-sharing, value); } }
-                                if root.game-file-transfer-reason != "": Muted { text: root.game-file-transfer-reason; color: Theme.warning; }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    ActionButton { text: root.selected-game == 2 ? "Offer OOT .nup" : "Offer TotK base .nsp"; available: root.can-offer-game-file; clicked => { root.action(Action.offer-game-file, 0); } }
-                                    if root.selected-game == 1: ActionButton { text: "Offer TotK update .nsp"; available: root.can-offer-update; clicked => { root.action(Action.offer-game-file, 1); } }
+                                Muted { text: "Also available in Settings > Game-file transfers, alongside Dusklight ISO/RVZ transfers."; }
+                                ActionButton {
+                                    text: root.game-transfers-expanded ? "Hide transfer controls" : "Show transfer controls";
+                                    clicked => { root.game-transfers-expanded = !root.game-transfers-expanded; }
                                 }
-                                Muted { text: root.selected-game == 2 ? "Select an OOT .nup in Game files. Extracted game folders are not transferred." : "Select your base/update .nsp in Game files. Other input formats can be used locally but are not transferred."; }
-                                if root.selected-game == 1: VerticalLayout {
-                                    spacing: 10px;
-                                    SwitchRow { title: "Also allow my console keys to this paired PC"; description: "Sensitive: enable this separately on both PCs in Game setup > Tears of the Kingdom before offering prod.keys. The receiver must also approve each file."; checked: root.key-sharing; toggled(value) => { root.toggle(Toggle.key-sharing, value); } }
-                                    ActionButton { text: "Offer prod.keys"; available: root.can-offer-keys; clicked => { root.action(Action.offer-game-file, 2); } }
+                                if root.game-transfers-expanded: GameInputTransfers {
+                                    game: root.selected-game; sharing: root.game-file-sharing; key-sharing: root.key-sharing;
+                                    can-choose: root.can-manage; can-offer: root.can-offer-game-file; can-offer-update: root.can-offer-update; can-offer-keys: root.can-offer-keys;
+                                    input: root.source-input; update: root.source-update; keys: root.source-keys; reason: root.game-file-transfer-reason;
+                                    choose(kind) => { root.choose-input(kind); }
+                                    offer(kind) => { root.action(Action.offer-game-file, kind); }
+                                    sharing-toggled(value) => { root.toggle(Toggle.game-file-sharing, value); }
+                                    keys-toggled(value) => { root.toggle(Toggle.key-sharing, value); }
                                 }
-                                Muted { text: "NUP/NSP container checks and SHA-256 detect transfer damage, not game ownership, title identity or authenticity. Received files become local setup inputs; review them before building."; }
                             }
                         }
                     }
@@ -1080,14 +1129,33 @@ export component MainWindow inherits Window {
                         Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
-                                SectionTitle { text: "Optional game-disc transfer"; }
-                                Muted { text: "Only your verified Twilight Princess GameCube ISO/RVZ. Disabled by default. Never downloads games."; }
-                                SwitchRow { title: "I own this game and allow disc transfers"; checked: root.disc-sharing; toggled(value) => { root.toggle(Toggle.disc-sharing, value); } }
-                                Muted { text: root.iso-path; }
+                                SectionTitle { text: "Game-file transfers"; }
+                                Muted { text: "Choose a game to offer its local files to your paired PC. Each game has separate permissions; console keys have their own opt-in."; }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Choose ISO / RVZ"; clicked => { root.action(Action.choose-iso, 0); } }
-                                    ActionButton { text: "Offer verified disc"; available: root.can-send-iso; clicked => { root.action(Action.send-iso, 0); } }
+                                    ActionButton { text: "Dusklight"; primary: root.selected-game == 0; clicked => { root.selected-game = 0; root.game-selected(0); } }
+                                    ActionButton { text: "TotK"; primary: root.selected-game == 1; clicked => { root.selected-game = 1; root.game-selected(1); } }
+                                    ActionButton { text: "OOT"; primary: root.selected-game == 2; clicked => { root.selected-game = 2; root.game-selected(2); } }
+                                }
+                                if root.selected-game == 0: VerticalLayout {
+                                    spacing: 12px;
+                                    Muted { text: "Only your verified Twilight Princess GameCube ISO/RVZ. Disabled by default. Never downloads games."; }
+                                    SwitchRow { title: "I own this game and allow disc transfers"; checked: root.disc-sharing; toggled(value) => { root.toggle(Toggle.disc-sharing, value); } }
+                                    Muted { text: root.iso-path; }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        ActionButton { text: "Choose ISO / RVZ"; clicked => { root.action(Action.choose-iso, 0); } }
+                                        ActionButton { text: "Offer verified disc"; available: root.can-send-iso; clicked => { root.action(Action.send-iso, 0); } }
+                                    }
+                                }
+                                if root.selected-game != 0: GameInputTransfers {
+                                    game: root.selected-game; sharing: root.game-file-sharing; key-sharing: root.key-sharing;
+                                    can-choose: root.can-manage; can-offer: root.can-offer-game-file; can-offer-update: root.can-offer-update; can-offer-keys: root.can-offer-keys;
+                                    input: root.source-input; update: root.source-update; keys: root.source-keys; reason: root.game-file-transfer-reason;
+                                    choose(kind) => { root.choose-input(kind); }
+                                    offer(kind) => { root.action(Action.offer-game-file, kind); }
+                                    sharing-toggled(value) => { root.toggle(Toggle.game-file-sharing, value); }
+                                    keys-toggled(value) => { root.toggle(Toggle.key-sharing, value); }
                                 }
                             }
                         }

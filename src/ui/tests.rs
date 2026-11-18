@@ -489,6 +489,9 @@ fn paired_game_file_controls_are_available_in_both_setup_methods() -> Result<()>
         ui.set_selected_game(game);
         ui.set_source_mode(source);
         flush();
+        if button(&ui, "Show transfer controls").is_ok() {
+            activate(&ui, "Show transfer controls")?;
+        }
         if game == 2 {
             activate(&ui, "Offer OOT .nup")?;
             assert_eq!(actions.borrow().last(), Some(&(Action::OfferGameFile, 0)));
@@ -516,6 +519,98 @@ fn paired_game_file_controls_are_available_in_both_setup_methods() -> Result<()>
         activate(&ui, "Decline file")?;
         assert_eq!(actions.borrow().last(), Some(&(Action::DeclineIso, 0)));
     }
+    Ok(())
+}
+
+#[test]
+fn settings_transfer_hub_reuses_selected_inputs_and_routes_only_manual_offers() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 3600.0));
+    ui.set_section(5);
+    ui.set_can_send_iso(true);
+    ui.set_can_offer_game_file(true);
+    ui.set_can_offer_update(true);
+    ui.set_can_offer_keys(true);
+    ui.set_source_input(r"C:\Games\base.nsp".into());
+    ui.set_source_update(r"C:\Games\update.nsp".into());
+    let keys = r"C:\Games\prod.keys";
+    ui.set_source_keys(keys.into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    let choices = Rc::new(RefCell::new(Vec::new()));
+    let recorded = choices.clone();
+    ui.on_choose_input(move |kind| recorded.borrow_mut().push(kind));
+    let games = Rc::new(RefCell::new(Vec::new()));
+    let recorded = games.clone();
+    ui.on_game_selected(move |game| recorded.borrow_mut().push(game));
+    flush();
+    activate(&ui, "Choose ISO / RVZ")?;
+    activate(&ui, "Offer verified disc")?;
+    assert_eq!(
+        &*actions.borrow(),
+        &[(Action::ChooseIso, 0), (Action::SendIso, 0)]
+    );
+    activate(&ui, "TotK")?;
+    assert_eq!(ui.get_selected_game(), 1);
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, keys)
+            .next()
+            .is_some(),
+        "The transfer hub did not reuse the selected build key"
+    );
+    assert_eq!(actions.borrow().len(), 2, "Selecting a game offered a file");
+    for (choose, offer, index) in [
+        ("Choose game file", "Offer TotK base .nsp", 0),
+        ("Choose update file", "Offer TotK update .nsp", 1),
+        ("Choose key file", "Offer prod.keys", 2),
+    ] {
+        activate(&ui, choose)?;
+        assert_eq!(choices.borrow().last(), Some(&index));
+        activate(&ui, offer)?;
+        assert_eq!(
+            actions.borrow().last(),
+            Some(&(Action::OfferGameFile, index))
+        );
+    }
+    activate(&ui, "OOT")?;
+    assert_eq!(ui.get_selected_game(), 2);
+    assert!(button(&ui, "Offer prod.keys").is_err());
+    activate(&ui, "Offer OOT .nup")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::OfferGameFile, 0)));
+    assert_eq!(&*games.borrow(), &[1, 2]);
+    ui.set_can_manage(false);
+    ui.set_can_offer_game_file(false);
+    flush();
+    let offered = actions.borrow().len();
+    activate(&ui, "Choose game file")?;
+    activate(&ui, "Offer OOT .nup")?;
+    assert_eq!(actions.borrow().len(), offered);
+    assert_eq!(&*choices.borrow(), &[0, 1, 2]);
+    ui.window().set_size(slint::LogicalSize::new(720.0, 720.0));
+    ui.set_section(0);
+    ui.set_selected_game(0);
+    ui.set_section(5);
+    flush();
+    let scroll = ElementHandle::find_by_element_type_name(&ui, "ScrollView")
+        .next()
+        .context("Missing settings scroll view")?;
+    for _ in 0..20 {
+        if button(&ui, "TotK").is_ok() {
+            break;
+        }
+        scroll.scroll(0.0, -150.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        flush();
+    }
+    let before = button(&ui, "TotK")?.absolute_position().y;
+    activate(&ui, "TotK")?;
+    let after = button(&ui, "TotK")?.absolute_position().y;
+    ensure!(
+        (before - after).abs() <= 1.0,
+        "Changing transfer game jumped away from the controls"
+    );
     Ok(())
 }
 
