@@ -16,8 +16,11 @@ fn main() -> Result<()> {
     let jobs = arguments
         .next()
         .map(|value| value.parse::<u8>())
-        .transpose()?
-        .unwrap_or(4);
+        .transpose()?;
+    anyhow::ensure!(
+        jobs.is_none_or(|jobs| (1..=16).contains(&jobs)),
+        "Choose 1 to 16 compiler workers"
+    );
     anyhow::ensure!(
         arguments.next().is_none(),
         "Unexpected validation arguments"
@@ -29,7 +32,7 @@ fn main() -> Result<()> {
     let built = source_build::stage_configured(
         game,
         &commit,
-        jobs,
+        jobs.unwrap_or_default(),
         &AtomicBool::new(false),
         &mut |message| {
             println!("{message}");

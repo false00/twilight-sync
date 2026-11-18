@@ -17,6 +17,7 @@ use std::{
 
 pub const REPOSITORY: &str = "false00/twilight-sync";
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const CHECK_COOLDOWN: Duration = Duration::from_secs(10);
 const BINARY: &str = "twilight-sync-windows-x86_64.exe";
 const LIMIT: u64 = 64 * 1024 * 1024;
 

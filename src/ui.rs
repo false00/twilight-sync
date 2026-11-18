@@ -1,4 +1,5 @@
 use crate::{
+    game_file::{Format as TransferFormat, Kind as GameFileKind},
     protocol::GameId,
     runtime::{Backend, Command, HistoryPreviewData, NativeCommand, Snapshot},
     source_build::{self, Method, Preference, SdkSetup},
@@ -10,8 +11,10 @@ use slint::winit_030::{WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::{
     cell::RefCell,
+    future::poll_fn,
     path::{Path, PathBuf},
     rc::Rc,
+    task::{Poll, Waker},
     time::{Duration, Instant},
 };
 use tray_icon::{
@@ -201,7 +204,6 @@ enum Interaction {
     SelectGame(i32),
     ChooseInput(i32),
     ClearInput(i32),
-    SetWorkers(i32),
     Appearance(widgets::AppearanceMode),
 }
 
@@ -213,16 +215,6 @@ impl Interaction {
             Self::SelectGame(index) => controller.select_game(index),
             Self::ChooseInput(kind) => controller.choose_input(kind),
             Self::ClearInput(kind) => controller.clear_input(kind),
-            Self::SetWorkers(workers) => {
-                let mut preference = controller
-                    .snapshot
-                    .source
-                    .preferences
-                    .get(controller.game)
-                    .clone();
-                preference.jobs = u8::try_from(workers).context("Invalid build worker count")?;
-                controller.set_preference(preference)
-            }
             Self::Appearance(mode) => {
                 controller.appearance.set(match mode {
                     widgets::AppearanceMode::System => appearance::Appearance::System,
@@ -291,26 +283,44 @@ impl Dispatcher {
 impl Controller {
     async fn confirm(&self, title: &str, message: impl Into<String>) -> Result<bool> {
         let ui = self.ui.upgrade().context("The window has closed")?;
-        let window = ui.window().window_handle();
         let message = message.into();
         ensure!(
             !title.contains('\0') && !message.contains('\0'),
             "Confirmation text contains invalid null characters"
         );
-        match rfd::AsyncMessageDialog::new()
-            .set_parent(&window)
-            .set_title(title)
-            .set_description(message)
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show()
-            .await
-        {
-            rfd::MessageDialogResult::Yes => Ok(true),
-            rfd::MessageDialogResult::No => Ok(false),
-            result => bail!(
-                "The confirmation was cancelled or could not be displayed ({result:?}); no action was approved"
-            ),
-        }
+        let response = Rc::new(RefCell::new((None, None::<Waker>)));
+        let callback = response.clone();
+        let weak = ui.as_weak();
+        ui.on_confirmation_response(move |approved| {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_confirmation_open(false);
+            }
+            let waker = {
+                let mut state = callback.borrow_mut();
+                state.0 = Some(approved);
+                state.1.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+        ui.show()?;
+        ui.window().set_minimized(false);
+        ui.set_confirmation_title(title.into());
+        ui.set_confirmation_message(message.into());
+        ui.set_confirmation_open(true);
+        let approved = poll_fn(|cx| {
+            let mut state = response.borrow_mut();
+            if let Some(approved) = state.0.take() {
+                Poll::Ready(approved)
+            } else {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await;
+        ui.on_confirmation_response(|_| {});
+        Ok(approved)
     }
 
     fn data_directory(&self) -> Result<PathBuf> {
@@ -421,6 +431,33 @@ impl Controller {
             Toggle::Startup => self.dispatch(Command::SetStartup(value)),
             Toggle::Updates => self.dispatch(Command::SetAutoUpdateChecks(value)),
             Toggle::DiscSharing => self.dispatch(Command::SetIsoEnabled(value)),
+            Toggle::GameFileSharing => {
+                let kind = match self.game {
+                    GameId::Triforce => GameFileKind::OotNup,
+                    GameId::Totk => GameFileKind::TotkBase,
+                    GameId::Dusklight => bail!("Use Dusklight's separate disc-transfer permission"),
+                };
+                self.dispatch(Command::SetGameFileSharing {
+                    kind,
+                    enabled: value,
+                })
+            }
+            Toggle::KeySharing => {
+                ensure!(
+                    self.game == GameId::Totk,
+                    "Select Tears of the Kingdom first"
+                );
+                if value && !self.confirm(
+                    "Allow console-key transfer",
+                    "Console keys are sensitive. Allow transferring your own prod.keys only to your pinned, paired PC over the encrypted LAN connection? The other PC must enable this separately and approve each incoming file. This does not share the app's private pairing identity.",
+                ).await? {
+                    return Ok(());
+                }
+                self.dispatch(Command::SetGameFileSharing {
+                    kind: GameFileKind::TotkKeys,
+                    enabled: value,
+                })
+            }
             Toggle::TextureConsent => {
                 self.texture_consent = value;
                 self.refresh_view()
@@ -474,26 +511,29 @@ impl Controller {
         let dialog = rfd::FileDialog::new();
         let selected = match kind {
             0 if self.game == GameId::Triforce => dialog
-                .set_title("Your Triforce game input")
-                .add_filter("Triforce input", &["nup"])
+                .set_title("Choose your Ocarina of Time game (.nup)")
+                .add_filter("Ocarina of Time game (.nup)", &["nup"])
                 .pick_file(),
-            0 => dialog
-                .set_title("Your TotK base game")
-                .add_filter("Your game dump", &["nsp", "xci", "nsz", "xcz"])
+            0 if self.game == GameId::Totk => dialog
+                .set_title("Choose your Tears of the Kingdom base game")
+                .add_filter(
+                    "TotK base game (.nsp, .xci, .nsz, .xcz)",
+                    &["nsp", "xci", "nsz", "xcz"],
+                )
                 .pick_file(),
-            1 => dialog
-                .set_title("Your supported TotK update")
-                .add_filter("Your game update", &["nsp", "nsz"])
+            1 if self.game == GameId::Totk => dialog
+                .set_title("Choose your Tears of the Kingdom update")
+                .add_filter("TotK update (.nsp, .nsz)", &["nsp", "nsz"])
                 .pick_file(),
-            2 => dialog
+            2 if self.game == GameId::Totk => dialog
                 .set_title("Your console's prod.keys")
                 .add_filter("Console keys", &["keys"])
                 .pick_file(),
-            3 => dialog
+            3 if self.game == GameId::Totk => dialog
                 .set_title("Optional firmware font folder")
                 .pick_folder(),
-            4 => dialog
-                .set_title("Folder with romfs and exefs/.triforce_exefs")
+            4 if self.game == GameId::Triforce => dialog
+                .set_title("Choose extracted Ocarina of Time files (romfs and exefs)")
                 .pick_folder(),
             _ => bail!("Unknown source input"),
         };
@@ -1027,22 +1067,51 @@ impl Controller {
                 );
                 self.dispatch(Command::SendIso)
             }
+            Action::OfferGameFile => {
+                let kind = match (self.game, index) {
+                    (GameId::Triforce, 0) => GameFileKind::OotNup,
+                    (GameId::Totk, 0) => GameFileKind::TotkBase,
+                    (GameId::Totk, 1) => GameFileKind::TotkUpdate,
+                    (GameId::Totk, 2) => GameFileKind::TotkKeys,
+                    _ => bail!("Choose a supported game input to transfer"),
+                };
+                ensure!(
+                    model::can_send_game_file(&self.snapshot, kind),
+                    "Select this file, enable its transfer permission and finish active work on the connected PCs first"
+                );
+                let message = if kind == GameFileKind::TotkKeys {
+                    "Send your selected prod.keys to the pinned paired PC? Console keys are sensitive. Continue only if this is your own trusted PC. Key contents are never written to transfer logs."
+                } else {
+                    "Offer the selected local game file to your paired PC? Continue only if you own the game. The other user must accept and choose a destination. This will not install or launch anything."
+                };
+                if self.confirm(kind.label(), message).await? {
+                    self.dispatch(Command::SendGameFile(kind))?;
+                }
+                Ok(())
+            }
             Action::AcceptIso => {
                 ensure!(
                     model::can_accept_disc(&self.snapshot),
-                    "Enable disc sharing and finish active work before accepting the offered image"
+                    "Enable this file's sharing permission and finish active work before accepting it"
                 );
                 let format = self
                     .snapshot
                     .pending_disc_format
                     .context("Image format missing; decline and request a new offer")?;
+                if format == TransferFormat::Game(GameFileKind::TotkKeys)
+                    && !self.confirm("Receive console keys",
+                        "Receive prod.keys from your pinned paired PC? Console keys are sensitive and will be saved unencrypted at the local destination you choose. This never replaces the app's private pairing identity.").await?
+                {
+                    return Ok(());
+                }
+                let file_name = match format {
+                    TransferFormat::Game(kind) => kind.file_name().to_owned(),
+                    _ => format!("Twilight Princess.{}", format.extension()),
+                };
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save the offered game disc")
-                    .add_filter(
-                        format!("GameCube {}", format.label()),
-                        &[format.extension()],
-                    )
-                    .set_file_name(format!("Twilight Princess.{}", format.extension()))
+                    .set_title(format!("Save offered {}", format.label()))
+                    .add_filter(format.label(), &[format.extension()])
+                    .set_file_name(file_name)
                     .save_file()
                 {
                     self.dispatch(Command::AcceptIso(Some(path)))?;
@@ -1122,6 +1191,12 @@ impl Controller {
             Action::RefreshTextures => self.dispatch(Command::RefreshTextures),
             Action::CancelTextures => self.dispatch(Command::CancelTextures),
             Action::OpenData => open_path(&self.data_directory()?),
+            Action::ProjectLink => match index {
+                0 => open_url("https://github.com/false00"),
+                1 => open_url(env!("CARGO_PKG_REPOSITORY")),
+                2 => open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases")),
+                _ => bail!("Unknown project link"),
+            },
             Action::OpenLicenses => {
                 let path = self.data_directory()?.join("THIRD_PARTY_NOTICES.txt");
                 crate::files::atomic_write(&path, NOTICES.as_bytes())?;
@@ -1215,6 +1290,17 @@ impl Controller {
             appearance::Appearance::Dark => widgets::AppearanceMode::Dark,
         });
         ui.set_version(env!("CARGO_PKG_VERSION").into());
+        ui.set_build_target(
+            format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH).into(),
+        );
+        ui.set_build_profile(
+            if cfg!(debug_assertions) {
+                "Debug"
+            } else {
+                "Release"
+            }
+            .into(),
+        );
         ui.set_connected(snapshot.ready);
         ui.set_connecting(snapshot.connecting);
         ui.set_connection(
@@ -1483,7 +1569,6 @@ impl Controller {
         ui.set_fsr(preference.amd_fsr4);
         ui.set_nvidia(preference.nvidia_dlss);
         ui.set_shaders(preference.prepare_shaders);
-        ui.set_workers(i32::from(preference.jobs));
         ui.set_source_consent(self.approved());
         for (path, setter) in [
             (
@@ -1860,13 +1945,54 @@ impl Controller {
                 .into(),
         );
         ui.set_disc_sharing(snapshot.settings.iso_enabled);
+        let input_kind = if game == GameId::Triforce {
+            GameFileKind::OotNup
+        } else {
+            GameFileKind::TotkBase
+        };
+        ui.set_game_file_sharing(snapshot.game_file_permissions.allows(input_kind));
+        ui.set_key_sharing(snapshot.game_file_permissions.keys);
+        ui.set_can_offer_game_file(model::can_send_game_file(snapshot, input_kind));
+        ui.set_can_offer_update(model::can_send_game_file(
+            snapshot,
+            GameFileKind::TotkUpdate,
+        ));
+        ui.set_can_offer_keys(model::can_send_game_file(snapshot, GameFileKind::TotkKeys));
+        ui.set_game_file_transfer_reason(
+            if !snapshot.ready {
+                "Connect your paired PC in Devices first."
+            } else if !snapshot.game_files_supported {
+                "Update Twilight Sync on both PCs for game-file and console-key transfers."
+            } else if !model::management_available(snapshot)
+                || model::native(snapshot, game).is_some_and(|state| {
+                    state.running
+                        || state.remote_running
+                        || state.busy
+                        || state.updating
+                        || state.launch_pending
+                        || state.recovery_pending
+                })
+                || snapshot.pending_save
+                || snapshot.pending_iso
+                || snapshot.pending_recovery
+                || !snapshot.transfer.is_empty()
+            {
+                "Finish active play, transfers or recovery before offering another input."
+            } else {
+                ""
+            }
+            .into(),
+        );
         ui.set_pending_iso(snapshot.pending_iso);
         ui.set_can_send_iso(model::can_send_disc(snapshot));
         ui.set_can_accept_iso(model::can_accept_disc(snapshot));
         ui.set_disc_offer(
             snapshot
                 .pending_disc_format
-                .map(|format| format!("Incoming {} image. Confirm you own this game, then choose a new destination. Existing files are never overwritten.", format.label()))
+                .map(|format| match format {
+                    TransferFormat::Game(GameFileKind::TotkKeys) => "Incoming console keys (prod.keys). Sensitive: accept only from your own trusted paired PC. Choose a new destination; existing files are never overwritten.".into(),
+                    _ => format!("Incoming {}. Confirm you own this game, then choose a new destination. Existing files are never overwritten.", format.label()),
+                })
                 .unwrap_or_else(|| "Image format missing; decline and request a new offer.".into())
                 .into(),
         );
@@ -1880,6 +2006,7 @@ impl Controller {
                 .into(),
         );
         ui.set_texture_status(snapshot.textures.notice.clone().into());
+        ui.set_texture_reason(model::texture_blocker(snapshot).unwrap_or_default().into());
         ui.set_texture_busy(snapshot.texture_busy);
         ui.set_texture_cancellable(snapshot.textures.cancellable);
         ui.set_texture_recovery(snapshot.textures.recovery_needed);
@@ -2016,6 +2143,10 @@ impl Controller {
         self.refresh_view()?;
         Ok(interaction)
     }
+}
+
+pub fn open_dashboard() -> Result<bool> {
+    background::open_dashboard(WINDOW_TITLE)
 }
 
 pub fn open_dusklight_controls() -> Result<bool> {
@@ -2197,18 +2328,19 @@ fn run_window(
         }
     });
     let weak = Rc::downgrade(&controller);
-    ui.on_set_workers(move |workers| {
-        if let Some(controller) = weak.upgrade() {
-            controller.run(Interaction::SetWorkers(workers));
-        }
-    });
-    let weak = Rc::downgrade(&controller);
     ui.on_appearance_selected(move |mode| {
         if let Some(controller) = weak.upgrade() {
             controller.run(Interaction::Appearance(mode));
         }
     });
+    let weak = ui.as_weak();
     ui.window().on_close_requested(move || {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_confirmation_open()
+        {
+            ui.invoke_confirmation_response(false);
+            return slint::CloseRequestResponse::KeepWindowShown;
+        }
         if demo && let Err(error) = slint::quit_event_loop() {
             eprintln!("Cannot close the UI preview: {error}");
         }

@@ -1,8 +1,9 @@
 use crate::{
     audit::Audit,
     config::{self, Identity, Peer, PlayLock, Settings},
-    disc::{self, Format as DiscFormat, Verified as VerifiedDisc},
+    disc::{self, Verified as VerifiedDisc},
     files::{self, CHUNK_SIZE, ensure_safe_path, valid_hash},
+    game_file::{self, Format as DiscFormat, Kind as GameFileKind},
     history::{self, History},
     install::{self, Installed, ReleaseInfo},
     lan::{self, Advertisement, Discovered, Network},
@@ -58,6 +59,8 @@ pub struct Snapshot {
     pub pending_save: bool,
     pub pending_iso: bool,
     pub pending_disc_format: Option<DiscFormat>,
+    pub game_file_permissions: game_file::Permissions,
+    pub game_files_supported: bool,
     pub pending_recovery: bool,
     pub transfer: String,
     pub install_busy: bool,
@@ -202,12 +205,18 @@ pub enum Command {
     Recover,
     AcceptRecovery(bool),
     SendIso,
+    SendGameFile(GameFileKind),
+    SetGameFileSharing {
+        kind: GameFileKind,
+        enabled: bool,
+    },
     AcceptIso(Option<PathBuf>),
     Install,
     CheckRelease,
     UpdateTotk,
     CheckTotkRelease,
     CheckSelfUpdate,
+    CheckSelfUpdateOnOpen,
     SetAutoUpdateChecks(bool),
     UpdateSelf,
     OpenTextureCreator(String),
@@ -325,7 +334,7 @@ enum Input {
     IsoPrepared {
         id: u64,
         path: PathBuf,
-        result: Result<VerifiedDisc>,
+        result: Result<game_file::Verified>,
     },
     IsoVerified {
         channel: u64,
@@ -358,6 +367,7 @@ struct Link {
     last_seen: Instant,
     game_channels: bool,
     triforce_channels: bool,
+    game_files: bool,
 }
 
 #[derive(Clone)]
@@ -481,6 +491,7 @@ struct Engine {
     incoming_iso: Option<IncomingIso>,
     outgoing_iso: Option<OutgoingIso>,
     iso_preparing: bool,
+    game_file_permissions: game_file::Permissions,
     iso_verifying: Option<DiscVerification>,
     cancel_transfer: Arc<AtomicBool>,
     install_busy: bool,
@@ -500,7 +511,6 @@ struct Engine {
     migrated_backups: bool,
     self_updates: self_update::State,
     last_self_update_check: Option<Instant>,
-    first_self_update_check: Instant,
     last_self_update_cleanup: Instant,
     totk: totk::Channel,
     triforce: totk::Channel,
@@ -610,6 +620,10 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
             }
             if let Err(error) = engine.initialize_self_updates() {
                 engine.report(error);
+            }
+            match game_file::Permissions::load(&engine.root) {
+                Ok(permissions) => engine.game_file_permissions = permissions,
+                Err(error) => engine.report(error),
             }
             if let Err(error) = engine.totk.refresh() {
                 engine.report(error);
@@ -895,6 +909,8 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         pending_save: false,
         pending_iso: false,
         pending_disc_format: None,
+        game_file_permissions: game_file::Permissions::default(),
+        game_files_supported: false,
         pending_recovery: false,
         transfer: String::new(),
         install_busy: false,
@@ -989,6 +1005,7 @@ impl Engine {
             incoming_iso: None,
             outgoing_iso: None,
             iso_preparing: false,
+            game_file_permissions: game_file::Permissions::default(),
             iso_verifying: None,
             cancel_transfer: Arc::new(AtomicBool::new(false)),
             install_busy: false,
@@ -1008,7 +1025,6 @@ impl Engine {
             migrated_backups: false,
             self_updates: self_update::State::default(),
             last_self_update_check: None,
-            first_self_update_check: now + Duration::from_secs(15),
             last_self_update_cleanup: Instant::now(),
             totk,
             triforce,
@@ -1446,7 +1462,7 @@ impl Engine {
                         self.self_updates.error = None;
                         self.self_updates.message = if release.update_available {
                             format!(
-                                "Twilight Sync {} is available. Use Update Twilight Sync in the tray when both games are stopped.",
+                                "Twilight Sync {} is available. Update from Settings or the tray.",
                                 release.tag
                             )
                         } else {
@@ -1487,7 +1503,7 @@ impl Engine {
                 })();
                 if let Err(error) = safe {
                     self.self_updates.error = Some(format!("Update deferred: {error:#}"));
-                    self.self_updates.message = "Gameplay or a transfer began during preparation. The update was cancelled without stopping the game.".into();
+                    self.self_updates.message = "A local operation began during preparation. Retry the update when this PC is ready.".into();
                     self.self_updates.preparing = true;
                     let sender = self.sender.clone();
                     thread::spawn(move || {
@@ -1620,11 +1636,13 @@ impl Engine {
                     Ok(verified) => verified,
                     Err(error) => {
                         self.transfer.clear();
-                        return Err(error)
-                            .context("Disc image verification failed before any offer");
+                        return Err(error).context("File verification failed before any offer");
                     }
                 };
                 self.require_idle()?;
+                if let DiscFormat::Game(kind) = verified.format {
+                    self.require_file_transfer_idle(kind)?;
+                }
                 let transfer_id = token();
                 let event = match verified.format {
                     DiscFormat::Iso => Event::IsoOffer {
@@ -1637,6 +1655,22 @@ impl Engine {
                         hash: verified.sha256.clone(),
                         size: verified.size,
                     },
+                    DiscFormat::Game(kind) => {
+                        ensure!(
+                            self.game_files_supported(),
+                            "Update both PCs before transferring game files"
+                        );
+                        ensure!(
+                            self.game_file_permissions.allows(kind),
+                            "Game-file transfer permission was revoked"
+                        );
+                        Event::GameFileOffer {
+                            id: transfer_id.clone(),
+                            hash: verified.sha256.clone(),
+                            size: verified.size,
+                            kind,
+                        }
+                    }
                 };
                 self.send(&event)?;
                 self.outgoing_iso = Some(OutgoingIso {
@@ -1678,7 +1712,7 @@ impl Engine {
                 self.iso_verifying = None;
                 let validation = result.and_then(|verified| {
                     ensure!(
-                        verified.format == pending.format
+                        DiscFormat::from(verified.format) == pending.format
                             && verified.size == pending.size
                             && verified.sha256 == pending.hash,
                         "Verified RVZ differs from the approved transfer"
@@ -1807,15 +1841,15 @@ impl Engine {
     fn require_self_update_idle(&mut self) -> Result<()> {
         self.game_running = self.process.game_running();
         ensure!(
-            !self.game_running && !self.remote.as_ref().is_some_and(|remote| remote.game),
-            "Stop Dusklight on both devices before updating Twilight Sync"
+            !self.game_running,
+            "Close Dusklight on this PC before updating Twilight Sync"
         );
         ensure!(
             !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
             "Finish the current installation, texture operation, or app update"
         );
-        self.totk.require_app_update_idle()?;
-        self.triforce.require_app_update_idle()?;
+        self.totk.require_manager_restart_idle()?;
+        self.triforce.require_manager_restart_idle()?;
         ensure!(
             self.no_transfer()
                 && self.child.is_none()
@@ -2560,7 +2594,7 @@ impl Engine {
                 ensure!(self.no_transfer(), "Another transfer is active");
                 ensure_safe_path(&path)?;
                 ensure!(path.is_file(), "Select your own disc image file");
-                let format = DiscFormat::from_path(&path)?;
+                let format = disc::Format::from_path(&path)?;
                 self.store(|s| s.iso_file = Some(path))?;
                 self.message = format!(
                     "{} selected. Full original-disc verification happens before any offer.",
@@ -2725,7 +2759,8 @@ impl Engine {
                 self.transfer =
                     "Verifying the entire reconstructed disc against the official hash...".into();
                 thread::spawn(move || {
-                    let result = disc::verify_with_cancel(&path, cancel);
+                    let result =
+                        disc::verify_with_cancel(&path, cancel).map(game_file::Verified::from);
                     if sender
                         .send(Input::IsoPrepared { id, path, result })
                         .is_err()
@@ -2734,10 +2769,78 @@ impl Engine {
                     }
                 });
             }
+            Command::SetGameFileSharing { kind, enabled } => {
+                self.require_idle()?;
+                ensure!(
+                    self.no_transfer(),
+                    "Finish the current transfer before changing permissions"
+                );
+                let mut permissions = self.game_file_permissions.clone();
+                permissions.set(kind, enabled);
+                permissions.persist(&self.root)?;
+                self.game_file_permissions = permissions;
+                self.audit.record(
+                    "game-file-permission-changed",
+                    None,
+                    None,
+                    None,
+                    &format!(
+                        "{}: {}",
+                        kind.label(),
+                        if enabled {
+                            "enabled by user"
+                        } else {
+                            "disabled"
+                        }
+                    ),
+                )?;
+            }
+            Command::SendGameFile(kind) => {
+                ensure!(
+                    self.game_files_supported(),
+                    "Connect your paired PC and update both apps for game-file transfer"
+                );
+                ensure!(
+                    self.game_file_permissions.allows(kind),
+                    "Enable this game-file transfer permission first"
+                );
+                self.require_file_transfer_idle(kind)?;
+                ensure!(self.no_transfer(), "Another transfer is active");
+                let preference = self.source.preferences.get(kind.game());
+                let path = match kind {
+                    GameFileKind::OotNup | GameFileKind::TotkBase => &preference.game_input,
+                    GameFileKind::TotkUpdate => &preference.update,
+                    GameFileKind::TotkKeys => &preference.keys,
+                }
+                .clone()
+                .context("Select this local game input in Game setup first")?;
+                let id = self.link.as_ref().context("No paired channel")?.id;
+                let sender = self.sender.clone();
+                let cancel = self.cancel_transfer.clone();
+                self.iso_preparing = true;
+                self.transfer = format!(
+                    "Checking {} and calculating SHA-256 before offering it...",
+                    kind.label()
+                );
+                thread::spawn(move || {
+                    let result = game_file::verify(&path, kind, &cancel);
+                    if sender
+                        .send(Input::IsoPrepared { id, path, result })
+                        .is_err()
+                    {
+                        eprintln!("Twilight Sync stopped during game-file verification");
+                    }
+                });
+            }
             Command::AcceptIso(destination) => self.accept_iso(destination)?,
             Command::CheckRelease => self.begin_game_release_check(protocol::GameId::Dusklight)?,
             Command::CheckTotkRelease => self.begin_game_release_check(protocol::GameId::Totk)?,
             Command::CheckSelfUpdate => self.begin_self_update_check()?,
+            Command::CheckSelfUpdateOnOpen => {
+                if self.should_check_for_app_update(self_update::CHECK_COOLDOWN) {
+                    self.begin_self_update_check()?;
+                }
+            }
             Command::SetAutoUpdateChecks(enabled) => {
                 self_update::set_enabled(&self.root, enabled)?;
                 self.audit.record(
@@ -2746,7 +2849,7 @@ impl Engine {
                     None,
                     None,
                     if enabled {
-                        "Enabled: startup and every six hours; never automatic installation"
+                        "Enabled: startup, dashboard open and every six hours; never automatic installation"
                     } else {
                         "Disabled; manual checks remain available"
                     },
@@ -2754,7 +2857,6 @@ impl Engine {
                 self.self_updates.enabled = enabled;
                 if enabled {
                     self.last_self_update_check = None;
-                    self.first_self_update_check = Instant::now();
                 }
             }
             Command::UpdateSelf => {
@@ -3290,6 +3392,11 @@ impl Engine {
             .get(&session.remote_key)
             .and_then(|device| device.triforce_seen)
             .is_some_and(|seen| seen.elapsed() < Duration::from_secs(8));
+        let game_files = self
+            .devices
+            .get(&session.remote_key)
+            .and_then(|device| device.game_files_seen)
+            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(8));
         self.link = Some(Link {
             id,
             key: session.remote_key,
@@ -3304,6 +3411,7 @@ impl Engine {
             last_seen: Instant::now(),
             game_channels,
             triforce_channels,
+            game_files,
         });
         self.remote = None;
         self.send(&Event::Hello {
@@ -3449,11 +3557,11 @@ impl Engine {
                     || self
                         .iso_offer
                         .as_ref()
-                        .is_some_and(|image| image.format == DiscFormat::Rvz)
+                        .is_some_and(|image| image.format != DiscFormat::Iso)
                     || self
                         .incoming_iso
                         .as_ref()
-                        .is_some_and(|image| image.format == DiscFormat::Rvz)
+                        .is_some_and(|image| image.format != DiscFormat::Iso)
                 {
                     self.iso_offer = None;
                     self.incoming_iso = None;
@@ -3982,6 +4090,18 @@ impl Engine {
             Event::RvzOffer { id, hash, size } => {
                 self.receive_disc_offer(DiscFormat::Rvz, id, hash, size)?
             }
+            Event::GameFileOffer {
+                id,
+                hash,
+                size,
+                kind,
+            } => {
+                ensure!(
+                    self.game_files_supported(),
+                    "Peer game-file support was not negotiated"
+                );
+                self.receive_disc_offer(DiscFormat::Game(kind), id, hash, size)?;
+            }
             Event::IsoAccept { id } => self.stream_iso(&id)?,
             Event::IsoChunk { id, bytes } => {
                 let incoming = self
@@ -4036,12 +4156,18 @@ impl Engine {
                 self.audit.record(
                     "iso-acknowledged",
                     Some(&outgoing.path),
-                    Some(&outgoing.hash),
+                    outgoing.format.audit_hash(&outgoing.hash),
                     Some(&peer),
-                    "Peer verified official disc hash and SHA-256 before committing",
+                    if matches!(outgoing.format, DiscFormat::Game(_)) {
+                        "Peer checked the container and SHA-256 before committing"
+                    } else {
+                        "Peer verified official disc hash and SHA-256 before committing"
+                    },
                 )?;
+                let label = outgoing.format.label();
                 self.outgoing_iso = None;
-                self.transfer = "Disc image synced and verified on the other device.".into();
+                self.transfer.clear();
+                self.message = format!("{label} synced and verified on the other device.");
             }
             _ => bail!("Unexpected twilightProto event in the paired state"),
         }
@@ -4865,7 +4991,7 @@ impl Engine {
         );
         ensure!(
             self.last_self_update_check
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(10)),
+                .is_none_or(|last| last.elapsed() >= self_update::CHECK_COOLDOWN),
             "Update checks are rate limited; retry shortly"
         );
         self.audit.record(
@@ -4889,6 +5015,16 @@ impl Engine {
             }
         });
         Ok(())
+    }
+
+    fn should_check_for_app_update(&self, interval: Duration) -> bool {
+        !self.maintenance
+            && self.self_updates.enabled
+            && !self.self_updates.checking
+            && !self.self_updates.preparing
+            && self
+                .last_self_update_check
+                .is_none_or(|last| last.elapsed() >= interval)
     }
 
     fn reload_textures(&mut self) -> Result<()> {
@@ -5031,14 +5167,7 @@ impl Engine {
     }
 
     fn tick(&mut self) -> Result<()> {
-        if self.self_updates.enabled
-            && !self.self_updates.checking
-            && !self.self_updates.preparing
-            && self.last_self_update_check.map_or_else(
-                || Instant::now() >= self.first_self_update_check,
-                |last| last.elapsed() >= self_update::CHECK_INTERVAL,
-            )
-        {
+        if self.should_check_for_app_update(self_update::CHECK_INTERVAL) {
             self.begin_self_update_check()?;
         }
         if !self.self_updates.preparing
@@ -5145,7 +5274,12 @@ impl Engine {
             .retain(|_, d| d.seen.elapsed() < Duration::from_secs(8));
         if self.last_discovery.elapsed() >= Duration::from_secs(2) {
             self.last_discovery = Instant::now();
-            for magic in ["twilightProto/1", "twilightProto/2", "twilightProto/3"] {
+            for magic in [
+                "twilightProto/1",
+                "twilightProto/2",
+                "twilightProto/3",
+                "twilightProto/4",
+            ] {
                 let bytes = serde_json::to_vec(&Advertisement {
                     magic: magic.into(),
                     network: network.fingerprint.clone(),
@@ -5183,6 +5317,13 @@ impl Engine {
                                     .and_then(|previous| previous.triforce_seen)
                                     .filter(|seen| seen.elapsed() < Duration::from_secs(8));
                             }
+                            if device.game_files_seen.is_none() {
+                                device.game_files_seen = self
+                                    .devices
+                                    .get(&device.key)
+                                    .and_then(|previous| previous.game_files_seen)
+                                    .filter(|seen| seen.elapsed() < Duration::from_secs(8));
+                            }
                             if self.devices.contains_key(&device.key) || self.devices.len() < 32 {
                                 if let Some(link) = &mut self.link
                                     && link.key == device.key
@@ -5190,6 +5331,7 @@ impl Engine {
                                 {
                                     link.game_channels = true;
                                     link.triforce_channels |= device.triforce_seen.is_some();
+                                    link.game_files |= device.game_files_seen.is_some();
                                 }
                                 self.devices.insert(device.key.clone(), device);
                             }
@@ -5394,6 +5536,37 @@ impl Engine {
         Ok(())
     }
 
+    fn game_files_supported(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|link| link.ready && link.game_files)
+    }
+
+    fn file_transfer_enabled(&self, format: DiscFormat) -> bool {
+        match format {
+            DiscFormat::Game(kind) => {
+                self.game_files_supported() && self.game_file_permissions.allows(kind)
+            }
+            _ => self.settings.iso_enabled,
+        }
+    }
+
+    fn require_file_transfer_idle(&mut self, kind: GameFileKind) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
+        ensure!(
+            self.source.preferences_valid,
+            "Reset invalid game-input preferences first"
+        );
+        let channel = self.native_channel(kind.game())?;
+        channel.require_manager_restart_idle()?;
+        ensure!(
+            !channel.status.remote_running,
+            "Close this game on the other PC before transferring its inputs"
+        );
+        Ok(())
+    }
+
     fn receive_disc_offer(
         &mut self,
         format: DiscFormat,
@@ -5402,10 +5575,14 @@ impl Engine {
         size: u64,
     ) -> Result<()> {
         ensure!(
-            self.settings.iso_enabled,
-            "Disc-image transfer is disabled locally"
+            self.file_transfer_enabled(format),
+            "This file transfer is disabled locally"
         );
-        self.require_idle()?;
+        if let DiscFormat::Game(kind) = format {
+            self.require_file_transfer_idle(kind)?;
+        } else {
+            self.require_idle()?;
+        }
         ensure!(self.no_transfer(), "A transfer is already active");
         ensure!(
             valid_hash(&id) && valid_hash(&hash),
@@ -5432,9 +5609,13 @@ impl Engine {
             .take()
             .context("No incoming disc-image offer")?;
         if let Some(destination) = destination {
-            self.require_idle()?;
+            if let DiscFormat::Game(kind) = offer.format {
+                self.require_file_transfer_idle(kind)?;
+            } else {
+                self.require_idle()?;
+            }
             ensure!(
-                self.settings.iso_enabled && offer.deadline > Instant::now(),
+                self.file_transfer_enabled(offer.format) && offer.deadline > Instant::now(),
                 "Disc-image permission or offer expired"
             );
             ensure_safe_path(&destination)?;
@@ -5443,7 +5624,7 @@ impl Engine {
                 "Choose a new destination; existing disc images are never overwritten"
             );
             ensure!(
-                DiscFormat::from_path(&destination)? == offer.format,
+                offer.format.matches_path(&destination),
                 "The destination extension must match the offered {} image",
                 offer.format.label()
             );
@@ -5460,7 +5641,7 @@ impl Engine {
             self.audit.record(
                 "iso-receive-approved",
                 Some(&destination),
-                Some(&offer.hash),
+                offer.format.audit_hash(&offer.hash),
                 Some(&self.peer_key()?),
                 "User explicitly approved this disc image and local destination",
             )?;
@@ -5488,8 +5669,16 @@ impl Engine {
 
     fn stream_iso(&mut self, id: &str) -> Result<()> {
         self.require_idle()?;
+        let format = self
+            .outgoing_iso
+            .as_ref()
+            .context("No outgoing file offer")?
+            .format;
+        if let DiscFormat::Game(kind) = format {
+            self.require_file_transfer_idle(kind)?;
+        }
         ensure!(
-            self.settings.iso_enabled,
+            self.file_transfer_enabled(format),
             "Disc-image permission was revoked"
         );
         let outgoing = self
@@ -5510,7 +5699,10 @@ impl Engine {
         let writer = link.writer.clone();
         let sender = self.sender.clone();
         let cancel = self.cancel_transfer.clone();
-        self.transfer = "Streaming approved disc image in bounded 32 KiB chunks...".into();
+        self.transfer = format!(
+            "Streaming approved {} in bounded 32 KiB chunks...",
+            format.label()
+        );
         thread::spawn(move || {
             let result = (|| -> Result<()> {
                 ensure_safe_path(&path)?;
@@ -5519,7 +5711,7 @@ impl Engine {
                     file.metadata()?.len() == size,
                     "Disc image changed since verification"
                 );
-                let mut buffer = [0; CHUNK_SIZE];
+                let mut buffer = zeroize::Zeroizing::new([0; CHUNK_SIZE]);
                 let mut sha = Sha256::new();
                 let mut total = 0_u64;
                 loop {
@@ -5527,7 +5719,7 @@ impl Engine {
                         !cancel.load(Ordering::Acquire),
                         "Disc-image transfer was cancelled"
                     );
-                    let count = file.read(&mut buffer)?;
+                    let count = file.read(&mut buffer[..])?;
                     if count == 0 {
                         break;
                     }
@@ -5580,6 +5772,13 @@ impl Engine {
                 "Received ISO is not an unmodified official disc"
             );
         }
+        if let DiscFormat::Game(kind) = incoming.format {
+            game_file::validate_container(
+                &mut File::open(incoming.temporary.path())?,
+                kind,
+                incoming.size,
+            )?;
+        }
         incoming.temporary.as_file().sync_all()?;
         let pending = PendingDisc {
             id: incoming.id,
@@ -5589,7 +5788,7 @@ impl Engine {
             destination: incoming.destination,
             temporary: incoming.temporary.into_temp_path(),
         };
-        if pending.format == DiscFormat::Iso {
+        if pending.format != DiscFormat::Rvz {
             return self.commit_disc(pending);
         }
         let channel = self
@@ -5623,9 +5822,13 @@ impl Engine {
 
     fn commit_disc(&mut self, incoming: PendingDisc) -> Result<()> {
         self.game_running = self.process.game_running();
-        self.require_idle()?;
+        if let DiscFormat::Game(kind) = incoming.format {
+            self.require_file_transfer_idle(kind)?;
+        } else {
+            self.require_idle()?;
+        }
         ensure!(
-            self.ready() && self.trusted_network() && self.settings.iso_enabled,
+            self.ready() && self.trusted_network() && self.file_transfer_enabled(incoming.format),
             "Disc permission or the trusted channel changed before commit"
         );
         ensure_safe_path(&incoming.destination)?;
@@ -5636,16 +5839,32 @@ impl Engine {
         self.audit.record(
             "iso-committed",
             Some(&incoming.destination),
-            Some(&incoming.hash),
+            incoming.format.audit_hash(&incoming.hash),
             Some(&self.peer_key()?),
             &format!(
-                "{}: reconstructed official XXH3-128 and transfer SHA-256 verified; never executed",
+                "{}: transfer verified; file committed without execution",
                 incoming.format.label()
             ),
         )?;
-        self.store(|s| s.iso_file = Some(incoming.destination))?;
+        if let DiscFormat::Game(kind) = incoming.format {
+            let mut preferences = self.source.preferences.clone();
+            let mut preference = preferences.get(kind.game()).clone();
+            match kind {
+                GameFileKind::OotNup | GameFileKind::TotkBase => {
+                    preference.game_input = Some(incoming.destination)
+                }
+                GameFileKind::TotkUpdate => preference.update = Some(incoming.destination),
+                GameFileKind::TotkKeys => preference.keys = Some(incoming.destination),
+            }
+            preferences.set(kind.game(), preference)?;
+            preferences.persist(&self.root)?;
+            self.source.preferences = preferences;
+        } else {
+            self.store(|s| s.iso_file = Some(incoming.destination))?;
+        }
         self.send(&Event::IsoReceived { id: incoming.id })?;
-        self.transfer = format!(
+        self.transfer.clear();
+        self.message = format!(
             "{} received, verified, and committed.",
             incoming.format.label()
         );
@@ -5681,6 +5900,8 @@ impl Engine {
             pending_save: self.pending_save.is_some(),
             pending_iso: self.iso_offer.is_some(),
             pending_disc_format: self.iso_offer.as_ref().map(|offer| offer.format),
+            game_file_permissions: self.game_file_permissions.clone(),
+            game_files_supported: self.game_files_supported(),
             pending_recovery: self.pending_recovery.is_some(),
             transfer: self.transfer.clone(),
             install_busy: self.install_busy,
@@ -6669,6 +6890,54 @@ mod tests {
     }
 
     #[test]
+    fn app_update_is_not_blocked_by_play_on_the_paired_pc() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), None)?;
+        h.left.remote = Some(RemoteState {
+            hash: None,
+            save_ready: false,
+            game: true,
+            lock: None,
+        });
+        h.left.totk.status.remote_running = true;
+        h.left.triforce.status.remote_running = true;
+        h.left.require_self_update_idle()?;
+        assert!(h.left.totk.require_app_update_idle().is_err());
+        assert!(h.left.triforce.require_app_update_idle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn opening_the_dashboard_allows_a_check_before_the_periodic_interval() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), None)?;
+        h.left.maintenance = false;
+        h.left.self_updates.enabled = true;
+        assert!(
+            h.left
+                .should_check_for_app_update(self_update::CHECK_INTERVAL)
+        );
+        h.left.last_self_update_check = Some(Instant::now());
+        assert!(
+            !h.left
+                .should_check_for_app_update(self_update::CHECK_COOLDOWN)
+        );
+        h.left.last_self_update_check = Instant::now().checked_sub(Duration::from_secs(60));
+        assert!(
+            h.left
+                .should_check_for_app_update(self_update::CHECK_COOLDOWN)
+        );
+        assert!(
+            !h.left
+                .should_check_for_app_update(self_update::CHECK_INTERVAL)
+        );
+        h.left.self_updates.enabled = false;
+        assert!(
+            !h.left
+                .should_check_for_app_update(self_update::CHECK_COOLDOWN)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn app_updates_require_verified_availability_and_an_idle_manager() -> Result<()> {
         let mut h = Harness::new(Some(variant(1)), None)?;
         h.left.self_updates.preparing = true;
@@ -7128,6 +7397,168 @@ mod tests {
     }
 
     #[test]
+    fn game_file_transfers_commit_only_approved_inputs_over_the_encrypted_channel() -> Result<()> {
+        for kind in [
+            GameFileKind::OotNup,
+            GameFileKind::TotkBase,
+            GameFileKind::TotkUpdate,
+            GameFileKind::TotkKeys,
+        ] {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.left
+                .link
+                .as_mut()
+                .context("No sender channel")?
+                .game_files = true;
+            h.right
+                .link
+                .as_mut()
+                .context("No receiver channel")?
+                .game_files = true;
+            h.left.command(Command::SetGameFileSharing {
+                kind,
+                enabled: true,
+            })?;
+            h.right.command(Command::SetGameFileSharing {
+                kind,
+                enabled: true,
+            })?;
+            let bytes = game_file::tests::fixture(kind);
+            let source = h.left.root.join(kind.file_name());
+            fs::write(&source, &bytes)?;
+            let mut preference = h.left.source.preferences.get(kind.game()).clone();
+            match kind {
+                GameFileKind::OotNup | GameFileKind::TotkBase => {
+                    preference.game_input = Some(source.clone())
+                }
+                GameFileKind::TotkUpdate => preference.update = Some(source.clone()),
+                GameFileKind::TotkKeys => preference.keys = Some(source.clone()),
+            }
+            h.left.command(Command::SetSourcePreference {
+                game: kind.game(),
+                preference,
+            })?;
+            h.left.command(Command::SendGameFile(kind))?;
+            h.pump_until(|h| h.right.iso_offer.is_some())?;
+            let destination = h.right.root.join(kind.file_name());
+            assert!(!destination.exists() && h.right.incoming_iso.is_none());
+            h.right
+                .command(Command::AcceptIso(Some(destination.clone())))?;
+            h.pump_until(|h| destination.exists() && h.left.outgoing_iso.is_none())?;
+            assert_eq!(fs::read(&destination)?, bytes);
+            assert!(h.left.no_transfer() && h.right.no_transfer());
+            assert!(h.left.transfer.is_empty() && h.right.transfer.is_empty());
+            let preferences = source_build::Preferences::load(&h.right.root)?;
+            let received = preferences.get(kind.game());
+            assert_eq!(
+                match kind {
+                    GameFileKind::OotNup | GameFileKind::TotkBase => &received.game_input,
+                    GameFileKind::TotkUpdate => &received.update,
+                    GameFileKind::TotkKeys => &received.keys,
+                },
+                &Some(destination)
+            );
+            assert!(h.right.settings.iso_file.is_none());
+            if kind == GameFileKind::TotkKeys {
+                for root in [&h.left.root, &h.right.root] {
+                    let log = fs::read_to_string(root.join("logs").join("audit.jsonl"))?;
+                    assert!(!log.contains(&"00".repeat(16)));
+                    assert!(!log.contains(&files::sha256(&bytes)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn game_file_offers_require_capability_consent_and_the_matching_destination() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+        h.pair()?;
+        let offer = |kind| Event::GameFileOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+            kind,
+        };
+        assert!(h.right.event(offer(GameFileKind::OotNup)).is_err());
+        h.right
+            .link
+            .as_mut()
+            .context("No receiver channel")?
+            .game_files = true;
+        assert!(h.right.event(offer(GameFileKind::OotNup)).is_err());
+        h.right.command(Command::SetGameFileSharing {
+            kind: GameFileKind::OotNup,
+            enabled: true,
+        })?;
+        assert!(h.right.event(offer(GameFileKind::TotkKeys)).is_err());
+        h.right.event(offer(GameFileKind::OotNup))?;
+        let existing = h.right.root.join("existing.nup");
+        fs::write(&existing, b"preserve this")?;
+        assert!(h.right.accept_iso(Some(existing.clone())).is_err());
+        assert_eq!(fs::read(existing)?, b"preserve this");
+        h.right.event(offer(GameFileKind::OotNup))?;
+        assert!(
+            h.right
+                .accept_iso(Some(h.right.root.join("wrong.nsp")))
+                .is_err()
+        );
+        assert!(h.right.incoming_iso.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn received_game_files_reject_corruption_and_discard_interrupted_staging() -> Result<()> {
+        for corrupt in [false, true] {
+            let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+            h.pair()?;
+            h.right
+                .link
+                .as_mut()
+                .context("No receiver channel")?
+                .game_files = true;
+            h.right.command(Command::SetGameFileSharing {
+                kind: GameFileKind::OotNup,
+                enabled: true,
+            })?;
+            let id = token();
+            let bytes = game_file::tests::fixture(GameFileKind::OotNup);
+            h.right.event(Event::GameFileOffer {
+                id: id.clone(),
+                hash: files::sha256(&bytes),
+                size: bytes.len() as u64,
+                kind: GameFileKind::OotNup,
+            })?;
+            let destination = h.right.root.join("received.nup");
+            h.right.accept_iso(Some(destination.clone()))?;
+            let staging = h
+                .right
+                .incoming_iso
+                .as_ref()
+                .context("No staging")?
+                .temporary
+                .path()
+                .to_owned();
+            let mut modified = bytes.clone();
+            if corrupt {
+                modified[200] ^= 1;
+            }
+            h.right.event(Event::IsoChunk {
+                id: id.clone(),
+                bytes: modified,
+            })?;
+            if corrupt {
+                assert!(h.right.finish_iso(&id).is_err());
+            } else {
+                h.right.disconnect("Test interrupted input transfer");
+            }
+            assert!(!staging.exists() && !destination.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn iso_transfer_is_a_separate_disabled_by_default_permission() -> Result<()> {
         let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
         h.pair()?;
@@ -7227,7 +7658,7 @@ mod tests {
         let source = h.left.root.join("modified.rvz");
         fs::write(&source, &bytes)?;
         let verified = VerifiedDisc {
-            format: DiscFormat::Rvz,
+            format: disc::Format::Rvz,
             sha256: files::sha256(&bytes),
             size: bytes.len() as u64,
         };
@@ -7235,7 +7666,7 @@ mod tests {
         h.left.input(Input::IsoPrepared {
             id: h.left.link.as_ref().context("Missing source channel")?.id,
             path: source,
-            result: Ok(verified),
+            result: Ok(verified.into()),
         })?;
         h.pump_until(|h| h.right.iso_offer.is_some())?;
         let destination = h.right.root.join("must-not-commit.rvz");
@@ -7299,7 +7730,7 @@ mod tests {
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
         let verified = VerifiedDisc {
-            format: DiscFormat::Rvz,
+            format: disc::Format::Rvz,
             sha256: files::sha256(&bytes),
             size: bytes.len() as u64,
         };
@@ -7307,7 +7738,7 @@ mod tests {
             id: token(),
             hash: verified.sha256.clone(),
             size: verified.size,
-            format: verified.format,
+            format: verified.format.into(),
             temporary: temporary.into_temp_path(),
             destination,
         });
@@ -7351,9 +7782,10 @@ mod tests {
                 assert_eq!(h.right.settings.iso_file.as_ref(), Some(&destination));
                 assert!(
                     h.right
-                        .transfer
+                        .message
                         .contains("RVZ received, verified, and committed")
                 );
+                assert!(h.right.transfer.is_empty());
             }
         }
         Ok(())
@@ -7379,7 +7811,7 @@ mod tests {
                     Ok(verified)
                 }
                 _ => {
-                    verified.format = DiscFormat::Iso;
+                    verified.format = disc::Format::Iso;
                     Ok(verified)
                 }
             };

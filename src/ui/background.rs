@@ -32,6 +32,7 @@ struct Pump {
     last_status: RefCell<String>,
     attention: Cell<bool>,
     error: RefCell<Option<String>>,
+    dashboard_message: u32,
     open_message: u32,
     game_message: u32,
     open_game_controls: Cell<Option<crate::protocol::GameId>>,
@@ -59,6 +60,10 @@ fn open_message() -> std::io::Result<u32> {
     register_message("TwilightSync.OpenDusklightControls.v1")
 }
 
+fn dashboard_message() -> std::io::Result<u32> {
+    register_message("TwilightSync.OpenDashboard.v1")
+}
+
 fn register_message(name: &str) -> std::io::Result<u32> {
     let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let message = unsafe { RegisterWindowMessageW(name.as_ptr()) };
@@ -73,6 +78,24 @@ pub(super) fn open_game_controls(title: &str) -> Result<bool> {
 }
 
 pub(super) fn open_selected_game(title: &str, game: crate::protocol::GameId) -> Result<bool> {
+    let message = if game == crate::protocol::GameId::Dusklight {
+        open_message()?
+    } else {
+        register_message("TwilightSync.OpenGameControls.v2")?
+    };
+    let argument = match game {
+        crate::protocol::GameId::Dusklight => 0,
+        crate::protocol::GameId::Totk => 1,
+        crate::protocol::GameId::Triforce => 2,
+    };
+    request_open(title, message, argument)
+}
+
+pub(super) fn open_dashboard(title: &str) -> Result<bool> {
+    request_open(title, dashboard_message()?, 0)
+}
+
+fn request_open(title: &str, message: u32, argument: WPARAM) -> Result<bool> {
     let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
     let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
     if window.is_null() {
@@ -83,27 +106,19 @@ pub(super) fn open_selected_game(title: &str, game: crate::protocol::GameId) -> 
         unsafe {
             SendMessageTimeoutW(
                 window,
-                if game == crate::protocol::GameId::Dusklight {
-                    open_message()?
-                } else {
-                    register_message("TwilightSync.OpenGameControls.v2")?
-                },
-                match game {
-                    crate::protocol::GameId::Dusklight => 0,
-                    crate::protocol::GameId::Totk => 1,
-                    crate::protocol::GameId::Triforce => 2,
-                },
+                message,
+                argument,
                 0,
                 SMTO_ABORTIFHUNG | SMTO_BLOCK,
                 2000,
                 &mut response,
             )
         } != 0,
-        "The running manager did not respond; close any dialog and try the desktop shortcut again"
+        "The running manager did not respond; close any dialog and try again"
     );
     ensure!(
         response == 1,
-        "The running manager must be restarted with the updated app before opening this shortcut"
+        "Open Twilight Sync from the tray, or restart the running manager to use this shortcut"
     );
     Ok(true)
 }
@@ -123,6 +138,7 @@ impl BackgroundGuard {
             last_status: RefCell::new(String::new()),
             attention: Cell::new(false),
             error: RefCell::new(None),
+            dashboard_message: dashboard_message()?,
             open_message: open_message()?,
             game_message: register_message("TwilightSync.OpenGameControls.v2")?,
             open_game_controls: Cell::new(None),
@@ -152,7 +168,7 @@ impl BackgroundGuard {
     }
 
     pub(super) fn reveal(&self) {
-        reveal(self.pump.window, &self.pump.ui);
+        self.pump.reveal_dashboard();
     }
 
     pub(super) fn error(&self) -> Option<String> {
@@ -193,6 +209,12 @@ unsafe extern "system" fn window_message(
     _: usize,
 ) -> LRESULT {
     let pump = PUMP.with(|cell| cell.borrow().clone());
+    if let Some(pump) = &pump
+        && message == pump.dashboard_message
+    {
+        pump.reveal_dashboard();
+        return 1;
+    }
     if let Some(pump) = pump
         && (message == pump.open_message || (message == pump.game_message && wparam <= 2))
     {
@@ -204,7 +226,7 @@ unsafe extern "system" fn window_message(
             } else {
                 crate::protocol::GameId::Dusklight
             }));
-        reveal(pump.window, &pump.ui);
+        pump.reveal_dashboard();
         return 1;
     }
     if message == WM_NCDESTROY
@@ -216,6 +238,17 @@ unsafe extern "system" fn window_message(
 }
 
 impl Pump {
+    fn reveal_dashboard(&self) {
+        reveal(self.window, &self.ui);
+        if let Err(error) = self
+            .backend
+            .command(crate::runtime::Command::CheckSelfUpdateOnOpen)
+        {
+            *self.error.borrow_mut() =
+                Some(format!("Could not request an update check: {error:#}"));
+        }
+    }
+
     fn update(&self) -> Result<()> {
         let snapshot = self.backend.snapshot()?;
         let status = if snapshot.error.is_some() || snapshot.textures.recovery_needed {

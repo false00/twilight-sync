@@ -3,6 +3,7 @@ pub mod config;
 pub mod desktop;
 pub mod disc;
 pub mod files;
+pub mod game_file;
 pub mod history;
 pub mod install;
 pub mod lan;

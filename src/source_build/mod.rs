@@ -39,6 +39,7 @@ pub enum Method {
 pub struct Preference {
     pub method: Method,
     pub managed_tools: bool,
+    #[serde(skip_serializing, deserialize_with = "discard_saved_jobs")]
     pub jobs: u8,
     pub game_input: Option<PathBuf>,
     pub update: Option<PathBuf>,
@@ -55,7 +56,7 @@ impl Default for Preference {
         Self {
             method: Method::Official,
             managed_tools: true,
-            jobs: 4,
+            jobs: 0,
             game_input: None,
             update: None,
             keys: None,
@@ -65,6 +66,30 @@ impl Default for Preference {
             amd_fsr4: false,
             prepare_shaders: true,
         }
+    }
+}
+
+fn discard_saved_jobs<'de, D: serde::Deserializer<'de>>(value: D) -> Result<u8, D::Error> {
+    // Older versions saved the UI's worker count. Overrides are now per invocation.
+    u8::deserialize(value).map(|_| 0)
+}
+
+fn compiler_jobs(logical: usize, available: u64) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Keep room for the OS and linker. Logical CPUs alone can oversubscribe memory.
+    let memory_limit = (available.saturating_sub(2 * GIB) / GIB).clamp(1, 16);
+    logical.clamp(1, memory_limit as usize)
+}
+
+impl Preference {
+    fn compiler_jobs(&self) -> usize {
+        if self.jobs != 0 {
+            return usize::from(self.jobs);
+        }
+        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        compiler_jobs(cpus, system.available_memory())
     }
 }
 
@@ -149,8 +174,8 @@ impl Preferences {
 
 fn validate_preference(preference: &Preference) -> Result<()> {
     ensure!(
-        (1..=16).contains(&preference.jobs),
-        "Source builds need 1 to 16 compiler workers"
+        preference.jobs <= 16,
+        "A compiler worker override must be between 1 and 16"
     );
     for path in [
         &preference.game_input,
@@ -1031,6 +1056,33 @@ pub fn selected_version(path: &Path, game: GameId) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_worker_limit_accounts_for_cpu_and_available_memory() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(compiler_jobs(16, 10 * gib), 8);
+        assert_eq!(compiler_jobs(2, 24 * gib), 2);
+        assert_eq!(compiler_jobs(16, gib), 1);
+        assert_eq!(compiler_jobs(32, 64 * gib), 16);
+    }
+
+    #[test]
+    fn saved_worker_counts_are_migrated_to_auto() -> Result<()> {
+        let preferences: Preferences =
+            serde_json::from_str(r#"{"triforce":{"method":"source","jobs":4}}"#)?;
+        assert_eq!(preferences.triforce.jobs, 0);
+        let override_for_this_run = Preference {
+            jobs: 7,
+            ..preferences.triforce
+        };
+        assert_eq!(override_for_this_run.compiler_jobs(), 7);
+        assert!(
+            serde_json::to_value(override_for_this_run)?
+                .get("jobs")
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn source_tags_and_installed_labels_are_bound_to_the_game_and_commit() -> Result<()> {

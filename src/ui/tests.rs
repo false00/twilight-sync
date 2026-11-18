@@ -47,6 +47,164 @@ fn fixture() -> Result<MainWindow> {
 }
 
 #[test]
+fn game_file_setup_routes_each_games_inputs_and_clear_actions() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 2600.0));
+    ui.set_section(1);
+    ui.set_selected_game(1);
+    ui.set_source_input(r"C:\Games\base.nsp".into());
+    ui.set_source_update(r"C:\Games\update.nsp".into());
+    ui.set_source_keys(r"C:\Games\prod.keys".into());
+    let choices = Rc::new(RefCell::new(Vec::new()));
+    let recorded = choices.clone();
+    ui.on_choose_input(move |kind| recorded.borrow_mut().push(kind));
+    let clears = Rc::new(RefCell::new(Vec::new()));
+    let recorded = clears.clone();
+    ui.on_clear_input(move |kind| recorded.borrow_mut().push(kind));
+    flush();
+    for label in [
+        "Choose TotK base game (.nsp)",
+        "Choose TotK update (.nsp)",
+        "Choose prod.keys",
+    ] {
+        activate(&ui, label)?;
+    }
+    activate(&ui, "Optional firmware fonts")?;
+    activate(&ui, "Choose font folder")?;
+    for label in ["Clear game input", "Clear update", "Clear keys selection"] {
+        activate(&ui, label)?;
+    }
+    assert_eq!(&*choices.borrow(), &[0, 1, 2, 3]);
+    assert_eq!(&*clears.borrow(), &[0, 1, 2]);
+    ui.set_selected_game(2);
+    ui.set_source_mode(true);
+    flush();
+    ui.set_setup_step(1);
+    ui.set_source_input(r"C:\Games\Ocarina of Time.nup".into());
+    flush();
+    assert!(!ui.get_extra_game_inputs());
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Choose prod.keys")
+            .next()
+            .is_none()
+    );
+    activate(&ui, "Choose OOT game (.nup)")?;
+    activate(&ui, "Use extracted OOT game files")?;
+    activate(&ui, "Choose extracted OOT folder")?;
+    activate(&ui, "Clear game input")?;
+    assert_eq!(&choices.borrow()[4..], &[0, 4]);
+    assert_eq!(&clears.borrow()[3..], &[0]);
+    ui.set_can_manage(false);
+    flush();
+    activate(&ui, "Choose OOT game (.nup)")?;
+    assert_eq!(choices.borrow().len(), 6);
+    Ok(())
+}
+
+#[test]
+fn texture_library_routes_install_switch_and_restore_actions() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 2600.0));
+    ui.set_section(4);
+    ui.set_texture_creators(rows(vec![
+        widgets::TextureCreator {
+            name: "First pack".into(),
+            version: "Imported today".into(),
+            ..Default::default()
+        },
+        widgets::TextureCreator {
+            name: "Second pack".into(),
+            version: "1.2.0".into(),
+            has_site: true,
+            ..Default::default()
+        },
+    ]));
+    ui.set_packs(rows(vec![
+        widgets::PackCard {
+            title: "Current pack".into(),
+            active: true,
+            ..Default::default()
+        },
+        widgets::PackCard {
+            title: "Previous pack".into(),
+            ..Default::default()
+        },
+    ]));
+    ui.set_can_import_textures(true);
+    ui.set_can_change_textures(true);
+    ui.set_textures_active(true);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    let toggles = Rc::new(RefCell::new(Vec::new()));
+    let recorded = toggles.clone();
+    ui.on_toggle(move |toggle, value| recorded.borrow_mut().push((toggle, value)));
+    flush();
+    activate(&ui, "Activate")?;
+    activate(&ui, "Disable pack and restore original textures")?;
+    activate(&ui, "Install ZIP")?;
+    assert_eq!(
+        &*actions.borrow(),
+        &[(Action::ActivateTexture, 1), (Action::DisableTextures, 0)]
+    );
+    activate(&ui, "First pack · Change")?;
+    activate(&ui, "Second pack")?;
+    assert_eq!(ui.get_texture_creator(), 1);
+    assert_eq!(ui.get_texture_version(), "1.2.0");
+    assert!(!ui.get_texture_picker_open());
+    assert!(toggles.borrow().contains(&(Toggle::TextureConsent, false)));
+    ui.set_texture_consent(true);
+    flush();
+    activate(&ui, "Visit creator download page")?;
+    activate(&ui, "Install ZIP")?;
+    activate(&ui, "Install folder")?;
+    assert_eq!(
+        &actions.borrow()[2..],
+        &[
+            (Action::OpenTextureSite, 1),
+            (Action::ImportTextureZip, 0),
+            (Action::ImportTextureFolder, 0),
+        ]
+    );
+    ui.set_texture_recovery(true);
+    ui.set_texture_busy(true);
+    ui.set_texture_cancellable(true);
+    flush();
+    activate(&ui, "Cancel installation safely")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::CancelTextures, 0)));
+    Ok(())
+}
+
+#[test]
+fn themed_confirmation_blocks_background_actions_and_delivers_the_choice() -> Result<()> {
+    let ui = fixture()?;
+    let answers = Rc::new(RefCell::new(Vec::new()));
+    let recorded = answers.clone();
+    let weak = ui.as_weak();
+    ui.on_confirmation_response(move |answer| {
+        recorded.borrow_mut().push(answer);
+        if let Some(ui) = weak.upgrade() {
+            ui.set_confirmation_open(false);
+        }
+    });
+    ui.set_confirmation_title("Update Twilight Sync".into());
+    ui.set_confirmation_message("Twilight Sync will restart.".into());
+    ui.set_confirmation_open(true);
+    flush();
+    activate(&ui, "About")?;
+    assert!(!ui.get_about_open());
+    activate(&ui, "Cancel")?;
+    assert!(!ui.get_confirmation_open());
+    ui.set_confirmation_open(true);
+    flush();
+    activate(&ui, "Continue")?;
+    assert_eq!(&*answers.borrow(), &[false, true]);
+    Ok(())
+}
+
+#[test]
 fn slint_navigation_game_selection_and_build_gates_route_real_component_actions() -> Result<()> {
     let ui = fixture()?;
     let selections = Rc::new(RefCell::new(Vec::new()));
@@ -93,8 +251,54 @@ fn slint_navigation_game_selection_and_build_gates_route_real_component_actions(
     assert!(ui.get_about_open());
     activate(&ui, "Devices")?;
     assert_eq!(ui.get_section(), 5);
-    activate(&ui, "Back to your adventure")?;
+    activate(&ui, "Done")?;
     assert!(!ui.get_about_open());
+    Ok(())
+}
+
+#[test]
+fn paired_game_file_controls_are_available_in_both_setup_methods() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 3000.0));
+    ui.set_section(1);
+    ui.set_can_offer_game_file(true);
+    ui.set_can_offer_update(true);
+    ui.set_can_offer_keys(true);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    for (game, source) in [(2, true), (1, false), (1, true)] {
+        ui.set_selected_game(game);
+        ui.set_source_mode(source);
+        flush();
+        if game == 2 {
+            activate(&ui, "Offer OOT .nup")?;
+            assert_eq!(actions.borrow().last(), Some(&(Action::OfferGameFile, 0)));
+        } else {
+            for (label, index) in [
+                ("Offer TotK base .nsp", 0),
+                ("Offer TotK update .nsp", 1),
+                ("Offer prod.keys", 2),
+            ] {
+                activate(&ui, label)?;
+                assert_eq!(
+                    actions.borrow().last(),
+                    Some(&(Action::OfferGameFile, index))
+                );
+            }
+        }
+    }
+    ui.set_pending_iso(true);
+    ui.set_can_accept_iso(true);
+    for section in 0..6 {
+        ui.set_section(section);
+        flush();
+        activate(&ui, "Choose destination & receive")?;
+        assert_eq!(actions.borrow().last(), Some(&(Action::AcceptIso, 0)));
+        activate(&ui, "Decline file")?;
+        assert_eq!(actions.borrow().last(), Some(&(Action::DeclineIso, 0)));
+    }
     Ok(())
 }
 
@@ -135,11 +339,12 @@ fn settings_cards_expand_with_their_content_instead_of_overlapping() -> Result<(
     let ui = fixture()?;
     ui.set_section(5);
     flush();
-    let toggle = ElementHandle::find_by_accessible_label(&ui, "Check for app updates")
-        .find(|element| {
-            element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Checkbox)
-        })
-        .context("Missing update preference")?;
+    let toggle =
+        ElementHandle::find_by_accessible_label(&ui, "Automatically check for app updates")
+            .find(|element| {
+                element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Checkbox)
+            })
+            .context("Missing update preference")?;
     let next = ElementHandle::find_by_accessible_label(&ui, "Keep the good things coming")
         .next()
         .context("Missing update section")?;

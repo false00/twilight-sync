@@ -167,6 +167,12 @@ pub enum Event {
         expected: Option<String>,
         preview: bool,
     },
+    GameFileOffer {
+        id: String,
+        hash: String,
+        size: u64,
+        kind: crate::game_file::Kind,
+    },
 }
 
 fn bounded_bytes<'de, D: de::Deserializer<'de>>(
@@ -727,6 +733,15 @@ mod tests {
                     id: id.clone(),
                     hash: hash.clone(),
                     size: 1024,
+                },
+            ),
+            (
+                35,
+                Event::GameFileOffer {
+                    id: id.clone(),
+                    hash: hash.clone(),
+                    size: 512,
+                    kind: crate::game_file::Kind::OotNup,
                 },
             ),
         ] {

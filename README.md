@@ -41,6 +41,9 @@ ROMs, and console keys are not included.*
   touch-friendly controls for your desktop or handheld.
 - **Your choice of installation.** Use official releases where supported,
   or review a source revision and build your own copy.
+- **Bring your own game files once.** Explicitly approve encrypted transfers of
+  OOT `.nup` and TotK base/update `.nsp` files between your paired PCs.
+  Console `prod.keys` has a separate, default-off permission and approvals.
 - **Pick up where you left off.** Pair two PCs once. Share saves over your
   private LAN, without uploading them to a cloud service.
 - **Offline is welcome.** Keep playing here. Reconnect later to sync or
@@ -106,6 +109,13 @@ Open **Game setup**, choose a game, and select an installation method:
 First-time official TotK setup runs **inside the managed workflow**. Select
 your local inputs and choose **Install / update**—there is no separate manual
 installer to run first.
+
+To copy inputs from your paired PC, open the game's **Game setup** on both PCs,
+enable its file-sharing permission, and offer a selected file. The receiver
+approves a new destination; existing files are never overwritten. Received
+files become setup inputs, not automatic installations. Console-key transfers
+require separate approval and save an unencrypted local file. Only share your
+own games and keys with your own trusted paired PC.
 
 New game builds go under your own `Games` folder. Existing custom installations
 are respected. Source builds are installed side-by-side, not over your working

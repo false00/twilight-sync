@@ -11,6 +11,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     ffi::OsString,
     fs,
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -219,7 +220,7 @@ pub(super) fn validate_input_paths(
                     || (input.join("romfs").is_dir()
                         && (input.join(".triforce_exefs").is_dir()
                             || input.join("exefs").is_dir())),
-                "Choose your Triforce .nup or a folder with romfs and exefs/.triforce_exefs"
+                "Choose your Ocarina of Time .nup or an extracted game folder with romfs and exefs/.triforce_exefs"
             );
         }
     }
@@ -234,10 +235,11 @@ fn input_paths(preference: &super::Preference, previous: Option<&Path>) -> Resul
     if let Some(input) = &preference.game_input {
         return Ok(input.clone());
     }
-    let current = previous.context("Choose your own Triforce .nup or existing game folder")?;
+    let current =
+        previous.context("Choose your own Ocarina of Time .nup or existing game folder")?;
     ensure!(
         current.join("romfs").is_dir() && current.join(".triforce_exefs").is_dir(),
-        "This Triforce installation has no retained build inputs; choose your own .nup or extracted game folder"
+        "This Ocarina of Time installation has no retained build inputs; choose your own .nup or extracted game folder"
     );
     Ok(current.to_path_buf())
 }
@@ -461,7 +463,7 @@ fn configure_nuget(command: &mut Command, workspace: &Path, config: &Path) {
         .env("DOTNET_CLI_HOME", workspace.join("dotnet-home"));
 }
 
-fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Command> {
+fn totk_installer(context: &ContextData<'_>, request: &Request, jobs: usize) -> Result<Command> {
     // Dev-mode layout uses the running interpreter when no embedded Python exists.
     let python = context
         .source
@@ -498,8 +500,8 @@ fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Comman
                 .as_ref()
                 .context("Missing console keys file")?,
         )
-        .env("TOTK_LIFT_JOBS", request.preference.jobs.to_string())
-        .env("PYTHON_CPU_COUNT", request.preference.jobs.to_string());
+        .env("TOTK_LIFT_JOBS", jobs.to_string())
+        .env("PYTHON_CPU_COUNT", jobs.to_string());
     if let Some(firmware) = &request.preference.firmware {
         command.arg("--firmware").arg(firmware);
     }
@@ -572,10 +574,11 @@ pub(super) fn build(
                 "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --build \"%TS_BUILD%\" --parallel %TS_JOBS%",
                 &vs, &python,
             )?;
+            let jobs = build_jobs(request, runner)?;
             compile
                 .env("TS_CMAKE", &cmake.entry)
                 .env("TS_BUILD", &binary)
-                .env("TS_JOBS", request.preference.jobs.to_string());
+                .env("TS_JOBS", jobs.to_string());
             runner.run(&mut compile, "Compiling Dusklight locally")?;
             let mut install = context.vs_command(
                 "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --install \"%TS_BUILD%\" --prefix \"%TS_OUTPUT%\"",
@@ -647,7 +650,8 @@ pub(super) fn build(
                 configure_nuget(&mut command, workspace, &nuget);
                 runner.run(&mut command, label)?;
             }
-            runner.run(&mut totk_installer(&context, request)?, "Compiling and preparing TotK from the checked-out source (shader preparation may open a window)")?;
+            let jobs = build_jobs(request, runner)?;
+            runner.run(&mut totk_installer(&context, request, jobs)?, "Compiling and preparing TotK from the checked-out source (shader preparation may open a window)")?;
         }
         GameId::Triforce => {
             let llvm = tools.ensure(Package::Llvm, allowed, cancel, &mut |text| {
@@ -737,6 +741,18 @@ pub(super) fn build(
                 );
             }
             let input = triforce_input(request)?;
+            if let Some(previous) = &request.previous_install {
+                match stage_triforce_caches(previous, output) {
+                    Ok(true) => runner.message(
+                        "Staged local shader caches; Triforce will check their compatibility.",
+                    )?,
+                    Ok(false) => {}
+                    Err(error) => runner.message(&format!(
+                        "Could not stage local shader caches; preparing shaders normally: {error:#}"
+                    ))?,
+                }
+            }
+            let jobs = build_jobs(request, runner)?;
             let mut command = context.command(&python)?;
             command
                 .args(triforce_arguments(
@@ -744,6 +760,7 @@ pub(super) fn build(
                     output,
                     &workspace.join("work"),
                     &request.preference,
+                    jobs,
                 )?)
                 .env("HOOKSHOT_MINGW", &llvm.root)
                 .env("HOOKSHOT_KEEP_BUILD_FILES", "1")
@@ -770,10 +787,73 @@ pub(super) fn build(
                     .try_exists()?,
                 "Unexpected prebuilt Triforce launcher in the source workspace"
             );
+            let log_start = runner.log.metadata()?.len();
             runner.run(&mut command, "Building Triforce and its Vulkan renderer from source (this can take an hour or more)")?;
+            if request.preference.prepare_shaders {
+                let mut log = BufReader::new(fs::File::open(&runner.log)?);
+                log.seek(SeekFrom::Start(log_start))?;
+                verify_triforce_shader_preparation(log)?;
+            }
         }
     }
     Ok(())
+}
+
+fn stage_triforce_caches(previous: &Path, output: &Path) -> Result<bool> {
+    const PROGRAMS: &str = "triforce_programs.bin";
+    const PIPELINES: &str = "mkw_vk_pipelines.bin";
+    const STAMP: &str = "mkw_vk_pipelines.bin.for";
+    let size = |name| -> Result<u64> {
+        let path = previous.join(name);
+        ensure_safe_path(&path)?;
+        match path.metadata() {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+            Ok(_) => anyhow::bail!("Expected a regular cache file: {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error).with_context(|| format!("Reading {}", path.display())),
+        }
+    };
+    let mut names = Vec::new();
+    const MAX_CACHE: u64 = 8 * 1024 * 1024 * 1024;
+    if (1..=MAX_CACHE).contains(&size(PROGRAMS)?) {
+        names.push(PROGRAMS);
+    }
+    if (33..=MAX_CACHE).contains(&size(PIPELINES)?) && size(STAMP)? == 16 {
+        names.extend([PIPELINES, STAMP]);
+    }
+    if names.is_empty() {
+        return Ok(false);
+    }
+    // Let upstream validate its caches, but never carry over a completion marker.
+    let staging = tempfile::tempdir_in(output)?;
+    for name in &names {
+        fs::copy(previous.join(name), staging.path().join(name))?;
+    }
+    for name in names {
+        fs::rename(staging.path().join(name), output.join(name))?;
+    }
+    Ok(true)
+}
+
+fn verify_triforce_shader_preparation(mut log: impl BufRead) -> Result<()> {
+    // Upstream can report shader failure while returning success for the executable build.
+    let mut line = Vec::new();
+    while log.read_until(b'\n', &mut line)? != 0 {
+        if line.starts_with(b"the shaders were not prepared now (") {
+            anyhow::bail!(
+                "Triforce shader preparation did not finish: {}",
+                String::from_utf8_lossy(&line).trim_end()
+            );
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
+fn build_jobs(request: &Request, runner: &mut Runner<'_>) -> Result<usize> {
+    let jobs = request.preference.compiler_jobs();
+    runner.message(&format!("Compiler worker limit: {jobs}"))?;
+    Ok(jobs)
 }
 
 fn triforce_arguments(
@@ -781,6 +861,7 @@ fn triforce_arguments(
     output: &Path,
     work: &Path,
     preference: &super::Preference,
+    jobs: usize,
 ) -> Result<Vec<OsString>> {
     let mut args: Vec<OsString> = ["-I", "-B", "nx2/make_game.py", "--out"]
         .into_iter()
@@ -790,7 +871,7 @@ fn triforce_arguments(
     args.push("--work".into());
     args.push(work.into());
     args.push("--jobs".into());
-    args.push(preference.jobs.to_string().into());
+    args.push(jobs.to_string().into());
     if !preference.renodx_hdr {
         args.push("--no-renodx".into());
     }
@@ -815,7 +896,7 @@ fn triforce_arguments(
         };
         ensure!(
             exefs.is_dir() && input.join("romfs").is_dir(),
-            "The selected Triforce folder has no build inputs"
+            "The selected Ocarina of Time folder has no build inputs"
         );
         args.push("--exefs".into());
         args.push(exefs.into());
@@ -988,7 +1069,7 @@ mod tests {
             approved: true,
             log: temp.path().join("not-created.log"),
         };
-        let command = totk_installer(&context, &request)?;
+        let command = totk_installer(&context, &request, 4)?;
         assert_eq!(
             command.get_program(),
             source
@@ -1083,6 +1164,42 @@ mod tests {
     }
 
     #[test]
+    fn triforce_reuses_only_shader_cache_data_with_its_stamp() -> Result<()> {
+        let current = tempfile::tempdir()?;
+        let output = tempfile::tempdir()?;
+        fs::write(current.path().join("mkw_vk_pipelines.bin"), [7; 64])?;
+        fs::write(current.path().join("triforce_prepared.bin"), [9; 48])?;
+        assert!(!stage_triforce_caches(current.path(), output.path())?);
+        fs::write(current.path().join("mkw_vk_pipelines.bin.for"), [1; 16])?;
+        fs::write(current.path().join("triforce_programs.bin"), [2; 64])?;
+        assert!(stage_triforce_caches(current.path(), output.path())?);
+        assert_eq!(
+            fs::read(output.path().join("mkw_vk_pipelines.bin"))?,
+            [7; 64]
+        );
+        assert_eq!(
+            fs::read(output.path().join("mkw_vk_pipelines.bin.for"))?,
+            [1; 16]
+        );
+        assert_eq!(
+            fs::read(output.path().join("triforce_programs.bin"))?,
+            [2; 64]
+        );
+        assert!(!output.path().join("triforce_prepared.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_shader_failure_is_not_counted_as_a_ready_install() -> Result<()> {
+        verify_triforce_shader_preparation(&b"@@stage shaders Preparing shaders\n@@done\n"[..])?;
+        let error = verify_triforce_shader_preparation(
+            &b"the shaders were not prepared now (no usable Vulkan here): the game prepares them at its first start\r\n@@done\n"[..],
+        );
+        assert!(error.is_err_and(|error| error.to_string().contains("no usable Vulkan here")));
+        Ok(())
+    }
+
+    #[test]
     fn triforce_source_builds_never_update_an_existing_installation_in_place() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let current = temp.path().join("existing game");
@@ -1094,7 +1211,9 @@ mod tests {
             prepare_shaders: false,
             ..Default::default()
         };
-        let args = triforce_arguments(&current, &output, &temp.path().join("work"), &preference)?;
+        let args =
+            triforce_arguments(&current, &output, &temp.path().join("work"), &preference, 7)?;
+        assert!(args.windows(2).any(|pair| pair == ["--jobs", "7"]));
         assert!(args.contains(&OsString::from("--no-prepare-shaders")));
         assert!(args.contains(&OsString::from("--no-renodx")));
         assert!(args.contains(&current.join(".triforce_exefs").into_os_string()));
@@ -1111,7 +1230,7 @@ mod tests {
         let output = temp.path().join("new-game");
         let work = temp.path().join("work");
         let mut preference = super::super::Preference::default();
-        let args = triforce_arguments(&input, &output, &work, &preference)?;
+        let args = triforce_arguments(&input, &output, &work, &preference, 4)?;
         for flag in [
             "--no-renodx",
             "--no-prepare-shaders",
@@ -1123,7 +1242,7 @@ mod tests {
         }
         preference.amd_fsr4 = true;
         preference.nvidia_dlss = true;
-        let args = triforce_arguments(&input, &output, &work, &preference)?;
+        let args = triforce_arguments(&input, &output, &work, &preference, 4)?;
         for flag in ["--fsr", "--fetch-ngx-sdk", "--accept-nvidia-license"] {
             assert!(args.contains(&OsString::from(flag)));
         }

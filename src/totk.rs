@@ -1065,10 +1065,19 @@ impl Channel {
     }
 
     pub fn require_app_update_idle(&mut self) -> Result<()> {
+        ensure!(
+            !self.status.remote_running,
+            "Stop {} on the other device before changing the game installation",
+            self.game.name()
+        );
+        self.require_manager_restart_idle()
+    }
+
+    pub(crate) fn require_manager_restart_idle(&mut self) -> Result<()> {
         ensure!(!self.status.updating, "Wait for the current game update");
         ensure!(
-            !self.game.running(&mut self.monitor) && !self.status.remote_running,
-            "Stop {} on both devices before updating Twilight Sync",
+            !self.game.running(&mut self.monitor),
+            "Close {} on this PC before updating",
             self.game.name()
         );
         ensure!(

@@ -34,6 +34,7 @@ It does not include game assets, saves, disc images, or a copy of Dusklight.
 | Windows startup | Enabled on the first normal launch; toggle in the tray or settings |
 | Private audit trail | Rotating JSON-lines logs under your home `.twilight-sync` directory |
 | Optional disc transfer | Separate, disabled-by-default, per-transfer consent for verified GameCube ISO / RVZ images |
+| Optional game-input transfer | Explicit paired-PC approval for OOT `.nup`, TotK base/update `.nsp`, and separately opted-in console `prod.keys` |
 | Dusklight updates | Check the latest official release; install/update side-by-side and verify existing managed files before reuse |
 | TotK Recomp updates | Verify the official setup and automatically rebuild an existing native installation, with play and save sync paused |
 | Source builds | Stable-tag/commit review, approved official tool archives, per-game local inputs and side-by-side builds for Dusklight, TotK and Triforce |
@@ -405,7 +406,38 @@ executable, modified client, compromised host, or independently launched second
 game can bypass cooperative exclusivity. Stronger enforcement requires an
 integration inside Dusklight itself.
 
-## Optional ISO / RVZ sync and official installation
+## Optional game-file sync and official installation
+
+### OOT and TotK setup inputs
+
+Open the selected game's **Game setup** on both paired PCs. Enable **I own this
+game and allow game-file transfers** on each PC, select the local input on the
+sender, and choose **Offer OOT .nup**, **Offer TotK base .nsp**, or **Offer TotK
+update .nsp**. Both managers must support `twilightProto/4` discovery (v0.16.0
+or later); legacy save and disc event encodings are unchanged.
+
+The receiver approves each offer and chooses a new destination with the
+matching extension. Existing files are never overwritten. Files are staged in
+that directory, bounded to 64 GiB, checked for NUP/NSP container structure and
+transfer SHA-256, then selected as the corresponding local setup input. These
+checks do **not** establish title identity, game authenticity, or ownership.
+Receipt never extracts, installs, or executes the file. Extracted OOT folders and
+TotK input formats other than `.nsp` remain local-only inputs.
+
+Console keys are **separately disabled by default**, even when game-file sharing
+is enabled. Both PCs must explicitly allow key sharing; sending and accepting
+`prod.keys` each require a sensitive-data confirmation. Key files are capped at
+64 KiB and checked as bounded text containing hexadecimal key assignments.
+Transfer logs omit key contents and key-file hashes. The chosen destination is
+an **unencrypted local file**; protect it like the original. This feature never
+shares the app's private pairing identity.
+
+Transfers use the existing authenticated encrypted paired channel, bounded
+32 KiB chunks, backpressure, sender rehashing, receiver verification and
+no-overwrite commit. Permissions and idle state are rechecked before sending,
+accepting and committing. A timeout, mismatch, disconnect or declined offer
+discards uncommitted staging. Only transfer your own games and console keys to
+your own trusted paired PC; no public upload service is involved.
 
 ### Disc images
 
@@ -573,10 +605,21 @@ The flow:
    TotK base/update/keys and optional firmware fonts; Triforce `.nup` or extracted
    files. A current Triforce install's `.triforce_exefs` and `romfs` are reused
    automatically when selected inputs are absent.
+   **Game files** labels each input separately: Ocarina of Time uses your `.nup`
+   game file (Triforce is the PC project's name), while Tears of the Kingdom uses
+   a base `.nsp` and a separate supported update plus `prod.keys`. TotK's other
+   supported base formats remain available in the picker. Optional firmware
+   fonts and extracted OOT folders are under additional input options.
 5. A fresh checkout is verified against the approved commit. Dusklight also
    initializes source-pinned submodules. Builds use fixed recipe arguments, not
    a user/peer-provided shell command. Source child processes receive a limited
    OS/build environment, not arbitrary inherited credential environment variables.
+   Compiler workers are selected automatically from the PC's available CPU
+   threads and memory. Triforce prepares shaders before the new installation is
+   selected by default. It seeds rebuilds with shader caches from the previous
+   local install; Triforce checks compatibility and still prepares missing
+   shaders. A cold cache can take hours. The advanced graphics option to skip
+   preparation moves that work to first launch.
 6. Play, incoming replacement and automatic sync are paused during compilation.
    Windows jobs own build process trees so cancellation or manager termination
    stops those helpers. This is lifecycle control, **not isolation from malicious
@@ -687,6 +730,12 @@ and import only assets you are authorized to use. The preset does not verify a
 downloaded archive's release version, and no pack assets are bundled or rehosted.
 
 ### Install or update a texture pack
+
+The **Textures** page is always Dusklight's library, even when another game is
+selected. Installed packs appear first; the active pack is marked **Active**.
+Use **Install or update a pack** below to choose a creator preset and install
+your downloaded files. Version labels and detected profile paths are optional
+details, not setup steps.
 
 1. Stop Dusklight on both paired devices.
 2. Select the project and confirm permission to use its texture assets.
@@ -908,8 +957,9 @@ Updater caches and application settings remain in `.twilight-sync`; they are not
 mixed into the game's installation folder.
 
 Audit logs include the local **username, file paths, hashes, public peer keys, timestamps,
-security decisions, and errors**. They do not include save payloads, private keys,
-or pairing comparison codes. A log rotates at approximately 5 MiB and keeps four
+security decisions, and errors**. They do not include save payloads, console-key
+contents or key-file hashes, private pairing keys, or pairing comparison codes.
+A log rotates at approximately 5 MiB and keeps four
 older files. History, textures, retained program versions, and preserved original
 texture folders consume additional space. Snapshot metadata also contains
 usernames and paths; its compressed game data is not encrypted at rest.
@@ -919,7 +969,8 @@ local discovery; save contents and paths are not.
 
 Source-build logs additionally capture upstream stdout/stderr. Review and redact
 them before sharing: third-party scripts can print anything they can read.
-Twilight Sync does not upload game inputs/keys/saves, but an approved source
+Twilight Sync does not upload game inputs/keys/saves to a public service.
+Explicitly approved paired-LAN transfers are supported; an approved source
 script has normal user permissions and can make its own network requests.
 
 Failure to persist lock/configuration safety state disables networking. Audit
@@ -941,8 +992,9 @@ application directory after preserving any backups you want.
 ### Twilight Sync app updates
 
 App checks use `https://api.github.com/repos/false00/twilight-sync/releases/latest`,
-not the separate Dusklight repository. They run after startup and every six
-hours unless disabled. Only stable, newer SemVer releases are offered.
+not the separate Dusklight repository. They run at startup, when you reopen the
+dashboard from the app shortcut or tray, and every six hours unless disabled. Repeated opens
+within a few seconds share the recent check. Only stable, newer SemVer releases are offered.
 Metadata requests time out and failures are reported as unknown update status,
 never as a successful "up to date" check.
 
@@ -953,9 +1005,11 @@ unchecked remote script or elevates. The verified new executable runs as a
 minimal helper, acknowledges readiness, and waits for the original PID and
 executable to exit normally before applying a same-directory replacement.
 
-Gameplay, persistent play locks, pending transfers, and management operations
-block handoff. If conditions change while downloading, the helper is cancelled
-and the current app stays running. Installation receipts are updated for the
+Only activity on this PC, such as a running game, a pending transfer, or a
+local installation, blocks handoff. Gameplay on the paired PC and durable play
+reservations alone do not block app updates. If a local operation begins while
+downloading, the helper is cancelled and the current app stays running.
+Installation receipts are updated for the
 PowerShell installer; game settings, pairing identities, and save histories are
 not migrated or reset. Preference storage is separate from the original game
 settings schema. Interrupted/failed update files are preserved for manual review;

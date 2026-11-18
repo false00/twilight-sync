@@ -8,12 +8,12 @@ export enum Action {
     setup-dotnet, setup-msys, copy-dotnet, copy-msys, check-release, install-release,
     trust-network, open-pairing, connect-device, reconnect, approve-pairing, reject-pairing, unpair, view-game,
     history-refresh, history-older, history-preview, history-restore, close-preview,
-    check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso,
+    check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso, offer-game-file,
     open-texture-site, import-texture-zip, import-texture-folder, cancel-textures, activate-texture,
     disable-textures, recover-textures, refresh-textures, open-data, open-licenses,
-    app-release-notes, official-help, preview-scenario, export-preview, quit
+    app-release-notes, official-help, project-link, preview-scenario, export-preview, quit
 }
-export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent }
+export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent, game-file-sharing, key-sharing }
 export enum AppearanceMode { system, light, dark }
 export struct GameCard { title: string, subtitle: string, status: string, installed: bool }
 export struct SaveCard { title: string, kind: string, date: string, hearts: string, rupees: string, played: string, extra: string, warning: string }
@@ -23,6 +23,30 @@ export struct HistoryCard { id: string, title: string, detail: string, metadata:
 export struct ToolRow { name: string, detail: string, ready: bool, setup: int }
 export struct PackCard { title: string, detail: string, metadata: string, active: bool }
 export struct TextureCreator { name: string, description: string, version: string, has-site: bool }
+
+component GameFileInput inherits Surface {
+    in property <string> title;
+    in property <string> description;
+    in property <string> selected-path;
+    in property <string> empty-text: "No file selected";
+    in property <string> choose-label;
+    in property <string> clear-label: "Clear selection";
+    in property <bool> available: true;
+    callback choose;
+    callback clear;
+    VerticalLayout {
+        padding: 20px; spacing: 12px;
+        SectionTitle { text: root.title; }
+        Muted { text: root.description; }
+        if root.selected-path == "": Muted { text: root.empty-text; }
+        if root.selected-path != "": DetailBlock { title: "SELECTED INPUT"; text: root.selected-path; }
+        HorizontalLayout {
+            spacing: 8px;
+            ActionButton { text: root.choose-label; available: root.available; clicked => { root.choose(); } }
+            if root.selected-path != "": ActionButton { text: root.clear-label; available: root.available; clicked => { root.clear(); } }
+        }
+    }
+}
 
 component BranchPreview inherits Rectangle {
     in property <string> title;
@@ -71,6 +95,8 @@ export component MainWindow inherits Window {
     in property <AppearanceMode> appearance-mode: AppearanceMode.system;
     in property <bool> demo-mode;
     in property <string> version;
+    in property <string> build-target;
+    in property <string> build-profile;
     in property <string> status;
     in property <string> connection;
     in property <bool> connected;
@@ -138,7 +164,6 @@ export component MainWindow inherits Window {
     in property <bool> fsr;
     in property <bool> nvidia;
     in property <bool> shaders;
-    in property <int> workers: 4;
     in property <string> source-tag;
     in property <string> source-commit;
     in property <string> source-message;
@@ -178,6 +203,12 @@ export component MainWindow inherits Window {
     in property <string> app-release-detail;
     in property <string> app-update-reason;
     in property <bool> disc-sharing;
+    in property <bool> game-file-sharing;
+    in property <bool> key-sharing;
+    in property <bool> can-offer-game-file;
+    in property <bool> can-offer-update;
+    in property <bool> can-offer-keys;
+    in property <string> game-file-transfer-reason;
     in property <string> iso-path;
     in property <bool> pending-iso;
     in property <bool> can-send-iso;
@@ -192,6 +223,7 @@ export component MainWindow inherits Window {
     in property <string> preview-id;
     in property <[SaveCard]> preview-saves;
     in property <string> texture-status;
+    in property <string> texture-reason;
     in property <[TextureCreator]> texture-creators;
     in-out property <int> texture-creator: 0;
     in-out property <string> texture-version: "1.2.0";
@@ -203,15 +235,22 @@ export component MainWindow inherits Window {
     in property <bool> can-change-textures;
     in property <bool> textures-active;
     in property <string> texture-profile;
+    in-out property <bool> texture-picker-open: false;
+    in-out property <bool> texture-details-open: false;
+    in-out property <bool> texture-profile-open: false;
     in-out property <bool> about-open: false;
+    in-out property <bool> confirmation-open: false;
+    in property <string> confirmation-title;
+    in property <string> confirmation-message;
+    callback confirmation-response(bool);
     in-out property <int> setup-step: 0;
     in-out property <bool> advanced-source: false;
+    in-out property <bool> extra-game-inputs: false;
     callback action(Action, int);
     callback game-selected(int);
     callback toggle(Toggle, bool);
     callback choose-input(int);
     callback clear-input(int);
-    callback set-workers(int);
     callback appearance-selected(AppearanceMode);
     init => {
         Theme.dark = root.dark-mode;
@@ -225,11 +264,16 @@ export component MainWindow inherits Window {
     changed section => { main-scroll.content-y = 0px; }
     changed selected-game => {
         main-scroll.content-y = 0px; root.setup-step = 0;
+        root.extra-game-inputs = false;
         root.show-other-saves = false; root.comparison-open = false;
     }
     changed setup-step => { main-scroll.content-y = 0px; }
-    changed comparison-open => { root.branch-choice = -1; Theme.modal-open = root.comparison-open || root.about-open; }
-    changed about-open => { Theme.modal-open = root.comparison-open || root.about-open; }
+    changed comparison-open => { root.branch-choice = -1; root.update-modal-state(); }
+    changed about-open => { root.update-modal-state(); }
+    changed confirmation-open => { root.update-modal-state(); }
+    function update-modal-state() {
+        Theme.modal-open = root.comparison-open || root.about-open || root.confirmation-open;
+    }
     changed has-conflict => { root.branch-choice = -1; if !root.has-conflict { root.comparison-open = false; } }
     changed local-revision => { root.branch-choice = -1; }
     changed remote-revision => { root.branch-choice = -1; }
@@ -300,11 +344,16 @@ export component MainWindow inherits Window {
                             ActionButton { text: "Review decision"; clicked => { root.action(Action.view-game, item.game-index); } }
                         }
                     }
-                    if root.pending-iso && root.section != 5: Surface {
-                        HorizontalLayout {
+                    if root.pending-iso: Surface {
+                        VerticalLayout {
                             padding: 16px; spacing: 12px;
-                            Muted { text: "An incoming disc image needs your permission."; horizontal-stretch: 1; color: Theme.warning; }
-                            ActionButton { text: "Review disc offer"; clicked => { root.section = 5; } }
+                            SectionTitle { text: "Your paired PC offers a file"; }
+                            Muted { text: root.disc-offer; color: Theme.warning; }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                ActionButton { text: "Choose destination & receive"; available: root.can-accept-iso; clicked => { root.action(Action.accept-iso, 0); } }
+                                ActionButton { text: "Decline file"; clicked => { root.action(Action.decline-iso, 0); } }
+                            }
                         }
                     }
                     if root.transfer != "": Surface {
@@ -502,50 +551,76 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if root.selected-game != 0 && (!root.source-mode || root.setup-step == 1): Surface {
-                            VerticalLayout {
-                                padding: 22px; spacing: 14px;
-                                SectionTitle { text: root.source-mode ? "2   Your local game files" : "Your local game files"; }
-                                Muted { text: root.selected-game == 1 ? "Your own base game, supported update and console keys stay local. We never supply or transfer keys." : "Use your own .nup or retained romfs and exefs files from an existing Triforce installation."; }
-                                Text { text: root.selected-game == 1 ? "BASE GAME" : "GAME INPUT"; color: Theme.muted; font-size: 11px; }
-                                Muted { text: root.source-input == "" ? "No file selected" : root.source-input; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    ActionButton { text: "Choose game file"; available: root.can-manage; clicked => { root.choose-input(0); } }
-                                    if root.selected-game == 2: ActionButton { text: "Use existing folder"; available: root.can-manage; clicked => { root.choose-input(4); } }
-                                    if root.source-input != "": ActionButton { text: "Clear"; available: root.can-manage; clicked => { root.clear-input(0); } }
-                                }
-                                if root.selected-game == 1: VerticalLayout {
-                                    spacing: 10px;
-                                    Text { text: "UPDATE"; color: Theme.muted; font-size: 11px; }
-                                    Muted { text: root.source-update == "" ? "Select your supported update" : root.source-update; }
-                                    ActionButton { text: "Choose update"; available: root.can-manage; clicked => { root.choose-input(1); } }
-                                    if root.source-update != "": ActionButton { text: "Clear update"; available: root.can-manage; clicked => { root.clear-input(1); } }
-                                    Text { text: "CONSOLE KEYS"; color: Theme.muted; font-size: 11px; }
-                                    Muted { text: root.source-keys == "" ? "Select your prod.keys file" : root.source-keys; }
-                                    ActionButton { text: "Choose keys"; available: root.can-manage; clicked => { root.choose-input(2); } }
-                                    if root.source-keys != "": ActionButton { text: "Clear keys selection"; available: root.can-manage; clicked => { root.clear-input(2); } }
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        ActionButton { text: "Optional firmware fonts"; available: root.can-manage; clicked => { root.choose-input(3); } }
-                                        Muted { text: root.source-firmware; }
-                                        if root.source-firmware != "": ActionButton { text: "Clear fonts"; available: root.can-manage; clicked => { root.clear-input(3); } }
-                                    }
-                                }
-                                if root.source-mode: ActionButton { text: "Next: review build"; primary: true; available: root.can-manage; clicked => { root.setup-step = 2; } }
+                        if root.selected-game != 0 && (!root.source-mode || root.setup-step == 1): VerticalLayout {
+                            spacing: 16px;
+                            SectionTitle { text: root.source-mode ? "2   Your local game files" : "Your local game files"; }
+                            Muted { text: "Choose your own legally obtained game files. They stay on this PC and are separate from texture packs."; }
+                            GameFileInput {
+                                title: root.selected-game == 1 ? "Tears of the Kingdom base game" : "Ocarina of Time game";
+                                description: root.selected-game == 1 ? "Required: your base-game .nsp. Also accepts .xci, .nsz and .xcz. Choose the update separately below." : "Choose your Ocarina of Time .nup game file. Triforce is the PC project that builds it, not the name of your game file.";
+                                selected-path: root.source-input;
+                                empty-text: root.selected-game == 2 && root.installed ? "No new input selected. Retained game files from the installed copy are reused when available." : "No game file selected";
+                                choose-label: root.selected-game == 1 ? "Choose TotK base game (.nsp)" : "Choose OOT game (.nup)";
+                                clear-label: "Clear game input";
+                                available: root.can-manage;
+                                choose => { root.choose-input(0); }
+                                clear => { root.clear-input(0); }
                             }
+                            if root.selected-game == 1: VerticalLayout {
+                                spacing: 16px;
+                                GameFileInput {
+                                    title: "Tears of the Kingdom update";
+                                    description: "Required: a supported game update in .nsp or .nsz format. This is separate from the base game.";
+                                    selected-path: root.source-update;
+                                    empty-text: "No update selected";
+                                    choose-label: "Choose TotK update (.nsp)";
+                                    clear-label: "Clear update";
+                                    available: root.can-manage;
+                                    choose => { root.choose-input(1); }
+                                    clear => { root.clear-input(1); }
+                                }
+                                GameFileInput {
+                                    title: "Console keys";
+                                    description: "Required: your own prod.keys file. Keys are never supplied; sending them to your paired PC requires separate explicit approval.";
+                                    selected-path: root.source-keys;
+                                    empty-text: "No prod.keys file selected";
+                                    choose-label: "Choose prod.keys";
+                                    clear-label: "Clear keys selection";
+                                    available: root.can-manage;
+                                    choose => { root.choose-input(2); }
+                                    clear => { root.clear-input(2); }
+                                }
+                            }
+                            ActionButton {
+                                text: root.extra-game-inputs ? "Hide additional input options" : root.selected-game == 1 ? "Optional firmware fonts" : "Use extracted OOT game files";
+                                available: root.can-manage;
+                                clicked => { root.extra-game-inputs = !root.extra-game-inputs; }
+                            }
+                            if root.selected-game == 1 && (root.extra-game-inputs || root.source-firmware != ""): GameFileInput {
+                                title: "Firmware fonts (optional)";
+                                description: "Choose a local firmware font folder only if needed. This is not the base game or update.";
+                                selected-path: root.source-firmware;
+                                empty-text: "No optional fonts selected";
+                                choose-label: "Choose font folder";
+                                clear-label: "Clear fonts";
+                                available: root.can-manage;
+                                choose => { root.choose-input(3); }
+                                clear => { root.clear-input(3); }
+                            }
+                            if root.selected-game == 2 && root.extra-game-inputs: Surface {
+                                VerticalLayout {
+                                    padding: 20px; spacing: 12px;
+                                    SectionTitle { text: "Extracted Ocarina of Time files"; }
+                                    Muted { text: "Instead of a .nup, choose the parent folder containing romfs and exefs (or .triforce_exefs in a previously built PC copy). Selecting it replaces the game input above."; }
+                                    ActionButton { text: "Choose extracted OOT folder"; available: root.can-manage; clicked => { root.choose-input(4); } }
+                                }
+                            }
+                            if root.source-mode: ActionButton { text: "Next: review build"; primary: true; available: root.can-manage; clicked => { root.setup-step = 2; } }
                         }
                         if root.source-mode && root.setup-step == 2: Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 14px;
                                 SectionTitle { text: root.selected-game == 0 ? "2   Build your copy" : "3   Build your copy"; }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    Text { text: "Build workers"; color: Theme.text; vertical-alignment: center; }
-                                    ActionButton { text: "−"; min-width: 46px; max-width: 46px; available: root.can-manage && root.workers > 1; clicked => { root.set-workers(root.workers - 1); } }
-                                    Text { text: root.workers; color: Theme.text; width: 30px; horizontal-alignment: center; vertical-alignment: center; }
-                                    ActionButton { text: "+"; min-width: 46px; max-width: 46px; available: root.can-manage && root.workers < 16; clicked => { root.set-workers(root.workers + 1); } }
-                                }
                                 SwitchRow { title: "Prepare missing official build tools"; description: "Download verified tool archives after approval."; checked: root.managed-tools; available: root.can-manage; toggled(value) => { root.toggle(Toggle.managed-tools, value); } }
                                 if root.selected-game == 2: ActionButton { text: root.advanced-source ? "Hide graphics options" : "Graphics options"; available: root.can-manage; clicked => { root.advanced-source = !root.advanced-source; } }
                                 if root.selected-game == 2 && root.advanced-source: VerticalLayout {
@@ -577,8 +652,29 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Install / update"; primary: true; available: root.can-install; clicked => { root.action(Action.install-release, 0); } }
                                     ActionButton { text: "Check latest"; available: root.can-manage; clicked => { root.action(Action.check-release, 0); } }
                                 }
-                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. The protected desktop shortcut opens this manager's play controls." : "The official setup runs inside this managed workflow. Your game inputs and keys stay local; saves, settings and mods are preserved."; }
+                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. The protected desktop shortcut opens this manager's play controls." : "The official setup runs inside this managed workflow. Inputs stay on your PCs unless you explicitly approve paired transfer; saves, settings and mods are preserved."; }
                                 if root.selected-game == 1: ActionButton { text: "Optional manual setup download"; subtle: true; clicked => { root.action(Action.official-help, 0); } }
+                            }
+                        }
+                        if root.selected-game != 0: Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Transfer inputs to your paired PC"; }
+                                Muted { text: "Send selected game inputs over encrypted twilightProto on your approved LAN. Enable the same permission on both PCs. The receiver chooses a new destination; nothing is overwritten or installed automatically."; }
+                                SwitchRow { title: "I own this game and allow game-file transfers"; checked: root.game-file-sharing; toggled(value) => { root.toggle(Toggle.game-file-sharing, value); } }
+                                if root.game-file-transfer-reason != "": Muted { text: root.game-file-transfer-reason; color: Theme.warning; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: root.selected-game == 2 ? "Offer OOT .nup" : "Offer TotK base .nsp"; available: root.can-offer-game-file; clicked => { root.action(Action.offer-game-file, 0); } }
+                                    if root.selected-game == 1: ActionButton { text: "Offer TotK update .nsp"; available: root.can-offer-update; clicked => { root.action(Action.offer-game-file, 1); } }
+                                }
+                                Muted { text: root.selected-game == 2 ? "Select an OOT .nup in Game files. Extracted game folders are not transferred." : "Select your base/update .nsp in Game files. Other input formats can be used locally but are not transferred."; }
+                                if root.selected-game == 1: VerticalLayout {
+                                    spacing: 10px;
+                                    SwitchRow { title: "Also allow my console keys to this paired PC"; description: "Sensitive: separate from game-file permission. Both PCs must explicitly allow key transfer."; checked: root.key-sharing; toggled(value) => { root.toggle(Toggle.key-sharing, value); } }
+                                    ActionButton { text: "Offer prod.keys"; available: root.can-offer-keys; clicked => { root.action(Action.offer-game-file, 2); } }
+                                }
+                                Muted { text: "NUP/NSP container checks and SHA-256 detect transfer damage, not game ownership, title identity or authenticity. Received files become local setup inputs; review them before building."; }
                             }
                         }
                         if root.operation-busy || root.source-message != "" || root.source-error != "": Surface {
@@ -722,53 +818,84 @@ export component MainWindow inherits Window {
                     }
                     if root.section == 4: VerticalLayout {
                         spacing: 20px;
-                        PageHeading { title: "Texture library"; description: "Optional Dusklight packs, imported from files you're authorized to use."; }
-                        Surface {
+                        PageHeading { title: "Dusklight texture packs"; description: "Install a complete pack, switch versions, or restore your original textures. These packs are for Twilight Princess only."; }
+                        if root.selected-game != 0: Muted { text: "This library always manages Dusklight textures, not " + root.game-title + "."; }
+                        if root.texture-status != "" || root.texture-busy: Surface {
                             VerticalLayout {
-                                padding: 22px; spacing: 12px;
-                                SectionTitle { text: "Your Dusklight profile"; }
-                                Muted { text: root.texture-profile == "" ? "Locate or install Dusklight first. Its active texture profile is detected automatically." : root.texture-profile; }
-                                Muted { text: "Changes apply to the next launch. Games must be stopped; no game is forcibly restarted."; }
-                                if root.texture-recovery: Muted { text: "An interrupted texture change needs recovery before protected play."; color: Theme.warning; }
-                            }
-                        }
-                        Surface {
-                            VerticalLayout {
-                                padding: 22px; spacing: 12px;
-                                SectionTitle { text: "Make it your own"; }
-                                for creator[index] in root.texture-creators: ActionButton { text: creator.name; primary: root.texture-creator == index; available: !root.texture-busy; clicked => { root.texture-creator = index; } }
-                                Muted { text: root.texture-creators[root.texture-creator].description; }
-                                if root.texture-creators[root.texture-creator].has-site: ActionButton { text: "Visit creator download page"; clicked => { root.action(Action.open-texture-site, root.texture-creator); } }
-                                LineEdit { text <=> root.texture-version; placeholder-text: "Version label"; enabled: !Theme.modal-open; }
-                                SwitchRow { title: "I have permission to use these textures"; checked: root.texture-consent; toggled(value) => { root.toggle(Toggle.texture-consent, value); } }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    ActionButton { text: "Import ZIP"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-zip, 0); } }
-                                    ActionButton { text: "Import folder"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-folder, 0); } }
-                                }
+                                padding: 20px; spacing: 12px;
                                 Muted { text: root.texture-status; }
                                 if root.texture-busy: ProgressIndicator { indeterminate: true; }
-                                if root.texture-busy && root.texture-cancellable: ActionButton { text: "Cancel import safely"; clicked => { root.action(Action.cancel-textures, 0); } }
-                                Muted { text: "Only validated texture images are installed. Creator sign-in, paid access, quotas and hosting restrictions are never bypassed."; }
+                                if root.texture-busy && root.texture-cancellable: ActionButton { text: "Cancel installation safely"; clicked => { root.action(Action.cancel-textures, 0); } }
                             }
                         }
-                        for pack[index] in root.packs: pack-card := Surface {
-                            property <bool> expanded: false;
+                        Surface {
                             VerticalLayout {
-                                padding: 20px; spacing: 10px;
-                                Text { text: pack.title + (pack.active ? " · ACTIVE" : ""); color: pack.active ? Theme.accent : Theme.text; font-weight: 600; }
-                                Muted { text: pack.detail; }
-                                ActionButton { text: pack-card.expanded ? "Hide version details" : "Version details"; subtle: true; clicked => { pack-card.expanded = !pack-card.expanded; } }
-                                if pack-card.expanded: DetailBlock { title: "VERSION / CONTENT ID"; text: pack.metadata; }
-                                ActionButton { text: "Use this pack"; available: root.can-change-textures && !pack.active; clicked => { root.action(Action.activate-texture, index); } }
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Installed packs"; }
+                                Muted { text: "One pack is active at a time. Changes apply on your next Dusklight launch."; }
+                                if root.packs.length == 0: Muted { text: "No packs installed yet. Choose a pack and install its ZIP or folder below."; }
+                                for pack[index] in root.packs: pack-card := Surface {
+                                    property <bool> expanded: false;
+                                    VerticalLayout {
+                                        padding: 16px; spacing: 10px;
+                                        Text { text: pack.title; color: Theme.text; font-weight: 600; wrap: word-wrap; }
+                                        if pack.active: StatusBadge { text: "Active"; tint: Theme.success; }
+                                        Muted { text: pack.detail; }
+                                        if !pack.active: ActionButton { text: "Activate"; available: root.can-change-textures; clicked => { root.action(Action.activate-texture, index); } }
+                                        ActionButton { text: pack-card.expanded ? "Hide version details" : "Version details"; subtle: true; clicked => { pack-card.expanded = !pack-card.expanded; } }
+                                        if pack-card.expanded: DetailBlock { title: "VERSION / CONTENT ID"; text: pack.metadata; }
+                                    }
+                                }
+                                ActionButton { text: "Disable pack and restore original textures"; available: root.can-change-textures && root.textures-active; clicked => { root.action(Action.disable-textures, 0); } }
+                                if root.texture-reason != "": Muted { text: root.texture-reason; color: Theme.warning; }
+                                if root.texture-recovery: ActionButton { text: "Recover interrupted texture switch"; available: root.management-available; clicked => { root.action(Action.recover-textures, 0); } }
                             }
                         }
-                        if root.packs.length == 0: Muted { text: "No texture packs installed. Import a complete ZIP or folder above."; }
-                        HorizontalLayout {
-                            spacing: 10px;
-                            ActionButton { text: "Disable textures"; available: root.can-change-textures && root.textures-active; clicked => { root.action(Action.disable-textures, 0); } }
-                            ActionButton { text: "Refresh"; available: root.management-available; clicked => { root.action(Action.refresh-textures, 0); } }
-                            if root.texture-recovery: ActionButton { text: "Recover interrupted change"; available: root.management-available; clicked => { root.action(Action.recover-textures, 0); } }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Install or update a pack"; }
+                                Muted { text: "1. Choose the pack you downloaded. Get the complete ZIP from its creator, or use an extracted folder. No manual extraction or config selection is needed."; }
+                                ActionButton {
+                                    text: root.texture-creators.length == 0 ? "No texture presets available" : root.texture-creators[root.texture-creator].name + (root.texture-picker-open ? " · Hide choices" : " · Change");
+                                    available: !root.texture-busy && root.texture-creators.length > 0;
+                                    clicked => { root.texture-picker-open = !root.texture-picker-open; }
+                                }
+                                if root.texture-picker-open: VerticalLayout {
+                                    spacing: 8px;
+                                    for creator[index] in root.texture-creators: ActionButton {
+                                        text: creator.name; primary: root.texture-creator == index;
+                                        available: !root.texture-busy;
+                                        clicked => { root.texture-creator = index; root.texture-picker-open = false; }
+                                    }
+                                }
+                                if root.texture-creators.length > 0: Muted { text: root.texture-creators[root.texture-creator].description; }
+                                if root.texture-creators.length > 0 && root.texture-creators[root.texture-creator].has-site: ActionButton { text: "Visit creator download page"; clicked => { root.action(Action.open-texture-site, root.texture-creator); } }
+                                Muted { text: "2. Confirm permission, then choose your downloaded ZIP or folder. Installing also activates the pack; older versions stay in your library."; }
+                                SwitchRow { title: "I have permission to use these textures"; checked: root.texture-consent; toggled(value) => { root.toggle(Toggle.texture-consent, value); } }
+                                ActionButton { text: root.texture-details-open ? "Hide version label" : "Edit version label"; subtle: true; available: !root.texture-busy; clicked => { root.texture-details-open = !root.texture-details-open; } }
+                                if root.texture-details-open: VerticalLayout {
+                                    spacing: 8px;
+                                    Muted { text: "A label for your library, not a verified release version. A default is filled in for you."; }
+                                    LineEdit { text <=> root.texture-version; placeholder-text: "Version label"; enabled: !root.texture-busy && !Theme.modal-open; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Install ZIP"; primary: true; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-zip, 0); } }
+                                    ActionButton { text: "Install folder"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-folder, 0); } }
+                                }
+                                Muted { text: "Twilight Sync does not download packs for you or share them with your paired PC. Only validated texture images are installed; creator access restrictions are never bypassed."; }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Dusklight profile"; }
+                                Muted { text: root.texture-profile == "" ? "Locate or install Dusklight in Game setup. Its profile is detected automatically." : "Packs are applied to the profile Dusklight actually uses. Your saves are not changed."; }
+                                if root.texture-profile != "": ActionButton { text: root.texture-profile-open ? "Hide profile details" : "Profile details"; subtle: true; clicked => { root.texture-profile-open = !root.texture-profile-open; } }
+                                if root.texture-profile-open && root.texture-profile != "": DetailBlock { title: "DETECTED PROFILE"; text: root.texture-profile; }
+                                ActionButton { text: "Refresh library"; available: root.management-available; clicked => { root.action(Action.refresh-textures, 0); } }
+                            }
                         }
                     }
                     if root.section == 5: VerticalLayout {
@@ -792,7 +919,7 @@ export component MainWindow inherits Window {
                                 padding: 22px; spacing: 14px;
                                 SectionTitle { text: "Startup & background"; }
                                 SwitchRow { title: "Ready when Windows starts"; description: "Start quietly in the tray."; checked: root.startup; toggled(value) => { root.toggle(Toggle.startup, value); } }
-                                SwitchRow { title: "Check for app updates"; description: "Metadata only. Updates still need your approval."; checked: root.auto-updates; toggled(value) => { root.toggle(Toggle.updates, value); } }
+                                SwitchRow { title: "Automatically check for app updates"; description: "Checks when you open Twilight Sync. Installing still needs your approval."; checked: root.auto-updates; toggled(value) => { root.toggle(Toggle.updates, value); } }
                                 Muted { text: "Closing the window keeps sync running in the tray. Double-click the moon icon to reopen it, or use Quit to exit."; }
                             }
                         }
@@ -825,15 +952,6 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Choose ISO / RVZ"; clicked => { root.action(Action.choose-iso, 0); } }
                                     ActionButton { text: "Offer verified disc"; available: root.can-send-iso; clicked => { root.action(Action.send-iso, 0); } }
                                 }
-                                if root.pending-iso: VerticalLayout {
-                                    spacing: 10px;
-                                    Muted { text: root.disc-offer; color: Theme.warning; }
-                                    HorizontalLayout {
-                                        spacing: 10px;
-                                        ActionButton { text: "Accept disc"; available: root.can-accept-iso; clicked => { root.action(Action.accept-iso, 0); } }
-                                        ActionButton { text: "Decline"; clicked => { root.action(Action.decline-iso, 0); } }
-                                    }
-                                }
                             }
                         }
                         Surface {
@@ -856,7 +974,7 @@ export component MainWindow inherits Window {
                                 Text { text: "Your network is an explicit boundary"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
                                 Muted { text: "A private physical IPv4 interface, direct subnet and approved router fingerprint gate LAN activity. Router changes or stale verification close the channel. Router identities can be spoofed; they do not replace pairing."; }
                                 Text { text: "Validated data, not remote execution"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
-                                Muted { text: "Bounded, game-scoped save events are checked before replacement. Games have separate histories, common bases and play reservations. No peer shell commands, executable attachments, console keys or arbitrary directories."; }
+                                Muted { text: "Bounded, game-scoped save events are checked before replacement. Games have separate histories, common bases and play reservations. Game inputs and console keys require separate explicit transfer approval. No peer shell commands, executable attachments or arbitrary directories."; }
                                 Text { text: "Protection without false promises"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
                                 Muted { text: "Different progress requires a branch choice; prior saves are retained. Play reservations survive disconnects and restarts. Direct game launches can bypass cooperative protection. Save validation is not proof against every game exploit. This early release has not had an independent security audit; a compromised PC remains outside the trust boundary."; }
                             }
@@ -940,16 +1058,43 @@ export component MainWindow inherits Window {
             TouchArea { scroll-event(event) => { accept } }
             Rectangle {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                width: min(parent.width - 80px, 600px); height: min(parent.height - 60px, 520px);
+                width: min(parent.width - 48px, 600px); height: min(parent.height - 48px, 670px);
                 background: Theme.dialog; border-radius: 24px; border-width: 1px; border-color: Theme.line;
                 VerticalLayout {
-                    padding: 30px; spacing: 16px;
-                    SectionTitle { text: "Twilight Sync"; }
-                    Muted { text: "Your adventures, across your PCs.\nVersion " + root.version + "\nA local-first library with encrypted save sharing. Not affiliated with Nintendo."; }
+                    padding: 26px; spacing: 18px;
+                    HorizontalLayout {
+                        spacing: 14px;
+                        Image { source: @image-url("../assets/app-icon-256.png"); width: 60px; height: 60px; }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 3px;
+                            alignment: center;
+                            SectionTitle { text: "Twilight Sync"; font-size: 24px; }
+                            Muted { text: "Version " + root.version; }
+                        }
+                        ActionButton { text: "Done"; subtle: true; modal-control: true; clicked => { root.about-open = false; } }
+                    }
                     ScrollView {
                         VerticalLayout {
-                            spacing: 12px;
-                            AboutSlint { }
+                            spacing: 14px;
+                            SectionTitle { text: "Your adventures, across your PCs."; }
+                            Muted { text: "A local-first game library with encrypted save sharing. Built by @false00. Not affiliated with Nintendo."; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ActionButton { text: "Developer"; modal-control: true; clicked => { root.action(Action.project-link, 0); } }
+                                ActionButton { text: "Source code"; modal-control: true; clicked => { root.action(Action.project-link, 1); } }
+                                ActionButton { text: "Releases"; modal-control: true; clicked => { root.action(Action.project-link, 2); } }
+                            }
+                            Surface {
+                                VerticalLayout {
+                                    padding: 14px; spacing: 4px;
+                                    Muted { text: "BUILD DETAILS"; font-size: 11px; }
+                                    Text { text: root.build-profile + " build · " + root.build-target; color: Theme.text; wrap: word-wrap; }
+                                    Muted { text: "MIT license"; }
+                                }
+                            }
+                            Muted { text: "CREDITS & LICENSES"; font-size: 11px; }
+                            AboutSlint { max-width: 240px; height: 145px; }
                             ActionButton { text: "View third-party licenses"; modal-control: true; clicked => { root.action(Action.open-licenses, 0); } }
                             if root.demo-mode: VerticalLayout {
                                 spacing: 10px;
@@ -963,12 +1108,43 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    ActionButton { text: "Back to your adventure"; primary: true; modal-control: true; clicked => { root.about-open = false; } }
                 }
             }
         }
         key-pressed(event) => {
             if event.text == Key.Escape { root.about-open = false; return accept; }
+            return reject;
+        }
+    }
+    if root.confirmation-open: FocusScope {
+        init => { self.focus(); }
+        Rectangle {
+            background: Theme.dark ? #0009 : #0006;
+            TouchArea { scroll-event(event) => { accept } }
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: min(parent.width - 48px, 570px); height: min(parent.height - 48px, 390px);
+                background: Theme.dialog; border-radius: 22px; border-width: 1px; border-color: Theme.line;
+                VerticalLayout {
+                    padding: 24px; spacing: 14px;
+                    SectionTitle { text: root.confirmation-title; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            alignment: start;
+                            Text { text: root.confirmation-message; wrap: word-wrap; color: Theme.text; font-size: 14px; }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        ActionButton { text: "Cancel"; modal-control: true; clicked => { root.confirmation-response(false); } }
+                        ActionButton { text: "Continue"; primary: true; modal-control: true; clicked => { root.confirmation-response(true); } }
+                    }
+                }
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.confirmation-response(false); return accept; }
             return reject;
         }
     }

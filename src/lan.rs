@@ -111,6 +111,7 @@ pub struct Discovered {
     pub seen: Instant,
     pub game_channels_seen: Option<Instant>,
     pub triforce_seen: Option<Instant>,
+    pub game_files_seen: Option<Instant>,
 }
 
 pub fn decode_advertisement(
@@ -131,7 +132,7 @@ pub fn decode_advertisement(
     ensure!(
         matches!(
             ad.magic.as_str(),
-            "twilightProto/1" | "twilightProto/2" | "twilightProto/3"
+            "twilightProto/1" | "twilightProto/2" | "twilightProto/3" | "twilightProto/4"
         ) && ad.network == network.fingerprint,
         "Discovery network mismatch"
     );
@@ -145,9 +146,14 @@ pub fn decode_advertisement(
         address: SocketAddr::from((*source.ip(), PORT)),
         pairing: ad.pairing,
         seen: Instant::now(),
-        game_channels_seen: matches!(ad.magic.as_str(), "twilightProto/2" | "twilightProto/3")
+        game_channels_seen: matches!(
+            ad.magic.as_str(),
+            "twilightProto/2" | "twilightProto/3" | "twilightProto/4"
+        )
+        .then(Instant::now),
+        triforce_seen: matches!(ad.magic.as_str(), "twilightProto/3" | "twilightProto/4")
             .then(Instant::now),
-        triforce_seen: (ad.magic == "twilightProto/3").then(Instant::now),
+        game_files_seen: (ad.magic == "twilightProto/4").then(Instant::now),
     })
 }
 
@@ -308,7 +314,11 @@ mod tests {
         let device = decode_advertisement(&bytes, valid_source, &network, &own)?;
         assert_eq!(device.address.port(), PORT);
         assert!(device.game_channels_seen.is_none() && device.triforce_seen.is_none());
-        for (magic, triforce) in [("twilightProto/2", false), ("twilightProto/3", true)] {
+        for (magic, triforce, game_files) in [
+            ("twilightProto/2", false, false),
+            ("twilightProto/3", true, false),
+            ("twilightProto/4", true, true),
+        ] {
             advertisement.magic = magic.into();
             let decoded = decode_advertisement(
                 &serde_json::to_vec(&advertisement)?,
@@ -318,6 +328,7 @@ mod tests {
             )?;
             assert!(decoded.game_channels_seen.is_some());
             assert_eq!(decoded.triforce_seen.is_some(), triforce);
+            assert_eq!(decoded.game_files_seen.is_some(), game_files);
         }
         for source in ["8.8.8.8:42816", "192.168.2.3:42816", "192.168.1.2:42816"] {
             assert!(decode_advertisement(&bytes, source.parse()?, &network, &own).is_err());

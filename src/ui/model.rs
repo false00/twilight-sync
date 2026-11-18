@@ -211,13 +211,8 @@ pub(super) fn can_install(snapshot: &Snapshot, game: GameId) -> bool {
 
 pub(super) fn app_update_blocker(snapshot: &Snapshot) -> Option<&'static str> {
     let native = [&snapshot.totk, &snapshot.triforce];
-    if snapshot.game_running
-        || snapshot.remote_game
-        || native
-            .iter()
-            .any(|state| state.running || state.remote_running)
-    {
-        Some("Close running games on both PCs before updating Twilight Sync.")
+    if snapshot.game_running || native.iter().any(|state| state.running) {
+        Some("Close running games on this PC before updating Twilight Sync.")
     } else if snapshot.self_updates.checking
         || snapshot.self_updates.preparing
         || snapshot.install_busy
@@ -537,6 +532,26 @@ pub(super) fn can_change_textures(snapshot: &Snapshot) -> bool {
         && !snapshot.textures.recovery_needed
 }
 
+pub(super) fn texture_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+    if snapshot.texture_busy {
+        Some("Wait for the current texture installation or switch to finish.")
+    } else if snapshot.textures.recovery_needed {
+        Some("Recover the interrupted texture switch before installing or activating another pack.")
+    } else if snapshot.settings.game_exe.is_none() {
+        Some("Locate or install Dusklight in Game setup before installing textures.")
+    } else if snapshot.game_running || snapshot.remote_game {
+        Some("Close Dusklight on both PCs before changing its textures.")
+    } else if snapshot.settings.play_lock.is_some() {
+        Some("Finish or recover the Dusklight play reservation before changing textures.")
+    } else if snapshot.install_busy || snapshot.self_updates.preparing {
+        Some("Finish the current installation or app update before changing textures.")
+    } else if snapshot.settings.texture_profile.is_none() {
+        Some("Refresh the library to detect Dusklight's profile before activating a pack.")
+    } else {
+        None
+    }
+}
+
 pub(super) fn can_import_textures(snapshot: &Snapshot) -> bool {
     management_available(snapshot)
         && snapshot.settings.game_exe.is_some()
@@ -554,11 +569,50 @@ pub(super) fn can_send_disc(snapshot: &Snapshot) -> bool {
         && snapshot.transfer.is_empty()
 }
 
+fn game_file_idle(snapshot: &Snapshot, kind: crate::game_file::Kind) -> bool {
+    management_available(snapshot)
+        && snapshot.source.preferences_valid
+        && native(snapshot, kind.game()).is_some_and(|state| {
+            !state.running
+                && !state.remote_running
+                && !state.busy
+                && !state.updating
+                && !state.launch_pending
+                && !state.recovery_pending
+        })
+}
+
+pub(super) fn can_send_game_file(snapshot: &Snapshot, kind: crate::game_file::Kind) -> bool {
+    let preference = snapshot.source.preferences.get(kind.game());
+    let path = match kind {
+        crate::game_file::Kind::OotNup | crate::game_file::Kind::TotkBase => &preference.game_input,
+        crate::game_file::Kind::TotkUpdate => &preference.update,
+        crate::game_file::Kind::TotkKeys => &preference.keys,
+    };
+    snapshot.ready
+        && snapshot.game_files_supported
+        && snapshot.game_file_permissions.allows(kind)
+        && game_file_idle(snapshot, kind)
+        && path.as_deref().is_some_and(|path| kind.matches_path(path))
+        && !snapshot.pending_save
+        && !snapshot.pending_iso
+        && !snapshot.pending_recovery
+        && snapshot.transfer.is_empty()
+}
+
 pub(super) fn can_accept_disc(snapshot: &Snapshot) -> bool {
     snapshot.ready
-        && snapshot.settings.iso_enabled
         && snapshot.pending_iso
-        && snapshot.pending_disc_format.is_some()
+        && snapshot
+            .pending_disc_format
+            .is_some_and(|format| match format {
+                crate::game_file::Format::Game(kind) => {
+                    snapshot.game_files_supported
+                        && snapshot.game_file_permissions.allows(kind)
+                        && game_file_idle(snapshot, kind)
+                }
+                _ => snapshot.settings.iso_enabled,
+            })
         && management_available(snapshot)
         && !snapshot.pending_save
         && !snapshot.pending_recovery
@@ -757,6 +811,7 @@ mod tests {
             seen: std::time::Instant::now(),
             game_channels_seen: None,
             triforce_seen: None,
+            game_files_seen: None,
         });
         assert!(!can_reconnect(&snapshot));
         snapshot.devices[0].key = snapshot
@@ -770,6 +825,30 @@ mod tests {
         snapshot.settings.network = None;
         assert!(!can_reconnect(&snapshot));
         assert!(!can_pair(&snapshot));
+        Ok(())
+    }
+
+    #[test]
+    fn game_file_receiving_uses_its_own_permission_without_breaking_disc_offers() -> Result<()> {
+        use crate::game_file::{Format, Kind};
+        let mut snapshot = snapshot()?;
+        snapshot.settings.iso_enabled = true;
+        snapshot.settings.iso_file = Some("Twilight Princess.iso".into());
+        assert!(can_send_disc(&snapshot));
+        snapshot.settings.iso_enabled = false;
+        snapshot.pending_iso = true;
+        snapshot.pending_disc_format = Some(Format::Game(Kind::OotNup));
+        snapshot.game_files_supported = true;
+        assert!(!can_accept_disc(&snapshot));
+        snapshot.game_file_permissions.oot = true;
+        assert!(can_accept_disc(&snapshot));
+        snapshot.pending_disc_format = Some(Format::Game(Kind::TotkKeys));
+        snapshot.game_file_permissions.totk = true;
+        assert!(!can_accept_disc(&snapshot));
+        snapshot.game_file_permissions.keys = true;
+        assert!(can_accept_disc(&snapshot));
+        snapshot.totk.running = true;
+        assert!(!can_accept_disc(&snapshot));
         Ok(())
     }
 

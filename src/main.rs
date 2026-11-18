@@ -12,7 +12,11 @@ const DEPENDENCY_NOTICES: &str = include_str!(r"..\THIRD_PARTY_NOTICES.txt");
 #[cfg(not(windows))]
 const DEPENDENCY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
 
-fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -> Result<()> {
+fn build_source(
+    game: twilight_sync::protocol::GameId,
+    commit: &str,
+    jobs: Option<u8>,
+) -> Result<()> {
     use std::{
         thread,
         time::{Duration, Instant},
@@ -29,7 +33,10 @@ fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "Approve an exact lowercase 40-character source commit"
     );
-    anyhow::ensure!((1..=16).contains(&jobs), "Choose 1 to 16 compiler workers");
+    anyhow::ensure!(
+        jobs.is_none_or(|jobs| (1..=16).contains(&jobs)),
+        "Choose 1 to 16 compiler workers"
+    );
     println!("{}", twilight_sync::source_build::WARNING);
     let backend = twilight_sync::runtime::start_maintenance()?;
     backend.command(Command::CheckSource(game))?;
@@ -60,7 +67,7 @@ fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -
     );
     let mut preference = checked.source.preferences.get(game).clone();
     preference.method = Method::Source;
-    preference.jobs = jobs;
+    preference.jobs = jobs.unwrap_or_default();
     backend.command(Command::SetSourcePreference {
         game,
         preference: preference.clone(),
@@ -71,7 +78,6 @@ fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -
         preference,
         approved: true,
     })?;
-    let started = Instant::now();
     let mut last_message = String::new();
     loop {
         let snapshot = backend.snapshot()?;
@@ -104,10 +110,6 @@ fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -
                 return Ok(());
             }
         }
-        anyhow::ensure!(
-            started.elapsed() < Duration::from_secs(4 * 60 * 60),
-            "Source installation exceeded four hours; inspect the retained build log"
-        );
         thread::sleep(Duration::from_millis(250));
     }
 }
@@ -235,14 +237,16 @@ fn run() -> Result<()> {
             if flag != "--jobs" {
                 bail!("Expected --jobs N");
             }
-            arguments
-                .next()
-                .context("Missing worker count")?
-                .to_str()
-                .context("Worker count must be UTF-8")?
-                .parse::<u8>()?
+            Some(
+                arguments
+                    .next()
+                    .context("Missing worker count")?
+                    .to_str()
+                    .context("Worker count must be UTF-8")?
+                    .parse::<u8>()?,
+            )
         } else {
-            4
+            None
         };
         if arguments.next().is_some() {
             bail!("Unexpected source-build arguments");
@@ -609,6 +613,9 @@ fn run() -> Result<()> {
     }
     #[cfg(windows)]
     {
+        if !background && twilight_sync::ui::open_dashboard()? {
+            return Ok(());
+        }
         twilight_sync::ui::run(twilight_sync::runtime::start()?, background)
     }
     #[cfg(not(windows))]
