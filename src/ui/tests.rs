@@ -398,14 +398,164 @@ fn source_cancellation_remains_available_after_leaving_the_build_step() -> Resul
     let actions = Rc::new(RefCell::new(Vec::new()));
     let recorded = actions.clone();
     ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
-    let scroll = ElementHandle::find_by_element_type_name(&ui, "ScrollView")
-        .next()
-        .context("Missing main scroll view")?;
-    scroll.scroll(0.0, -4000.0);
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
-    flush();
     activate(&ui, "Cancel safely")?;
     assert_eq!(&*actions.borrow(), &[(Action::CancelSource, 0)]);
+    Ok(())
+}
+
+#[test]
+fn dependency_rows_preserve_controls_details_and_actions_as_setup_completes() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 3200.0));
+    ui.set_section(1);
+    ui.set_selected_game(1);
+    ui.set_source_mode(true);
+    flush();
+    ui.set_setup_step(0);
+    let tools: Vec<_> = [
+        ("Visual Studio 2026 C++ tools and Windows SDK 26100", 3),
+        (".NET SDK 10", 1),
+        ("MSYS2 UCRT64 compiler/runtime development packages", 2),
+    ]
+    .into_iter()
+    .map(|(name, setup)| widgets::ToolRow {
+        name: name.into(),
+        detail: format!(
+            r"Missing C:\a very long SDK installation directory\{}\include\required.h",
+            "toolchain".repeat(12)
+        )
+        .into(),
+        setup,
+        ..Default::default()
+    })
+    .collect();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    let controls = |label: &str| {
+        let mut elements: Vec<_> = ElementHandle::find_by_accessible_label(&ui, label)
+            .filter(|element| {
+                element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Button)
+            })
+            .collect();
+        elements.sort_by(|left, right| {
+            left.absolute_position()
+                .y
+                .total_cmp(&right.absolute_position().y)
+        });
+        elements
+    };
+    for dark in [false, true] {
+        ui.set_dark_mode(dark);
+        for width in [720.0, 900.0, 1200.0] {
+            ui.window().set_size(slint::LogicalSize::new(width, 3200.0));
+            replace_rows(ui.get_tools(), tools.clone(), |model| ui.set_tools(model));
+            ui.set_tools_missing(true);
+            ui.set_can_manage(true);
+            flush();
+            let setup_buttons = controls("Set up");
+            let command_buttons = controls("Commands");
+            assert_eq!(setup_buttons.len(), 3);
+            assert_eq!(command_buttons.len(), 3);
+            for (index, expected) in [
+                Action::SetupVisualStudio,
+                Action::SetupDotnet,
+                Action::SetupMsys,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                setup_buttons[index].invoke_accessible_default_action();
+                assert_eq!(actions.borrow().last(), Some(&(expected, 0)));
+            }
+            for (index, expected) in [
+                Action::CopyVisualStudio,
+                Action::CopyDotnet,
+                Action::CopyMsys,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                command_buttons[index].invoke_accessible_default_action();
+                assert_eq!(actions.borrow().last(), Some(&(expected, 0)));
+            }
+            controls("Details")[0].invoke_accessible_default_action();
+            flush();
+            let mut installing = tools.clone();
+            installing[0].busy = true;
+            replace_rows(ui.get_tools(), installing, |model| ui.set_tools(model));
+            ui.set_can_manage(false);
+            flush();
+            assert_eq!(
+                controls("Hide details").len(),
+                1,
+                "A row refresh discarded its expansion"
+            );
+            let previous_actions = actions.borrow().len();
+            controls("Set up")[0].invoke_accessible_default_action();
+            assert_eq!(
+                actions.borrow().len(),
+                previous_actions,
+                "Setup can start twice"
+            );
+            let installed: Vec<_> = tools
+                .iter()
+                .cloned()
+                .map(|mut tool| {
+                    tool.ready = true;
+                    tool.detail = "".into();
+                    tool
+                })
+                .collect();
+            replace_rows(ui.get_tools(), installed, |model| ui.set_tools(model));
+            ui.set_tools_missing(false);
+            ui.set_can_manage(true);
+            flush();
+            assert!(
+                ui.get_show_tool_details(),
+                "Completing setup collapsed the checks"
+            );
+            assert_eq!(controls("Installed").len(), 3);
+            assert_eq!(controls("Commands").len(), 3);
+            assert_eq!(controls("Hide details").len(), 1);
+            for label in ["Installed", "Commands", "Hide details"] {
+                for element in controls(label) {
+                    let position = element.absolute_position();
+                    let size = element.size();
+                    ensure!(
+                        position.x >= 0.0 && position.x + size.width <= width + 1.0,
+                        "{label} overflows at {width}px: {position:?} {size:?}"
+                    );
+                    ensure!(
+                        size.height >= 44.0,
+                        "Dependency control lost its touch target"
+                    );
+                }
+            }
+            controls("Installed")[0].invoke_accessible_default_action();
+            assert_eq!(actions.borrow().len(), previous_actions);
+            controls("Hide details")[0].invoke_accessible_default_action();
+            flush();
+        }
+    }
+    ui.window().set_size(slint::LogicalSize::new(720.0, 720.0));
+    ui.set_sdk_busy(true);
+    ui.set_source_busy(true);
+    ui.set_operation_busy(true);
+    ui.set_source_message(
+        "Setting up the SDK. Complete Microsoft's installer and Windows approval prompts.".into(),
+    );
+    flush();
+    let status = ElementHandle::find_by_accessible_label(&ui, "Installing build prerequisites")
+        .next()
+        .context("Installer status is offscreen on a handheld")?;
+    assert!(status.absolute_position().y + status.size().height <= 720.0);
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Cancel safely")
+            .next()
+            .is_none()
+    );
     Ok(())
 }
 

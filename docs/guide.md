@@ -62,8 +62,11 @@ For development:
 cargo run --locked
 ```
 
-Normal desktop startup creates the private application directory, protects the
-device key with Windows DPAPI, and applies the startup preference. It does **not**
+Normal desktop startup creates the private application directory and checks its
+permissions. On Windows, it repairs the directory ACL only when needed, rather
+than rewriting inherited permissions across build caches on every launch.
+It protects the device key with Windows DPAPI and applies the startup preference.
+It does **not**
 trust a router, pair a peer, download Dusklight, modify a save, or transfer a disc image
 without the applicable approvals.
 
@@ -589,8 +592,15 @@ The flow:
 3. Finish the displayed one-time SDK prerequisites. Some require the vendor's
    installer/permissions; Twilight Sync does not bypass signing, UAC, antivirus,
    SmartScreen or Windows policy. TotK currently follows the upstream
-   `C:\msys64\ucrt64` development layout. Missing .NET 10 and MSYS2 rows offer
-   **Copy setup commands** and approved automatic setup. The .NET command is
+   `C:\msys64\ucrt64` development layout. Missing Visual Studio, .NET 10 and
+   MSYS2 rows offer **Set up** and **Commands**. Visual Studio setup selects the
+   2026 C++ tools and Windows SDK 10.0.26100 for you, completing an existing
+   2026 installation or installing Build Tools alongside older versions.
+   Microsoft's installer still asks for its terms and Windows permissions;
+   no restart is forced. If it requests a restart, restart Windows before
+   building. Checks validate the compiler, SDK headers, x64 libraries and
+   resource compiler, including custom Visual Studio/SDK locations.
+   The .NET command is
    `winget install --id Microsoft.DotNet.SDK.10 --exact --source winget`.
    MSYS2 is installed via `MSYS2.MSYS2` if absent, updated twice using fresh
    `bash -lc` sessions, then provisioned with the UCRT64 package list. Close other
@@ -599,8 +609,11 @@ The flow:
    **Cancel source build**. Prerequisites are rechecked after completion.
    When using copied commands outside the app, click **Check source version /
    prerequisites** afterwards to refresh cached results. Missing MSYS2 checks
-   list the exact files; both `include\vma\vk_mem_alloc.h` and the flat
+   expose the exact files under **Details**; both `include\vma\vk_mem_alloc.h` and the flat
    allocator-header layout are accepted and preserved for the upstream compiler.
+   Checks stay expanded until you hide them, and installed rows keep their
+   places instead of removing controls. Installer progress and errors appear
+   at the top of Game setup, separate from game-build cancellation.
 4. Supply legally obtained local inputs: no build assets for Dusklight's engine;
    TotK base/update/keys and optional firmware fonts; Triforce `.nup` or extracted
    files. A current Triforce install's `.triforce_exefs` and `romfs` are reused

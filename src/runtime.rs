@@ -313,7 +313,7 @@ enum Input {
     SourceSdkReady {
         game: protocol::GameId,
         setup: source_build::SdkSetup,
-        result: Result<()>,
+        result: Result<(source_build::SdkOutcome, Vec<source_build::Prerequisite>)>,
     },
     SourceBuilt {
         game: protocol::GameId,
@@ -1373,21 +1373,28 @@ impl Engine {
             } => {
                 self.install_busy = false;
                 self.source.busy = false;
-                self.source.sdk_setup = false;
+                self.source.sdk_setup = None;
                 ensure!(
                     self.source.game == Some(game),
                     "Unexpected SDK setup result"
                 );
-                self.source.prerequisites = source_build::prerequisites(game)?;
-                let result = result.and_then(|()| {
+                let result = result.and_then(|(outcome, prerequisites)| {
+                        self.source.prerequisites = prerequisites;
+                        if outcome.reboot_required {
+                            return Ok(outcome);
+                        }
                         ensure!(self.source.prerequisites.iter().any(|item| item.setup == Some(setup) && item.ready),
                             "SDK installer finished, but the required tools were not found yet. Complete any installer/reboot prompts and recheck prerequisites.");
-                        Ok(())
+                        Ok(outcome)
                     });
                 match result {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         self.source.error = None;
-                        self.source.message = "SDK setup completed and prerequisites were rechecked. You can continue with the source build.".into();
+                        self.source.message = if outcome.reboot_required {
+                            "SDK setup finished. Restart Windows to complete installation, then check source & tools again before building."
+                        } else {
+                            "SDK setup completed and prerequisites were rechecked. Continue with the next missing dependency or the source build."
+                        }.into();
                         Ok(())
                     }
                     Err(error) => {
@@ -2074,7 +2081,7 @@ impl Engine {
         self.source.game = Some(game);
         self.source.busy = true;
         self.source.building = building;
-        self.source.sdk_setup = false;
+        self.source.sdk_setup = None;
         self.source.error = None;
         self.install_busy = true;
         if building {
@@ -2321,16 +2328,18 @@ impl Engine {
                 );
                 let log = source_build::new_log(&self.root, game)?;
                 self.begin_source_operation(game, false)?;
-                self.source.sdk_setup = true;
+                self.source.sdk_setup = Some(setup);
                 self.source.log = Some(log.clone());
                 self.source.message = "Preparing the selected SDK. Complete any Windows Package Manager/installer prompts; no game build runs.".into();
                 let sender = self.sender.clone();
                 thread::spawn(move || {
-                    let result = setup.run(&log, &mut |message| {
-                        sender
-                            .send(Input::SourceProgress { game, message })
-                            .context("SDK setup progress receiver stopped")
-                    });
+                    let result = setup
+                        .run(&log, &mut |message| {
+                            sender
+                                .send(Input::SourceProgress { game, message })
+                                .context("SDK setup progress receiver stopped")
+                        })
+                        .and_then(|outcome| Ok((outcome, source_build::prerequisites(game)?)));
                     if sender
                         .send(Input::SourceSdkReady {
                             game,
@@ -2427,7 +2436,9 @@ impl Engine {
             }
             Command::CancelSource => {
                 ensure!(
-                    self.source.busy && self.source.log.is_some() && !self.source.sdk_setup,
+                    self.source.busy
+                        && self.source.log.is_some()
+                        && self.source.sdk_setup.is_none(),
                     "There is no cancellable source build or tool download"
                 );
                 self.source_cancel.store(true, Ordering::Release);
@@ -6729,12 +6740,60 @@ mod tests {
     }
 
     #[test]
+    fn sdk_completion_rechecks_tools_reports_restarts_and_does_not_cancel_installers() -> Result<()>
+    {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let setup = source_build::SdkSetup::VisualStudio;
+        for (ready, reboot_required) in [(false, false), (true, false), (false, true)] {
+            harness.left.source.game = Some(protocol::GameId::Totk);
+            harness.left.source.busy = true;
+            harness.left.install_busy = true;
+            harness.left.source.sdk_setup = Some(setup);
+            harness.left.source.log = Some(harness.left.root.join("synthetic-sdk.log"));
+            assert!(harness.left.command(Command::CancelSource).is_err());
+            assert!(!harness.left.source_cancel.load(Ordering::Acquire));
+            let result = harness.left.input(Input::SourceSdkReady {
+                game: protocol::GameId::Totk,
+                setup,
+                result: Ok((
+                    source_build::SdkOutcome { reboot_required },
+                    vec![source_build::Prerequisite {
+                        name: "Synthetic C++ tools and SDK",
+                        ready,
+                        url: "https://visualstudio.microsoft.com/downloads/",
+                        setup: Some(setup),
+                        detail: None,
+                    }],
+                )),
+            });
+            assert_eq!(result.is_ok(), ready || reboot_required);
+            assert!(!harness.left.source.busy && !harness.left.install_busy);
+            assert!(harness.left.source.sdk_setup.is_none());
+            assert_eq!(harness.left.source.prerequisites[0].ready, ready);
+            if reboot_required {
+                assert!(harness.left.source.message.contains("Restart Windows"));
+            } else if !ready {
+                assert!(
+                    harness
+                        .left
+                        .source
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.contains("required tools were not found"))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn source_build_approval_and_idle_guards_run_before_tool_or_source_execution() -> Result<()> {
         let mut harness = Harness::new(Some(variant(1)), None)?;
         let before = harness.left.current_hash()?;
         for setup in [
             source_build::SdkSetup::DotNet10,
             source_build::SdkSetup::Msys2Ucrt64,
+            source_build::SdkSetup::VisualStudio,
         ] {
             let error = harness
                 .left

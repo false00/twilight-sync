@@ -32,7 +32,49 @@ fn on_path(name: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn vs_dev() -> Result<Option<PathBuf>> {
+fn vs_dev(game: GameId) -> Result<Option<PathBuf>> {
+    vs_dev_in(&vs_installations()?, game)
+}
+
+fn vs_installations() -> Result<Vec<PathBuf>> {
+    let mut installations = Vec::new();
+    if let Some(program_files) = std::env::var_os("ProgramFiles(x86)") {
+        let vswhere =
+            PathBuf::from(program_files).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+        if vswhere.try_exists()? {
+            ensure_safe_path(&vswhere)?;
+            let mut command = Command::new(vswhere);
+            command.args([
+                "-products",
+                "*",
+                "-sort",
+                "-property",
+                "installationPath",
+                "-utf8",
+            ]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command
+                .output()
+                .context("Finding installed Visual Studio build tools")?;
+            ensure!(
+                output.status.success(),
+                "Visual Studio discovery failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for path in std::str::from_utf8(&output.stdout)?
+                .lines()
+                .filter(|line| !line.is_empty())
+            {
+                let path = PathBuf::from(path);
+                ensure_safe_path(&path)?;
+                installations.push(path);
+            }
+        }
+    }
     for program_files in ["ProgramFiles", "ProgramFiles(x86)"]
         .into_iter()
         .filter_map(std::env::var_os)
@@ -51,28 +93,118 @@ fn vs_dev() -> Result<Option<PathBuf>> {
                 if !edition.file_type()?.is_dir() {
                     continue;
                 }
-                let directory = edition.path();
-                let script = directory.join("Common7").join("Tools").join("VsDevCmd.bat");
-                let compilers = directory.join("VC").join("Tools").join("MSVC");
-                if script.is_file() && compilers.try_exists()? {
-                    for version in fs::read_dir(compilers)? {
-                        if version?
-                            .path()
-                            .join("bin")
-                            .join("Hostx64")
-                            .join("x64")
-                            .join("cl.exe")
-                            .is_file()
-                        {
-                            ensure_safe_path(&script)?;
-                            return Ok(Some(script));
-                        }
+                if !installations.contains(&edition.path()) {
+                    installations.push(edition.path());
+                }
+            }
+        }
+    }
+    Ok(installations)
+}
+
+fn vs_dev_in(installations: &[PathBuf], game: GameId) -> Result<Option<PathBuf>> {
+    for directory in installations {
+        let script = directory.join(r"Common7\Tools\VsDevCmd.bat");
+        let compilers = directory.join(r"VC\Tools\MSVC");
+        if script.is_file() && compilers.try_exists()? {
+            for version in fs::read_dir(compilers)? {
+                let version = version?;
+                if !version.file_type()?.is_dir() {
+                    continue;
+                }
+                if game == GameId::Totk {
+                    let parts: Vec<_> = version
+                        .file_name()
+                        .to_string_lossy()
+                        .split('.')
+                        .map(str::parse::<u32>)
+                        .collect::<std::result::Result<_, _>>()?;
+                    if parts.len() < 2 || (parts[0], parts[1]) < (14, 50) {
+                        continue;
                     }
+                }
+                if version.path().join(r"bin\Hostx64\x64\cl.exe").is_file() {
+                    ensure_safe_path(&script)?;
+                    return Ok(Some(script));
                 }
             }
         }
     }
     Ok(None)
+}
+
+fn windows_sdk_ready(minimum_build: u32) -> Result<bool> {
+    let mut roots = Vec::new();
+    #[cfg(windows)]
+    {
+        use winreg::{
+            RegKey,
+            enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY},
+        };
+        match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+            r"SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+            KEY_READ | KEY_WOW64_32KEY,
+        ) {
+            Ok(key) => match key.get_value::<String, _>("KitsRoot10") {
+                Ok(root) => roots.push(PathBuf::from(root)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Reading Windows SDK location"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Finding Windows SDK registration"),
+        }
+    }
+    for directory in ["ProgramFiles(x86)", "ProgramFiles"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+    {
+        roots.push(PathBuf::from(directory).join(r"Windows Kits\10"));
+    }
+    for root in roots {
+        if windows_sdk_ready_at(&root, minimum_build)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn windows_sdk_ready_at(root: &Path, minimum_build: u32) -> Result<bool> {
+    let includes = root.join("Include");
+    ensure_safe_path(&includes)?;
+    if !includes.try_exists()? {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(&includes)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Ok(version) = name
+            .to_string_lossy()
+            .split('.')
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        if version.len() != 4 || version[0] != 10 || version[1] != 0 || version[2] < minimum_build {
+            continue;
+        }
+        let mut complete = true;
+        for path in [
+            entry.path().join(r"um\Windows.h"),
+            entry.path().join(r"shared\winerror.h"),
+            entry.path().join(r"ucrt\stdio.h"),
+            root.join("Lib").join(&name).join(r"um\x64\kernel32.lib"),
+            root.join("Lib").join(&name).join(r"ucrt\x64\ucrt.lib"),
+            root.join("bin").join(&name).join(r"x64\rc.exe"),
+        ] {
+            ensure_safe_path(&path)?;
+            complete &= path.try_exists()? && path.metadata()?.is_file();
+        }
+        if complete {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn dotnet_root() -> Result<Option<PathBuf>> {
@@ -137,12 +269,24 @@ pub(super) fn prerequisites(game: GameId) -> Result<Vec<Prerequisite>> {
         detail: None,
     }];
     if game != GameId::Triforce {
+        let compiler = vs_dev(game)?.is_some();
+        let sdk = windows_sdk_ready(if game == GameId::Totk { 26100 } else { 0 })?;
         prerequisites.push(Prerequisite {
-            name: "Visual Studio C++ Build Tools and Windows SDK",
-            ready: vs_dev()?.is_some(),
+            name: if game == GameId::Totk {
+                "Visual Studio 2026 C++ tools and Windows SDK 26100"
+            } else {
+                "Visual Studio C++ Build Tools and Windows SDK"
+            },
+            ready: compiler && sdk,
             url: VS_URL,
-            setup: None,
-            detail: None,
+            setup: (game == GameId::Totk).then_some(super::SdkSetup::VisualStudio),
+            detail: (!(compiler && sdk)).then(|| format!(
+                "{}{}",
+                if compiler { "" } else if game == GameId::Totk {
+                    "Visual Studio 2026 C++ x64 compiler (MSVC 14.50 or newer) is missing. "
+                } else { "C++ x64 compiler is missing. " },
+                if sdk { "" } else { "A complete Windows SDK (headers, x64 libraries and resource compiler) is missing." },
+            )),
         });
     }
     match game {
@@ -556,7 +700,8 @@ pub(super) fn build(
                 0,
                 python.parent().context("Python has no directory")?.into(),
             );
-            let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            let vs = vs_dev(request.plan.game)?
+                .context("Install Visual Studio C++ Build Tools first")?;
             let binary = workspace.join("b");
             let mut configure = context.vs_command(
                 "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --preset windows-msvc-relwithdebinfo -B \"%TS_BUILD%\" \"-DCMAKE_INSTALL_PREFIX=%TS_OUTPUT%\" \"-DPython3_EXECUTABLE=%TS_PYTHON%\" \"-DCMAKE_MAKE_PROGRAM=%TS_NINJA%\"",
@@ -634,7 +779,8 @@ pub(super) fn build(
                 &[source.join("tools").join("requirements-installer.txt")],
                 runner,
             )?;
-            let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            let vs = vs_dev(request.plan.game)?
+                .context("Install Visual Studio C++ Build Tools first")?;
             let nuget = prepare_nuget(workspace)?;
             for (script, label) in [
                 (
@@ -912,6 +1058,63 @@ fn triforce_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_sdk_requires_current_headers_libraries_and_resource_compiler() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let files = [
+            r"Include\10.0.26100.0\um\Windows.h",
+            r"Include\10.0.26100.0\shared\winerror.h",
+            r"Include\10.0.26100.0\ucrt\stdio.h",
+            r"Lib\10.0.26100.0\um\x64\kernel32.lib",
+            r"Lib\10.0.26100.0\ucrt\x64\ucrt.lib",
+            r"bin\10.0.26100.0\x64\rc.exe",
+        ];
+        for file in files {
+            assert!(!windows_sdk_ready_at(root, 26100)?);
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().context("SDK fixture has no parent")?)?;
+            fs::write(path, b"synthetic SDK fixture")?;
+        }
+        assert!(windows_sdk_ready_at(root, 26100)?);
+        assert!(!windows_sdk_ready_at(root, 26200)?);
+        fs::remove_file(root.join(files[0]))?;
+        assert!(!windows_sdk_ready_at(root, 26100)?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn custom_visual_studio_paths_require_a_complete_current_compiler() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let installation = temp.path().join("Custom developer's tools");
+        let script = installation.join(r"Common7\Tools\VsDevCmd.bat");
+        fs::create_dir_all(
+            script
+                .parent()
+                .context("Developer-script fixture has no parent")?,
+        )?;
+        fs::write(&script, b"synthetic developer environment")?;
+        let roots = [installation.clone()];
+        assert!(vs_dev_in(&roots, GameId::Totk)?.is_none());
+        for (version, totk_ready) in [("14.49.1", false), ("14.50.1", true)] {
+            let compiler = installation
+                .join(r"VC\Tools\MSVC")
+                .join(version)
+                .join(r"bin\Hostx64\x64\cl.exe");
+            fs::create_dir_all(
+                compiler
+                    .parent()
+                    .context("Compiler fixture has no parent")?,
+            )?;
+            fs::write(compiler, b"synthetic compiler fixture")?;
+            assert_eq!(vs_dev_in(&roots, GameId::Totk)?.is_some(), totk_ready);
+            assert_eq!(vs_dev_in(&roots, GameId::Dusklight)?, Some(script.clone()));
+        }
+        Ok(())
+    }
 
     #[test]
     #[cfg(windows)]

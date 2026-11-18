@@ -5,7 +5,7 @@ export enum Action {
     play, sync-save, setup, locate-game, refresh, compare, continue-local,
     use-local, use-remote, accept-save, decline-save, recover, approve-recovery, decline-recovery,
     check-source, reset-source, review-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
-    setup-dotnet, setup-msys, copy-dotnet, copy-msys, check-release, install-release,
+    setup-dotnet, setup-msys, setup-visual-studio, copy-dotnet, copy-msys, copy-visual-studio, check-release, install-release,
     trust-network, open-pairing, connect-device, reconnect, approve-pairing, reject-pairing, unpair, view-game,
     history-refresh, history-older, history-preview, history-restore, close-preview,
     check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso, offer-game-file,
@@ -20,9 +20,53 @@ export struct SaveCard { title: string, kind: string, date: string, hearts: stri
 export struct DeviceCard { name: string, detail: string, pairing: bool }
 export struct AttentionCard { game-index: int, title: string, detail: string }
 export struct HistoryCard { id: string, title: string, detail: string, metadata: string, ancestry: string, branch: int, current: bool }
-export struct ToolRow { name: string, detail: string, ready: bool, setup: int }
+export struct ToolRow { name: string, detail: string, ready: bool, busy: bool, setup: int }
 export struct PackCard { title: string, detail: string, metadata: string, active: bool }
 export struct TextureCreator { name: string, description: string, version: string, has-site: bool }
+
+component BuildPrerequisite inherits VerticalLayout {
+    in property <ToolRow> tool;
+    in property <bool> available;
+    property <bool> expanded: false;
+    callback setup(int);
+    callback commands(int);
+    callback help;
+    spacing: 8px;
+    HorizontalLayout {
+        spacing: 10px;
+        Text {
+            text: root.tool.busy ? "INSTALLING" : root.tool.ready ? "FOUND" : "SETUP NEEDED";
+            color: root.tool.busy ? Theme.accent : root.tool.ready ? Theme.success : Theme.warning;
+            font-size: 11px; width: 110px; vertical-alignment: center;
+        }
+        Muted { text: root.tool.name; horizontal-stretch: 1; min-width: 0px; }
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        if root.tool.setup > 0: ActionButton {
+            text: root.tool.ready ? "Installed" : "Set up";
+            width: 112px; available: root.available && !root.tool.ready;
+            clicked => { root.setup(root.tool.setup); }
+        }
+        if root.tool.setup > 0: ActionButton {
+            text: "Commands"; subtle: true; available: root.available;
+            clicked => { root.commands(root.tool.setup); }
+        }
+        if root.tool.setup == 0: ActionButton {
+            text: "Instructions"; available: root.available && !root.tool.ready;
+            clicked => { root.help(); }
+        }
+        ActionButton {
+            text: root.expanded ? "Hide details" : "Details"; subtle: true;
+            available: root.expanded || root.tool.detail != "";
+            clicked => { root.expanded = !root.expanded; }
+        }
+    }
+    if root.expanded && root.tool.detail != "": Text {
+        text: root.tool.detail; color: Theme.warning; font-size: 14px;
+        wrap: char-wrap; min-width: 0px;
+    }
+}
 
 component GameFileInput inherits Surface {
     in property <string> title;
@@ -109,7 +153,7 @@ export component MainWindow inherits Window {
     in property <[HistoryCard]> history;
     in property <[ToolRow]> tools;
     in property <bool> tools-missing;
-    in-out property <bool> show-tool-details: false;
+    in-out property <bool> show-tool-details: true;
     in property <[PackCard]> packs;
     in property <string> game-title;
     in property <string> game-subtitle;
@@ -485,6 +529,22 @@ export component MainWindow inherits Window {
                     if root.section == 1: VerticalLayout {
                         spacing: 20px;
                         PageHeading { title: "Game setup"; description: root.game-title + " · Install, update, or build your own copy."; }
+                        if root.operation-busy || root.source-message != "" || root.source-error != "": Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: root.sdk-busy ? "Installing build prerequisites" : root.operation-busy ? "Getting your adventure ready" : root.source-error == "" ? "Build status" : "Let's resolve this"; }
+                                if root.operation-busy: ProgressIndicator { indeterminate: true; }
+                                Text { text: root.source-message; color: Theme.text; wrap: char-wrap; min-width: 0px; }
+                                if root.source-error != "": Text { text: root.source-error; color: Theme.danger; wrap: char-wrap; min-width: 0px; }
+                                Muted { text: root.sdk-busy ? "Complete any installer, license or Windows approval prompts. Keep the installer open until it finishes; SDK installation cannot be cancelled as a game build." : "Previous installations and saves stay intact until verification succeeds."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Open build log"; available: root.source-log != ""; clicked => { root.action(Action.open-log, 0); } }
+                                    if root.source-busy && !root.sdk-busy: ActionButton { text: "Cancel safely"; clicked => { root.action(Action.cancel-source, 0); } }
+                                    if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
+                                }
+                            }
+                        }
                         if !root.preferences-valid: Surface {
                             VerticalLayout {
                                 padding: 20px; spacing: 12px;
@@ -528,22 +588,17 @@ export component MainWindow inherits Window {
                                     }
                                     if root.source-tag != "": Muted { text: "Source " + root.source-tag + " · " + root.source-commit; }
                                     if root.source-tag != "": ActionButton { text: "Review this source revision"; available: root.can-manage; clicked => { root.action(Action.review-source, 0); } }
-                                    if root.tools.length > 0 && !root.tools-missing: HorizontalLayout {
-                                        Text { text: "All build prerequisites found"; color: Theme.success; vertical-alignment: center; }
+                                    if root.tools.length > 0: HorizontalLayout {
+                                        Text { text: root.tools-missing ? "Build prerequisites" : "All build prerequisites found"; color: root.tools-missing ? Theme.text : Theme.success; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; min-width: 0px; }
                                         ActionButton { text: root.show-tool-details ? "Hide checks" : "Show checks"; clicked => { root.show-tool-details = !root.show-tool-details; } }
                                     }
-                                    if root.tools-missing || root.show-tool-details: VerticalLayout {
-                                    for tool[index] in root.tools: VerticalLayout {
-                                        spacing: 6px;
-                                        HorizontalLayout {
-                                            spacing: 10px;
-                                            Text { text: tool.ready ? "FOUND" : "SETUP NEEDED"; color: tool.ready ? Theme.success : Theme.accent; font-size: 11px; width: 110px; vertical-alignment: center; }
-                                            Muted { text: tool.name; horizontal-stretch: 1; }
-                                            if !tool.ready && tool.setup > 0: ActionButton { text: "Set up"; available: root.can-manage; min-width: 88px; clicked => { root.action(tool.setup == 1 ? Action.setup-dotnet : Action.setup-msys, 0); } }
-                                            if !tool.ready && tool.setup > 0: ActionButton { text: "Commands"; subtle: true; min-width: 100px; clicked => { root.action(tool.setup == 1 ? Action.copy-dotnet : Action.copy-msys, 0); } }
-                                            if !tool.ready && tool.setup == 0: ActionButton { text: "Instructions"; min-width: 100px; clicked => { root.action(Action.tool-help, index); } }
-                                        }
-                                        if tool.detail != "": Muted { text: tool.detail; color: Theme.danger; }
+                                    if root.show-tool-details: VerticalLayout {
+                                    spacing: 18px;
+                                    for tool[index] in root.tools: BuildPrerequisite {
+                                        tool: tool; available: root.can-manage;
+                                        setup(kind) => { root.action(kind == 1 ? Action.setup-dotnet : kind == 2 ? Action.setup-msys : Action.setup-visual-studio, 0); }
+                                        commands(kind) => { root.action(kind == 1 ? Action.copy-dotnet : kind == 2 ? Action.copy-msys : Action.copy-visual-studio, 0); }
+                                        help => { root.action(Action.tool-help, index); }
                                     }
                                     }
                                     Muted { text: "After running copied commands, check source & tools again to refresh the results."; }
@@ -675,22 +730,6 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Offer prod.keys"; available: root.can-offer-keys; clicked => { root.action(Action.offer-game-file, 2); } }
                                 }
                                 Muted { text: "NUP/NSP container checks and SHA-256 detect transfer damage, not game ownership, title identity or authenticity. Received files become local setup inputs; review them before building."; }
-                            }
-                        }
-                        if root.operation-busy || root.source-message != "" || root.source-error != "": Surface {
-                            VerticalLayout {
-                                padding: 22px; spacing: 12px;
-                                SectionTitle { text: root.operation-busy ? "Getting your adventure ready" : root.source-error == "" ? "Build status" : "Let's resolve this"; }
-                                if root.operation-busy: ProgressIndicator { indeterminate: true; }
-                                Text { text: root.source-message; color: Theme.text; wrap: word-wrap; }
-                                if root.source-error != "": Muted { text: root.source-error; color: Theme.danger; }
-                                Muted { text: "Previous installations and saves stay intact until verification succeeds."; }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    ActionButton { text: "Open build log"; available: root.source-log != ""; clicked => { root.action(Action.open-log, 0); } }
-                                    if root.source-busy && !root.sdk-busy: ActionButton { text: "Cancel safely"; clicked => { root.action(Action.cancel-source, 0); } }
-                                    if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
-                                }
                             }
                         }
                     }

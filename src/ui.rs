@@ -115,6 +115,16 @@ fn replace_rows<T: Clone + PartialEq + 'static>(
     values: Vec<T>,
     set: impl FnOnce(ModelRc<T>),
 ) {
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<T>>()
+        && model.row_count() == values.len()
+    {
+        for (index, value) in values.into_iter().enumerate() {
+            if model.row_data(index).as_ref() != Some(&value) {
+                model.set_row_data(index, value);
+            }
+        }
+        return;
+    }
     if current.row_count() != values.len()
         || values
             .iter()
@@ -863,11 +873,11 @@ impl Controller {
                     .context("No build log is available")?;
                 open_path(log)
             }
-            Action::SetupDotnet | Action::SetupMsys => {
-                let setup = if action == Action::SetupDotnet {
-                    SdkSetup::DotNet10
-                } else {
-                    SdkSetup::Msys2Ucrt64
+            Action::SetupDotnet | Action::SetupMsys | Action::SetupVisualStudio => {
+                let setup = match action {
+                    Action::SetupDotnet => SdkSetup::DotNet10,
+                    Action::SetupVisualStudio => SdkSetup::VisualStudio,
+                    _ => SdkSetup::Msys2Ucrt64,
                 };
                 if self
                     .confirm("Set up source-build SDK", setup.notice())
@@ -884,6 +894,7 @@ impl Controller {
             }
             Action::CopyDotnet => copy_commands(SdkSetup::DotNet10),
             Action::CopyMsys => copy_commands(SdkSetup::Msys2Ucrt64),
+            Action::CopyVisualStudio => copy_commands(SdkSetup::VisualStudio),
             Action::CheckRelease => match self.game {
                 GameId::Dusklight => self.dispatch(Command::CheckRelease),
                 GameId::Totk => self.dispatch(Command::CheckTotkRelease),
@@ -1614,7 +1625,7 @@ impl Controller {
                 .as_ref()
                 .is_some_and(|built| built.game == game),
         );
-        ui.set_sdk_busy(snapshot.source.sdk_setup);
+        ui.set_sdk_busy(snapshot.source.sdk_setup.is_some());
         ui.set_source_message(
             if same_game || snapshot.source.busy {
                 match snapshot.source.game {
@@ -1658,9 +1669,11 @@ impl Controller {
                     name: tool.name.into(),
                     detail: tool.detail.as_deref().unwrap_or_default().into(),
                     ready: tool.ready,
+                    busy: tool.setup.is_some() && snapshot.source.sdk_setup == tool.setup,
                     setup: match tool.setup {
                         Some(SdkSetup::DotNet10) => 1,
                         Some(SdkSetup::Msys2Ucrt64) => 2,
+                        Some(SdkSetup::VisualStudio) => 3,
                         None => 0,
                     },
                 })

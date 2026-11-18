@@ -2,7 +2,7 @@ mod recipes;
 mod runner;
 mod setup;
 mod tools;
-pub use setup::SdkSetup;
+pub use setup::{SdkOutcome, SdkSetup};
 
 use crate::{
     files::{self, ensure_safe_path, valid_hash},
@@ -218,7 +218,7 @@ pub struct State {
     pub preferences_valid: bool,
     pub busy: bool,
     pub building: bool,
-    pub sdk_setup: bool,
+    pub sdk_setup: Option<SdkSetup>,
     pub game: Option<GameId>,
     pub plan: Option<Plan>,
     pub prerequisites: Vec<Prerequisite>,

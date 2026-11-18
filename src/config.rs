@@ -178,43 +178,80 @@ pub fn acquire_instance(root: &Path) -> Result<File> {
 
 #[cfg(windows)]
 fn restrict_directory(root: &Path) -> Result<()> {
+    ensure_private_directory(root).map(|_| ())
+}
+
+#[cfg(windows)]
+const PRIVATE_DIRECTORY_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$full = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+$none = [System.Security.AccessControl.PropagationFlags]::None
+function Test-PrivateDirectory($acl) {
+    if (-not $acl.AreAccessRulesProtected) { return $false }
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+        $acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $descriptor.DiscretionaryAcl -or $descriptor.DiscretionaryAcl.Count -ne 2) {
+        return $false
+    }
+    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 2) { return $false }
+    foreach ($identity in @($sid, $system)) {
+        $matching = @($rules | Where-Object { $_.IdentityReference.Value -eq $identity.Value })
+        if ($matching.Count -ne 1) { return $false }
+        $rule = $matching[0]
+        if ($rule.IsInherited -or $rule.AccessControlType -ne $allow -or
+            $rule.FileSystemRights -ne $full -or $rule.InheritanceFlags -ne $inherit -or
+            $rule.PropagationFlags -ne $none) { return $false }
+    }
+    return $true
+}
+$root = $env:TWILIGHT_SYNC_PRIVATE_DIRECTORY
+$acl = [System.IO.Directory]::GetAccessControl($root)
+if (Test-PrivateDirectory $acl) {
+    'false'
+} else {
+    $private = [System.Security.AccessControl.DirectorySecurity]::new()
+    $private.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($sid, $system)) {
+        $private.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity, $full, $inherit, $none, $allow))
+    }
+    [System.IO.Directory]::SetAccessControl($root, $private)
+    if (-not (Test-PrivateDirectory ([System.IO.Directory]::GetAccessControl($root)))) {
+        throw 'Application data permissions did not become private'
+    }
+    'true'
+}
+"#;
+
+#[cfg(windows)]
+fn ensure_private_directory(root: &Path) -> Result<bool> {
     use std::os::windows::process::CommandExt;
     let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
-    let script = "$ErrorActionPreference='Stop'; [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value";
     let output = std::process::Command::new(
-        PathBuf::from(&windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
     )
-    .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    .args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        PRIVATE_DIRECTORY_SCRIPT,
+    ])
+    .env("TWILIGHT_SYNC_PRIVATE_DIRECTORY", root)
     .creation_flags(0x08000000)
-    .output()?;
+    .output()
+    .context("Checking application data permissions")?;
     ensure!(
         output.status.success(),
-        "Cannot determine current Windows SID"
-    );
-    let sid = String::from_utf8(output.stdout)?.trim().to_owned();
-    ensure!(
-        sid.starts_with("S-1-")
-            && sid
-                .bytes()
-                .all(|c| c.is_ascii_digit() || c == b'S' || c == b'-'),
-        "Invalid Windows SID"
-    );
-    let output = std::process::Command::new(PathBuf::from(windows).join(r"System32\icacls.exe"))
-        .arg(root)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            &format!("*{sid}:(OI)(CI)F"),
-            "*S-1-5-18:(OI)(CI)F",
-        ])
-        .creation_flags(0x08000000)
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "Cannot restrict application data permissions: {}",
+        "Cannot verify or repair application data permissions: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(())
+    serde_json::from_slice(&output.stdout)
+        .context("Invalid application data permission-check response")
 }
 
 #[cfg(not(windows))]
@@ -335,6 +372,59 @@ pub fn set_startup(_: bool) -> Result<()> {
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_permissions_skip_unchanged_acls_and_repair_extra_access() -> Result<()> {
+        use std::{os::windows::process::CommandExt, process::Command};
+
+        let temp = tempfile::Builder::new()
+            .prefix("twilight ACL ' ")
+            .tempdir()?;
+        let sentinel = temp.path().join("retained.txt");
+        fs::write(&sentinel, b"preserve existing contents")?;
+        assert!(ensure_private_directory(temp.path())?);
+        assert!(!ensure_private_directory(temp.path())?);
+
+        let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
+        let output = Command::new(
+            PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        )
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            r#"
+$ErrorActionPreference = 'Stop'
+$root = $env:TWILIGHT_SYNC_PRIVATE_DIRECTORY
+$acl = [System.IO.Directory]::GetAccessControl($root)
+$users = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+    $users, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+[System.IO.Directory]::SetAccessControl($root, $acl)
+"#,
+        ])
+        .env("TWILIGHT_SYNC_PRIVATE_DIRECTORY", temp.path())
+        .creation_flags(0x08000000)
+        .output()?;
+        ensure!(
+            output.status.success(),
+            "Cannot prepare ACL test: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(ensure_private_directory(temp.path())?);
+        assert!(!ensure_private_directory(temp.path())?);
+        assert_eq!(fs::read(sentinel)?, b"preserve existing contents");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_permission_errors_are_not_treated_as_a_successful_check() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        assert!(ensure_private_directory(&temp.path().join("missing")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn older_settings_keep_their_pairing_and_play_lock_when_texture_settings_are_added()
