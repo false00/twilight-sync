@@ -5600,20 +5600,41 @@ impl Engine {
         size: u64,
     ) -> Result<()> {
         ensure!(
-            self.file_transfer_enabled(format),
-            "This file transfer is disabled locally"
+            valid_hash(&id) && valid_hash(&hash),
+            "Invalid disc offer identity or hash"
         );
+        format.validate_size(size)?;
+        if !self.file_transfer_enabled(format) {
+            let message = match format {
+                DiscFormat::Game(GameFileKind::TotkKeys) => {
+                    "Console-key transfer is disabled on the receiving PC. In Game setup > Tears of the Kingdom, enable console-key sharing on both PCs, then offer prod.keys again."
+                }
+                DiscFormat::Game(_) => {
+                    "Game-file transfer is disabled on the receiving PC. Enable game-file transfers for this game on both PCs, then offer the file again."
+                }
+                _ => {
+                    "Disc-image transfer is disabled on the receiving PC. Enable disc transfers on both PCs, then offer the image again."
+                }
+            };
+            self.audit.record(
+                "file-offer-declined",
+                None,
+                None,
+                Some(&self.peer_key()?),
+                message,
+            )?;
+            self.send(&Event::Error {
+                message: message.into(),
+            })?;
+            self.error = Some(message.into());
+            return Ok(());
+        }
         if let DiscFormat::Game(kind) = format {
             self.require_file_transfer_idle(kind)?;
         } else {
             self.require_idle()?;
         }
         ensure!(self.no_transfer(), "A transfer is already active");
-        ensure!(
-            valid_hash(&id) && valid_hash(&hash),
-            "Invalid disc offer identity or hash"
-        );
-        format.validate_size(size)?;
         self.iso_offer = Some(IsoOffer {
             id,
             hash,
@@ -7682,10 +7703,6 @@ mod tests {
                 kind,
                 enabled: true,
             })?;
-            h.right.command(Command::SetGameFileSharing {
-                kind,
-                enabled: true,
-            })?;
             let bytes = game_file::tests::fixture(kind);
             let source = h.left.root.join(kind.file_name());
             fs::write(&source, &bytes)?;
@@ -7700,6 +7717,36 @@ mod tests {
             h.left.command(Command::SetSourcePreference {
                 game: kind.game(),
                 preference,
+            })?;
+            let receiver_settings = fs::read(h.right.root.join("settings.json"))?;
+            h.left.command(Command::SendGameFile(kind))?;
+            h.pump_until(|h| h.left.outgoing_iso.is_none() && h.left.error.is_some())?;
+            assert!(h.left.ready() && h.right.ready());
+            assert!(h.left.no_transfer() && h.right.no_transfer());
+            assert!(h.left.transfer.is_empty() && h.right.transfer.is_empty());
+            assert!(
+                h.left
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("disabled on the receiving PC"))
+            );
+            assert!(!game_file::Permissions::load(&h.right.root)?.allows(kind));
+            assert_eq!(
+                fs::read(h.right.root.join("settings.json"))?,
+                receiver_settings
+            );
+            assert!(!h.right.root.join(kind.file_name()).exists());
+            if kind == GameFileKind::TotkKeys {
+                assert!(
+                    h.left
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("offer prod.keys again"))
+                );
+            }
+            h.right.command(Command::SetGameFileSharing {
+                kind,
+                enabled: true,
             })?;
             h.left.command(Command::SendGameFile(kind))?;
             h.pump_until(|h| h.right.iso_offer.is_some())?;
@@ -7734,6 +7781,31 @@ mod tests {
     }
 
     #[test]
+    fn disabled_console_key_offers_preserve_durable_play_locks() -> Result<()> {
+        let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
+        h.pair()?;
+        h.right
+            .link
+            .as_mut()
+            .context("No receiver channel")?
+            .game_files = true;
+        let lock = play::acquire(None, false, &h.right.identity.public, &token())?;
+        h.right.store(|settings| settings.play_lock = Some(lock))?;
+        let settings = fs::read(h.right.root.join("settings.json"))?;
+        h.left.send(&Event::GameFileOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+            kind: GameFileKind::TotkKeys,
+        })?;
+        h.pump_until(|h| h.left.error.is_some())?;
+        assert!(h.left.ready() && h.right.ready());
+        assert!(h.left.no_transfer() && h.right.no_transfer());
+        assert_eq!(fs::read(h.right.root.join("settings.json"))?, settings);
+        Ok(())
+    }
+
+    #[test]
     fn game_file_offers_require_capability_consent_and_the_matching_destination() -> Result<()> {
         let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
         h.pair()?;
@@ -7749,12 +7821,24 @@ mod tests {
             .as_mut()
             .context("No receiver channel")?
             .game_files = true;
-        assert!(h.right.event(offer(GameFileKind::OotNup)).is_err());
+        assert!(
+            h.right
+                .event(Event::GameFileOffer {
+                    id: "invalid".into(),
+                    hash: "a".repeat(64),
+                    size: 512,
+                    kind: GameFileKind::OotNup,
+                })
+                .is_err()
+        );
+        h.right.event(offer(GameFileKind::OotNup))?;
+        assert!(h.right.iso_offer.is_none() && h.right.ready());
         h.right.command(Command::SetGameFileSharing {
             kind: GameFileKind::OotNup,
             enabled: true,
         })?;
-        assert!(h.right.event(offer(GameFileKind::TotkKeys)).is_err());
+        h.right.event(offer(GameFileKind::TotkKeys))?;
+        assert!(h.right.iso_offer.is_none() && h.right.ready());
         h.right.event(offer(GameFileKind::OotNup))?;
         let existing = h.right.root.join("existing.nup");
         fs::write(&existing, b"preserve this")?;
@@ -7826,16 +7910,15 @@ mod tests {
         h.pair()?;
         assert!(Settings::default().startup);
         assert!(!h.right.settings.iso_enabled);
-        assert!(
-            h.right
-                .event(Event::IsoOffer {
-                    id: token(),
-                    hash: "a".repeat(64),
-                    size: ISO_SIZE
-                })
-                .is_err()
-        );
+        h.right.event(Event::IsoOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: ISO_SIZE,
+        })?;
         assert!(h.right.iso_offer.is_none() && h.right.incoming_iso.is_none());
+        h.pump_until(|h| h.left.error.is_some())?;
+        assert!(h.left.ready() && h.right.ready());
+        assert!(!h.right.settings.iso_enabled);
         Ok(())
     }
 
@@ -7843,15 +7926,12 @@ mod tests {
     fn rvz_requires_its_own_valid_offer_consent_and_matching_destination() -> Result<()> {
         let mut h = Harness::new(Some(variant(0)), Some(variant(0)))?;
         h.pair()?;
-        assert!(
-            h.right
-                .event(Event::RvzOffer {
-                    id: token(),
-                    hash: "a".repeat(64),
-                    size: 512
-                })
-                .is_err()
-        );
+        h.right.event(Event::RvzOffer {
+            id: token(),
+            hash: "a".repeat(64),
+            size: 512,
+        })?;
+        assert!(h.right.iso_offer.is_none() && h.right.ready());
         h.right.command(Command::SetIsoEnabled(true))?;
         for size in [0, 0x147, disc::MAX_IMAGE_SIZE + 1, u64::MAX] {
             assert!(

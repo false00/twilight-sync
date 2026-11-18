@@ -812,7 +812,7 @@ export component MainWindow inherits Window {
                                 Muted { text: root.selected-game == 2 ? "Select an OOT .nup in Game files. Extracted game folders are not transferred." : "Select your base/update .nsp in Game files. Other input formats can be used locally but are not transferred."; }
                                 if root.selected-game == 1: VerticalLayout {
                                     spacing: 10px;
-                                    SwitchRow { title: "Also allow my console keys to this paired PC"; description: "Sensitive: separate from game-file permission. Both PCs must explicitly allow key transfer."; checked: root.key-sharing; toggled(value) => { root.toggle(Toggle.key-sharing, value); } }
+                                    SwitchRow { title: "Also allow my console keys to this paired PC"; description: "Sensitive: enable this separately on both PCs in Game setup > Tears of the Kingdom before offering prod.keys. The receiver must also approve each file."; checked: root.key-sharing; toggled(value) => { root.toggle(Toggle.key-sharing, value); } }
                                     ActionButton { text: "Offer prod.keys"; available: root.can-offer-keys; clicked => { root.action(Action.offer-game-file, 2); } }
                                 }
                                 Muted { text: "NUP/NSP container checks and SHA-256 detect transfer damage, not game ownership, title identity or authenticity. Received files become local setup inputs; review them before building."; }

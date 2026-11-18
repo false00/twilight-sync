@@ -443,6 +443,13 @@ Transfer logs omit key contents and key-file hashes. The chosen destination is
 an **unencrypted local file**; protect it like the original. This feature never
 shares the app's private pairing identity.
 
+On both PCs, open **Game setup > Tears of the Kingdom** and enable **Also allow
+my console keys to this paired PC** before choosing **Offer prod.keys**. If the
+receiver's permission is off, the offer is declined with instructions on the
+sender; pairing, the connection, and play locks remain intact. Enable the
+permission on the receiver and offer the file again. Nothing is received or
+enabled automatically.
+
 Transfers use the existing authenticated encrypted paired channel, bounded
 32 KiB chunks, backpressure, sender rehashing, receiver verification and
 no-overwrite commit. Permissions and idle state are rechecked before sending,
