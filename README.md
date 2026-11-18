@@ -7,7 +7,8 @@
 **A home for your native Zelda games—and the progress you don't want to leave behind.**
 
 Install, update, or build supported PC projects. Pick an adventure from a
-console-inspired **Slint** interface. Move between your desktop and Windows
+glass-style **Slint** library with light, dark, and system appearances.
+Move between your desktop and Windows
 handheld with private, encrypted save sharing over your home network.
 
 **No cloud account. No subscription. No choosing a save folder.**
@@ -20,7 +21,7 @@ handheld with private, encrypted save sharing over your home network.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="assets/interface-light.png">
-  <img src="assets/interface-dark.png" width="1200" alt="Twilight Sync's console-inspired game library, showing three adventures and verified save progress">
+  <img src="assets/interface-dark.png" width="1200" alt="Twilight Sync's glass-style game library, showing three adventures and verified save progress">
 </picture>
 
 *The new Slint interface, shown with synthetic example data.*
@@ -212,6 +213,79 @@ personal information, and **never attach console keys, game assets, or saves
 you do not intend to share publicly**.
 
 </details>
+
+## Security: private by design
+
+Encryption is only one layer. Twilight Sync combines an explicitly approved
+network, authenticated devices, narrowly scoped transfers, and save-replacement
+checks. Your paired PC is trusted to share supported game data—not to run
+commands or choose arbitrary files on your machine.
+
+### A private connection, with an identity you verify
+
+- **Your LAN is an explicit boundary.** Sync requires a physical adapter on a
+  Windows **Private** IPv4 network, a directly connected subnet, and your
+  approval of the router/subnet fingerprint. Connections bind to that interface;
+  router changes or stale verification stop network activity. There is no
+  Internet relay, router port forwarding, or public-network fallback.
+- **Both PCs approve the same session.** First pairing opens a two-minute,
+  attempt-limited window. Compare the **entire eight-digit code** on both PCs:
+  it comes from that exact handshake, not a reusable password. Both PCs must
+  approve and persist the pairing before saves or play reservations are accepted.
+  Discovery names alone are never proof of identity.
+- **The channel is encrypted and authenticated.** `twilightProto/1` uses
+  **Noise XX** with **X25519, ChaCha20-Poly1305, and SHA-256**, providing forward
+  secrecy and authenticated encryption. Each direction rekeys after **4,096
+  authenticated events**. Modified or replayed ciphertext is rejected.
+  Reconnection must match the full pinned device public key—there is no silent
+  key replacement.
+
+### Permission to sync is not permission to overwrite anything
+
+- **Only supported, validated data crosses the save channel.** Bounded,
+  game-scoped messages carry committed saves, not executables, mod scripts,
+  console keys, or arbitrary folders. Save structure, supported identities,
+  checksums, and transfer hashes are checked. Optional verified GameCube disc
+  transfer has separate ownership/permission settings and per-transfer consent.
+- **The receiving PC controls the destination.** Paths come from its own
+  detected game profile. Unsafe paths and reparse points are rejected; the
+  expected current save is checked again before replacement. Writes are staged,
+  verified, and committed with rollback protection rather than blindly copying
+  over a live save.
+- **Different progress is a decision, not a timestamp race.** Automatic sync
+  depends on agreed common-save state. Divergent branches require an explicit
+  choice and receiver approval; neither branch is silently declared the winner.
+  Content-addressed history retains prior progress within its storage budget.
+  Games have separate save channels, histories, and play reservations.
+- **Play protection survives a disconnect.** Managed online launches coordinate
+  durable reservations on both PCs. A timeout, app restart, or lost connection
+  does not silently unlock a session. Recovery is an explicit completed-session
+  workflow, not an expiring lease.
+
+### What this does—and does not—protect
+
+The private device key is protected at rest with **Windows current-user DPAPI**,
+and application-data permissions are restricted. **Saves and snapshot history
+are not encrypted at rest.** Local audit logs contain usernames, paths, hashes,
+public peer identities, and security decisions; redact them before sharing.
+The manager does not log private keys, save payloads, or pairing codes.
+Discovery exposes the device name, public key, network tag, and pairing
+availability to the local network.
+
+This is an **early release, not an independently audited security product**.
+Router fingerprints can be spoofed; they supplement, not replace, device
+authentication. A structurally valid save can still target a game-engine bug.
+Direct game launches can bypass cooperative play protection, and offline play cannot
+guarantee the other PC is idle. DPAPI and encryption do not defend against
+malware running as your user, an administrator, or a compromised OS.
+
+App/tool checksums verify download integrity, not publisher trust or the absence
+of malicious code. Approved source-build scripts run with your Windows account's
+permissions, can make their own network requests, and may print sensitive data
+to build logs. They are **not sandboxed**. Keep independent save backups and use
+a separate VM for code you do not trust.
+
+[Read the protocol, validation rules, and security boundaries](docs/guide.md#twilightproto1-the-protocol).
 
 ## For contributors
 

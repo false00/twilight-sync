@@ -187,15 +187,35 @@ cargo build --example ui-preview --locked
 
 The preview uses synthetic example data, never the real manager store, saves,
 pairing, or startup preferences. It cannot perform real game or network actions.
+Use About to switch between synchronized, divergent, pairing, offline and
+connecting scenarios without touching a real profile.
 It exits after 30 minutes or from its Quit control. Its About dialog can save
 an example-data PNG; inspect the interface and exported image before using it
 in documentation. Do not publish private app captures.
 
 Headless tests use the exact matching Slint testing backend to activate actual
 accessible controls, navigate the source wizard, check disabled build actions,
-and verify touch-target and horizontal layout bounds in both themes. They do
+and verify touch-target and horizontal layout bounds across all feature pages
+and the comparison footer in both themes. They also cover explicit branch
+selection and stale-choice invalidation, system/light/dark appearance
+persistence, pinned-partner reconnect, cross-game pending decisions, complete
+Dusklight metadata, focused bilateral pairing, modal input isolation, and
+history-preview warnings. Incoming Dusklight offers remain eligible for a
+verified branch comparison without enabling history restore or bypassing
+transfer/session guards. They do
 not replace an interactive native-window check. Slint debug metadata is compiled
 only in debug builds; no UI control server is enabled in production.
+
+The Slint interface retains the original dashboard's installation/source
+workflows, device identity and router inspection, full-save comparisons,
+history ancestry/storage details, texture library, disc consent, and
+security/privacy information. Settings offers System, Light, and Dark;
+existing `interface.json` choices are preserved. The glass-style palette uses
+translucent gradients and borders supported by the software renderer, not a
+macOS material or a native backdrop-blur guarantee.
+The pinned Slint version's `unstable-winit-030` accessor applies the same
+appearance to native window decorations; revisit that integration when
+upgrading the toolkit.
 
 The generated Slint module has a scoped `clippy::unwrap_used` allowance because
 the toolkit generates those calls. Handwritten application code retains the
@@ -243,7 +263,7 @@ The checked-in Cargo configuration statically links the MSVC C runtime for the
 Windows x64 build. Verify the application and installer before publishing:
 
 ```powershell
-.\scripts\Package-Release.ps1 -Version v0.8.0
+.\scripts\Package-Release.ps1 -Version v0.15.0
 ```
 
 This writes exactly the supported release assets to the ignored `dist` folder:
@@ -260,7 +280,7 @@ Checksums cover both the executable and the bootstrap script.
 1. Update the Cargo package version and lockfile, refresh dependency notices,
    validate the code, and commit.
 2. Push `main` and wait for CI on that exact commit to pass.
-3. Create and push the matching fresh stable tag, such as `v0.8.1`.
+3. Create and push the matching fresh stable tag, such as `v0.15.1`.
 4. The release workflow builds and tests on Windows, creates a draft release,
    uploads all assets, then publishes it as latest.
 5. Verify the public one-liner in an isolated folder with `-NoLaunch -NoShortcut`

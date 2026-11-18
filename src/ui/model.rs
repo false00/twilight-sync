@@ -57,6 +57,103 @@ pub(super) fn installed(snapshot: &Snapshot, game: GameId) -> bool {
     })
 }
 
+pub(super) fn saves_match(snapshot: &Snapshot, game: GameId) -> bool {
+    snapshot.ready
+        && if let Some(state) = native(snapshot, game) {
+            !state.updating
+                && state.remote_save_ready
+                && state.verification_error.is_none()
+                && !state.running
+                && !state.remote_running
+                && state.local_hash.is_some()
+                && state.local_hash == state.remote_hash
+        } else {
+            snapshot.save_ready
+                && !snapshot.game_running
+                && !snapshot.remote_game
+                && snapshot.local_hash.is_some()
+                && snapshot.local_hash == snapshot.remote_hash
+        }
+}
+
+pub(super) fn game_status(snapshot: &Snapshot, game: GameId) -> &'static str {
+    let (running, remote_running, pending, recovery, reserved, conflict) =
+        if let Some(state) = native(snapshot, game) {
+            if state.updating {
+                return "Installation in progress";
+            }
+            if state.verification_error.is_some() {
+                return "Verification needs attention";
+            }
+            (
+                state.running,
+                state.remote_running,
+                state.pending,
+                state.recovery_pending,
+                state.lock.is_some() || state.remote_lock.is_some() || state.release_pending,
+                state.conflict,
+            )
+        } else {
+            (
+                snapshot.game_running,
+                snapshot.remote_game,
+                snapshot.pending_save,
+                snapshot.pending_recovery,
+                snapshot.settings.play_lock.is_some(),
+                snapshot.conflict.is_some(),
+            )
+        };
+    if running {
+        "Playing on this PC"
+    } else if remote_running {
+        "Playing on your other PC"
+    } else if recovery {
+        "Recovery needs approval"
+    } else if pending {
+        "Incoming save needs approval"
+    } else if reserved {
+        "Previous session needs attention"
+    } else if conflict {
+        "Two save branches to compare"
+    } else if saves_match(snapshot, game) {
+        "Saves synchronized"
+    } else if !installed(snapshot, game) {
+        "Ready to set up"
+    } else if !snapshot.ready {
+        "Offline play"
+    } else if local_hash(snapshot, game).is_none() {
+        "No committed save yet"
+    } else {
+        "Ready for your next chapter"
+    }
+}
+
+pub(super) fn network_trusted(snapshot: &Snapshot) -> bool {
+    snapshot.network.as_ref().is_some_and(|network| {
+        snapshot.settings.network.as_deref() == Some(network.fingerprint.as_str())
+    })
+}
+
+pub(super) fn can_pair(snapshot: &Snapshot) -> bool {
+    network_trusted(snapshot)
+        && snapshot.settings.peer.is_none()
+        && !snapshot.connecting
+        && !snapshot.ready
+        && management_available(snapshot)
+}
+
+pub(super) fn can_reconnect(snapshot: &Snapshot) -> bool {
+    network_trusted(snapshot)
+        && !snapshot.ready
+        && !snapshot.connecting
+        && snapshot.settings.peer.as_ref().is_some_and(|peer| {
+            snapshot
+                .devices
+                .iter()
+                .any(|device| device.key == peer.public_key)
+        })
+}
+
 pub(super) fn management_available(snapshot: &Snapshot) -> bool {
     !snapshot.game_running
         && !snapshot.remote_game
@@ -238,6 +335,8 @@ pub(super) fn play_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
         Some("Recover the completed Dusklight play reservation before continuing.")
     } else if snapshot.install_busy || snapshot.texture_busy || snapshot.self_updates.preparing {
         Some("Finish the current installation or update.")
+    } else if snapshot.textures.recovery_needed {
+        Some("Recover the interrupted texture change in Textures before playing.")
     } else if !snapshot.save_ready
         || snapshot.save_profile.is_none()
         || snapshot.settings.save_file.is_none()
@@ -335,6 +434,8 @@ pub(super) fn can_continue(snapshot: &Snapshot, game: GameId) -> bool {
             && !snapshot.self_updates.preparing
     } else {
         management_available(snapshot)
+            && snapshot.settings.game_exe.is_some()
+            && !snapshot.textures.recovery_needed
             && snapshot.save_ready
             && snapshot.save_profile.is_some()
             && snapshot.settings.save_file.is_some()
@@ -349,7 +450,13 @@ pub(super) fn can_resolve(snapshot: &Snapshot, game: GameId) -> bool {
         snapshot.ready && state.comparison_verified && can_restore(snapshot, game)
     } else {
         snapshot.ready
-            && can_restore(snapshot, game)
+            && management_available(snapshot)
+            && snapshot.save_ready
+            && snapshot.save_profile.is_some()
+            && snapshot.settings.save_file.is_some()
+            && !snapshot.pending_iso
+            && !snapshot.pending_recovery
+            && snapshot.transfer.is_empty()
             && snapshot
                 .conflict
                 .as_ref()
@@ -361,10 +468,113 @@ pub(super) fn can_resolve(snapshot: &Snapshot, game: GameId) -> bool {
     }
 }
 
+pub(super) fn comparison_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
+    if can_resolve(snapshot, game) {
+        None
+    } else if !snapshot.ready {
+        Some("Reconnect both PCs before choosing a branch. Your local progress is retained.")
+    } else if let Some(state) = native(snapshot, game) {
+        native_session_blocker(snapshot, state).or(Some(
+            "Waiting for both complete, verified, compatible save snapshots.",
+        ))
+    } else if snapshot.game_running || snapshot.remote_game {
+        Some("Close Dusklight on both PCs before choosing a save branch.")
+    } else if snapshot.settings.play_lock.is_some() {
+        Some("Recover the completed play reservation before choosing a branch.")
+    } else if snapshot.install_busy || snapshot.texture_busy || snapshot.self_updates.preparing {
+        Some("Finish the current installation or update before choosing a branch.")
+    } else if snapshot.pending_iso || snapshot.pending_recovery || !snapshot.transfer.is_empty() {
+        Some("Finish the pending transfer or recovery before choosing a branch.")
+    } else {
+        Some("Waiting for both complete, verified snapshots with compatible save identities.")
+    }
+}
+
+pub(super) fn can_accept(snapshot: &Snapshot, game: GameId) -> bool {
+    if let Some(state) = native(snapshot, game) {
+        state.pending
+            && !state.running
+            && !state.remote_running
+            && !state.updating
+            && !state.launch_pending
+            && state.lock.is_none()
+            && state.remote_lock.is_none()
+            && state.verification_error.is_none()
+            && !snapshot.self_updates.preparing
+    } else {
+        snapshot.pending_save
+            && management_available(snapshot)
+            && snapshot.save_ready
+            && snapshot.save_profile.is_some()
+            && !snapshot.pending_iso
+            && snapshot.transfer.is_empty()
+    }
+}
+
+pub(super) fn can_recover(snapshot: &Snapshot, game: GameId) -> bool {
+    if let Some(state) = native(snapshot, game) {
+        !state.running
+            && !state.remote_running
+            && !state.updating
+            && !state.launch_pending
+            && !state.pending
+            && !snapshot.self_updates.preparing
+    } else {
+        !snapshot.game_running
+            && !snapshot.remote_game
+            && !snapshot.install_busy
+            && !snapshot.texture_busy
+            && !snapshot.self_updates.preparing
+            && !snapshot.pending_save
+            && !snapshot.pending_iso
+            && snapshot.transfer.is_empty()
+    }
+}
+
+pub(super) fn can_change_textures(snapshot: &Snapshot) -> bool {
+    management_available(snapshot)
+        && snapshot.settings.texture_profile.is_some()
+        && !snapshot.textures.recovery_needed
+}
+
+pub(super) fn can_import_textures(snapshot: &Snapshot) -> bool {
+    management_available(snapshot)
+        && snapshot.settings.game_exe.is_some()
+        && !snapshot.textures.recovery_needed
+}
+
+pub(super) fn can_send_disc(snapshot: &Snapshot) -> bool {
+    snapshot.ready
+        && snapshot.settings.iso_enabled
+        && snapshot.settings.iso_file.is_some()
+        && management_available(snapshot)
+        && !snapshot.pending_save
+        && !snapshot.pending_iso
+        && !snapshot.pending_recovery
+        && snapshot.transfer.is_empty()
+}
+
+pub(super) fn can_accept_disc(snapshot: &Snapshot) -> bool {
+    snapshot.ready
+        && snapshot.settings.iso_enabled
+        && snapshot.pending_iso
+        && snapshot.pending_disc_format.is_some()
+        && management_available(snapshot)
+        && !snapshot.pending_save
+        && !snapshot.pending_recovery
+        && snapshot.transfer.is_empty()
+}
+
 pub(super) fn dusklight_cards(summary: &save_data::Summary) -> Vec<SaveCard> {
-    summary
-        .slots
-        .iter()
+    let mut slots: Vec<_> = summary.slots.iter().collect();
+    slots.sort_by(|left, right| {
+        right
+            .saved_at
+            .cmp(&left.saved_at)
+            .then(left.number.cmp(&right.number))
+    });
+    slots
+        .into_iter()
         .map(|slot| {
             let mut inventory = slot.equipment.clone();
             inventory.extend(slot.items.iter().map(|item| item.name.clone()));
@@ -385,13 +595,23 @@ pub(super) fn dusklight_cards(summary: &save_data::Summary) -> Vec<SaveCard> {
                     .unwrap_or_else(|| "Unavailable".into())
                     .into(),
                 extra: format!(
-                    "{}\n{} · Room {} · {} heart pieces · {} Poes · {} insects\n{}",
+                    "{}\nPlayer: {} · Horse: {}\nLocation: {} / room {}\nHeart pieces: {} / 5 · Poe souls: {} / 60 · Golden insects: {} / 24\nFused Shadows: {} / 4 · Mirror shards: {} / 4\nDeaths: {} · Clears: {}\nAmmunition: {} arrows / bombs {}, {}, {}\nEquipment & inventory: {}",
                     slot.story(),
+                    slot.player,
+                    slot.horse,
                     slot.stage,
                     slot.room,
                     slot.heart_pieces,
                     slot.poes,
                     slot.insects,
+                    slot.fused_shadows,
+                    slot.mirror_shards,
+                    slot.deaths,
+                    slot.clears,
+                    slot.arrows,
+                    slot.bombs[0],
+                    slot.bombs[1],
+                    slot.bombs[2],
                     inventory.join(", ")
                 )
                 .into(),
@@ -471,6 +691,7 @@ pub(super) fn native_cards(summary: &totk::Summary) -> Vec<SaveCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     fn snapshot() -> Result<Snapshot> {
         let backend = crate::runtime::ui_smoke_backend("ready")?;
         let snapshot = backend.snapshot()?;
@@ -521,6 +742,111 @@ mod tests {
         assert!(can_resolve(&snapshot, GameId::Triforce));
         snapshot.triforce.running = true;
         assert!(!can_resolve(&snapshot, GameId::Triforce));
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_requires_the_pinned_partner_on_the_approved_network() -> Result<()> {
+        let mut snapshot = snapshot()?;
+        snapshot.ready = false;
+        snapshot.devices.push(crate::lan::Discovered {
+            key: "a".repeat(64),
+            name: "Unverified announcement".into(),
+            address: "192.168.10.21:42817".parse()?,
+            pairing: true,
+            seen: std::time::Instant::now(),
+            game_channels_seen: None,
+            triforce_seen: None,
+        });
+        assert!(!can_reconnect(&snapshot));
+        snapshot.devices[0].key = snapshot
+            .settings
+            .peer
+            .as_ref()
+            .context("Missing preview peer")?
+            .public_key
+            .clone();
+        assert!(can_reconnect(&snapshot));
+        snapshot.settings.network = None;
+        assert!(!can_reconnect(&snapshot));
+        assert!(!can_pair(&snapshot));
+        Ok(())
+    }
+
+    #[test]
+    fn incoming_save_and_texture_controls_respect_active_sessions_and_recovery() -> Result<()> {
+        let mut snapshot = snapshot()?;
+        snapshot.pending_save = true;
+        assert!(can_accept(&snapshot, GameId::Dusklight));
+        snapshot.game_running = true;
+        assert!(!can_accept(&snapshot, GameId::Dusklight));
+        assert!(!can_recover(&snapshot, GameId::Dusklight));
+        assert!(!can_import_textures(&snapshot));
+        snapshot.game_running = false;
+        snapshot.pending_save = false;
+        assert!(can_change_textures(&snapshot));
+        snapshot.textures.recovery_needed = true;
+        assert!(!can_change_textures(&snapshot));
+        assert!(!can_import_textures(&snapshot));
+        assert!(play_blocker(&snapshot, GameId::Dusklight).is_some());
+        assert!(!can_continue(&snapshot, GameId::Dusklight));
+        snapshot.triforce.pending = true;
+        assert!(can_accept(&snapshot, GameId::Triforce));
+        snapshot.triforce.remote_running = true;
+        assert!(!can_accept(&snapshot, GameId::Triforce));
+        assert!(!can_recover(&snapshot, GameId::Triforce));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_dusklight_saves_can_be_compared_without_enabling_history_restore() -> Result<()> {
+        let backend = crate::runtime::ui_smoke_backend("attention")?;
+        let mut snapshot = backend.snapshot()?;
+        backend.command(crate::runtime::Command::Shutdown)?;
+        assert!(snapshot.pending_save);
+        assert!(can_resolve(&snapshot, GameId::Dusklight));
+        assert!(!can_restore(&snapshot, GameId::Dusklight));
+        assert!(comparison_blocker(&snapshot, GameId::Dusklight).is_none());
+        snapshot.settings.game_exe = None;
+        assert!(can_resolve(&snapshot, GameId::Dusklight));
+        assert!(!can_continue(&snapshot, GameId::Dusklight));
+        snapshot.pending_iso = true;
+        assert!(!can_resolve(&snapshot, GameId::Dusklight));
+        snapshot.pending_iso = false;
+        snapshot
+            .conflict
+            .as_mut()
+            .context("Missing conflict")?
+            .remote
+            .as_mut()
+            .context("Missing remote summary")?
+            .file_name = "incompatible-save".into();
+        assert!(!can_resolve(&snapshot, GameId::Dusklight));
+        Ok(())
+    }
+
+    #[test]
+    fn dusklight_cards_retain_the_original_metadata_and_latest_save_order() -> Result<()> {
+        let snapshot = snapshot()?;
+        let mut summary = snapshot.local_save.context("Missing synthetic save")?;
+        let mut newer = summary.slots[0].clone();
+        newer.number = 2;
+        newer.saved_at = Some("2026-10-26T14:15:00Z".into());
+        newer.clears = 3;
+        summary.slots.push(newer);
+        let cards = dusklight_cards(&summary);
+        assert!(cards[0].title.starts_with("Slot 2"));
+        for detail in [
+            "Horse: Epona",
+            "Fused Shadows: 3 / 4",
+            "Mirror shards: 1 / 4",
+            "Deaths: 7",
+            "Clears: 3",
+            "30 arrows / bombs 24, 10, 0",
+            "Hylian Shield",
+        ] {
+            assert!(cards[0].extra.contains(detail), "Missing {detail}");
+        }
         Ok(())
     }
 }

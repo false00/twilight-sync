@@ -9,9 +9,9 @@ use std::{
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Appearance {
+    #[default]
     System,
     Light,
-    #[default]
     Dark,
 }
 
@@ -44,7 +44,7 @@ impl Store {
             );
             preferences.appearance
         } else {
-            Appearance::Dark
+            Appearance::System
         };
         Ok(Self {
             path: Some(path),
@@ -83,12 +83,7 @@ impl Store {
         }
     }
 
-    pub fn set_dark(&mut self, dark: bool) -> Result<()> {
-        let appearance = if dark {
-            Appearance::Dark
-        } else {
-            Appearance::Light
-        };
+    pub fn set(&mut self, appearance: Appearance) -> Result<()> {
         if let Some(path) = &self.path {
             atomic_write(
                 path,
@@ -99,6 +94,23 @@ impl Store {
             )?;
         }
         self.appearance = appearance;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_appearance_choices_persist_and_existing_preferences_are_retained() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path())?;
+        assert!(matches!(store.appearance, Appearance::System));
+        for appearance in [Appearance::Dark, Appearance::Light, Appearance::System] {
+            store.set(appearance)?;
+            assert!(Store::load(directory.path())?.appearance == appearance);
+        }
         Ok(())
     }
 }

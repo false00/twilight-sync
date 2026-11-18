@@ -1,6 +1,6 @@
 [package]
 name = "twilight-sync"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Local-network save sync and source builds for Dusklight, TotK Recomp and Triforce"
@@ -37,7 +37,7 @@ zstd = "0.13"
 tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "raw-window-handle-06", "compat-1-18"] }
+slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "raw-window-handle-06", "unstable-winit-030", "compat-1-18"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = { version = "3.7", default-features = false }
 rfd = "0.15"

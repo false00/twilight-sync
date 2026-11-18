@@ -91,6 +91,8 @@ fn slint_navigation_game_selection_and_build_gates_route_real_component_actions(
     }
     activate(&ui, "About")?;
     assert!(ui.get_about_open());
+    activate(&ui, "Devices")?;
+    assert_eq!(ui.get_section(), 5);
     activate(&ui, "Back to your adventure")?;
     assert!(!ui.get_about_open());
     Ok(())
@@ -119,6 +121,7 @@ fn compared_saves_show_verified_details_and_metadata_warnings() -> Result<()> {
             .next()
             .is_some()
     );
+    activate(&ui, "Save details")?;
     assert!(
         ElementHandle::find_by_element_type_name(&ui, "Muted").any(|element| element
             .accessible_label()
@@ -230,6 +233,240 @@ fn visible_navigation_controls_fit_handheld_and_desktop_layouts_in_both_themes()
                     "{label} is smaller than the required touch target"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn comparison_requires_an_explicit_verified_branch_and_resets_stale_choices() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_has_conflict(true);
+    ui.set_local_revision("a".repeat(64).into());
+    ui.set_remote_revision("b".repeat(64).into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    activate(&ui, "Compare saves")?;
+    assert!(ui.get_comparison_open());
+    assert_eq!(ui.get_branch_choice(), -1);
+    activate(&ui, "Game setup")?;
+    assert_eq!(ui.get_section(), 0, "A modal allowed background navigation");
+    activate(&ui, "Select other PC's branch")?;
+    activate(&ui, "Choose a branch above")?;
+    assert_eq!(&*actions.borrow(), &[(Action::Compare, 0)]);
+    ui.set_can_resolve(true);
+    activate(&ui, "Select other PC's branch")?;
+    assert_eq!(ui.get_branch_choice(), 1);
+    activate(&ui, "Use other PC's save")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::UseRemote, 0)));
+    ui.set_remote_revision("c".repeat(64).into());
+    flush();
+    assert_eq!(ui.get_branch_choice(), -1);
+    activate(&ui, "Choose a branch above")?;
+    assert_eq!(actions.borrow().len(), 2);
+    activate(&ui, "Not now")?;
+    assert!(!ui.get_comparison_open());
+    Ok(())
+}
+
+#[test]
+fn restored_appearance_reconnect_and_cross_game_decisions_are_actionable() -> Result<()> {
+    let ui = fixture()?;
+    let appearances = Rc::new(RefCell::new(Vec::new()));
+    let recorded = appearances.clone();
+    ui.on_appearance_selected(move |mode| recorded.borrow_mut().push(mode));
+    ui.set_section(5);
+    flush();
+    for label in ["System", "Light", "Dark"] {
+        activate(&ui, label)?;
+    }
+    assert_eq!(
+        &*appearances.borrow(),
+        &[
+            widgets::AppearanceMode::System,
+            widgets::AppearanceMode::Light,
+            widgets::AppearanceMode::Dark
+        ]
+    );
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    ui.set_attention(rows(vec![widgets::AttentionCard {
+        game_index: 2,
+        title: "Ocarina of Time".into(),
+        detail: "Incoming save".into(),
+    }]));
+    flush();
+    activate(&ui, "Review decision")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::ViewGame, 2)));
+    ui.set_attention(rows(Vec::new()));
+    ui.set_section(2);
+    ui.set_peer_key("b".repeat(64).into());
+    ui.set_can_reconnect(false);
+    flush();
+    let count = actions.borrow().len();
+    activate(&ui, "Reconnect")?;
+    assert_eq!(actions.borrow().len(), count);
+    ui.set_can_reconnect(true);
+    activate(&ui, "Reconnect")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::Reconnect, 0)));
+    activate(&ui, "Verified device identity")?;
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, &"b".repeat(64))
+            .next()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn active_pairing_prioritizes_the_code_and_both_approvals_in_a_short_window() -> Result<()> {
+    let ui = fixture()?;
+    ui.window().set_size(slint::LogicalSize::new(720.0, 600.0));
+    ui.set_section(2);
+    ui.set_pairing_code("1234 5678".into());
+    ui.set_remote_approved(true);
+    flush();
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "1234 5678")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "This PC · waiting")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Other PC · approved")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Open pairing")
+            .next()
+            .is_none()
+    );
+    let approve = button(&ui, "Codes match")?;
+    ensure!(
+        approve.absolute_position().y + approve.size().height <= 600.0,
+        "Pairing approval requires scrolling past discovery instead of focusing the code"
+    );
+    Ok(())
+}
+
+#[test]
+fn history_preview_preserves_save_dates_details_and_validation_warnings() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_section(3);
+    ui.set_history(rows(vec![widgets::HistoryCard {
+        id: "snapshot-id".into(),
+        title: "Preserved save".into(),
+        metadata: "Parent: verified-parent\nPartner branch: verified-peer-parent".into(),
+        ..Default::default()
+    }]));
+    ui.set_preview_id("snapshot-id".into());
+    ui.set_preview_title("Read-only progress".into());
+    ui.set_preview_saves(rows(vec![widgets::SaveCard {
+        title: "Preview slot".into(),
+        date: "2026-10-25 14:15 UTC".into(),
+        extra: "Horse: Epona".into(),
+        warning: "Unsupported optional metadata; no invented progress".into(),
+        ..Default::default()
+    }]));
+    flush();
+    let scroll = ElementHandle::find_by_element_type_name(&ui, "ScrollView")
+        .next()
+        .context("Missing main scroll view")?;
+    scroll.scroll(0.0, -4000.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+    flush();
+    for label in [
+        "2026-10-25 14:15 UTC",
+        "Horse: Epona",
+        "Unsupported optional metadata; no invented progress",
+    ] {
+        ensure!(
+            ElementHandle::find_by_accessible_label(&ui, label)
+                .next()
+                .is_some(),
+            "History preview lost {label}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn feature_pages_and_comparison_keep_touch_controls_inside_handheld_bounds() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_source_mode(true);
+    ui.set_selected_game(2);
+    ui.set_advanced_source(true);
+    ui.set_pending_save(true);
+    ui.set_has_conflict(true);
+    ui.set_comparison_reason(
+        "Wait for both verified snapshots and finish this game's active session.".into(),
+    );
+    let save = widgets::SaveCard {
+        title: "Slot 1 · Example player with a long name".into(),
+        hearts: "Unavailable".into(),
+        rupees: "Unavailable".into(),
+        played: "Unavailable".into(),
+        ..Default::default()
+    };
+    ui.set_local_saves(rows(vec![save.clone()]));
+    ui.set_remote_saves(rows(vec![save]));
+    ui.set_texture_creators(rows(vec![widgets::TextureCreator {
+        name: "Authorized custom texture import".into(),
+        description: "Synthetic creator description".into(),
+        ..Default::default()
+    }]));
+    ui.set_history(rows(vec![widgets::HistoryCard {
+        title: "Snapshot #12".into(),
+        ..Default::default()
+    }]));
+    for dark in [false, true] {
+        ui.set_dark_mode(dark);
+        for width in [720.0_f32, 900.0, 1200.0] {
+            ui.window().set_size(slint::LogicalSize::new(width, 720.0));
+            for section in 0..6 {
+                ui.set_section(section);
+                for step in if section == 1 { 0..3 } else { 0..1 } {
+                    ui.set_setup_step(step);
+                    flush();
+                    for element in ElementHandle::find_by_element_type_name(&ui, "ActionButton") {
+                        let position = element.absolute_position();
+                        let size = element.size();
+                        ensure!(
+                            position.x >= -1.0 && position.x + size.width <= width + 1.0,
+                            "{:?} overflows section {section}, step {step}, {width}px: {position:?} {size:?}",
+                            element.accessible_label()
+                        );
+                        ensure!(
+                            size.height >= 44.0,
+                            "A feature control lost its touch target"
+                        );
+                    }
+                }
+            }
+            ui.set_section(0);
+            ui.set_has_conflict(true);
+            ui.set_comparison_open(true);
+            flush();
+            for label in ["Choose a branch above", "Not now"] {
+                let element = button(&ui, label)?;
+                let position = element.absolute_position();
+                let size = element.size();
+                ensure!(
+                    position.x >= 0.0
+                        && position.x + size.width <= width
+                        && position.y >= 0.0
+                        && position.y + size.height <= 720.0,
+                    "Comparison footer left the viewport at {width}px: {label}"
+                );
+            }
+            ui.set_comparison_open(false);
         }
     }
     Ok(())

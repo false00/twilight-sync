@@ -1,25 +1,60 @@
 import { AboutSlint, ScrollView, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
-import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile } from "components.slint";
+import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile, NavigationItem, PageHeading, StatusBadge, DetailBlock, SaveProgress } from "components.slint";
 
 export enum Action {
     play, sync-save, setup, locate-game, refresh, compare, continue-local,
     use-local, use-remote, accept-save, decline-save, recover, approve-recovery, decline-recovery,
     check-source, reset-source, review-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
     setup-dotnet, setup-msys, copy-dotnet, copy-msys, check-release, install-release,
-    trust-network, open-pairing, connect-device, approve-pairing, reject-pairing, unpair,
+    trust-network, open-pairing, connect-device, reconnect, approve-pairing, reject-pairing, unpair, view-game,
     history-refresh, history-older, history-preview, history-restore, close-preview,
     check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso,
     open-texture-site, import-texture-zip, import-texture-folder, cancel-textures, activate-texture,
     disable-textures, recover-textures, refresh-textures, open-data, open-licenses,
-    export-preview, quit
+    app-release-notes, official-help, preview-scenario, export-preview, quit
 }
-export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent, dark-mode }
+export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent }
+export enum AppearanceMode { system, light, dark }
 export struct GameCard { title: string, subtitle: string, status: string, installed: bool }
 export struct SaveCard { title: string, kind: string, date: string, hearts: string, rupees: string, played: string, extra: string, warning: string }
 export struct DeviceCard { name: string, detail: string, pairing: bool }
-export struct HistoryCard { title: string, detail: string, current: bool }
+export struct AttentionCard { game-index: int, title: string, detail: string }
+export struct HistoryCard { id: string, title: string, detail: string, metadata: string, ancestry: string, branch: int, current: bool }
 export struct ToolRow { name: string, detail: string, ready: bool, setup: int }
-export struct PackCard { title: string, detail: string, active: bool }
+export struct PackCard { title: string, detail: string, metadata: string, active: bool }
+export struct TextureCreator { name: string, description: string, version: string, has-site: bool }
+
+component BranchPreview inherits Rectangle {
+    in property <string> title;
+    in property <string> revision;
+    in property <string> changes;
+    in property <[SaveCard]> saves;
+    in property <bool> selectable;
+    in property <bool> selected;
+    in property <bool> remote;
+    callback choose;
+    border-radius: 18px;
+    background: root.selected ? Theme.selection : Theme.raised;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : Theme.line;
+    VerticalLayout {
+        padding: 14px; spacing: 12px; alignment: start;
+        SectionTitle { text: root.title; }
+        ActionButton {
+            text: root.remote ? "Select other PC's branch" : "Select this PC's branch";
+            available: root.selectable; primary: root.selected; modal-control: true;
+            clicked => { root.choose(); }
+        }
+        DetailBlock { title: "SNAPSHOT · SHA-256"; text: root.revision == "" ? "Waiting for a verified snapshot" : root.revision; }
+        if root.changes != "": Muted { text: root.changes; }
+        if root.saves.length == 0: Muted { text: "Waiting for verified progress details. A branch cannot be chosen until both complete snapshots are verified."; }
+        for save in root.saves: SaveProgress {
+            title: save.title; kind: save.kind; date: save.date;
+            hearts: save.hearts; rupees: save.rupees; played: save.played;
+            extra: save.extra; warning: save.warning; modal-control: true;
+        }
+    }
+}
 
 export component MainWindow inherits Window {
     in property <string> window-title: "Twilight Sync";
@@ -27,12 +62,13 @@ export component MainWindow inherits Window {
     preferred-width: 1200px; preferred-height: 820px;
     min-width: 720px; min-height: 600px;
     default-font-family: "Segoe UI";
-    default-font-size: 16px;
+    default-font-size: 15px;
     background: Theme.canvas;
     icon: @image-url("../assets/app-icon-256.png");
     in-out property <int> section: 0;
     in-out property <int> selected-game: 0;
     in-out property <bool> dark-mode: true;
+    in property <AppearanceMode> appearance-mode: AppearanceMode.system;
     in property <bool> demo-mode;
     in property <string> version;
     in property <string> status;
@@ -43,6 +79,7 @@ export component MainWindow inherits Window {
     in property <[SaveCard]> local-saves;
     in property <[SaveCard]> remote-saves;
     in property <[DeviceCard]> devices;
+    in property <[AttentionCard]> attention;
     in property <[HistoryCard]> history;
     in property <[ToolRow]> tools;
     in property <bool> tools-missing;
@@ -51,12 +88,16 @@ export component MainWindow inherits Window {
     in property <string> game-title;
     in property <string> game-subtitle;
     in property <string> installed-path;
+    in property <string> installed-executable;
+    in property <string> installed-release;
     in property <bool> installed;
     in property <bool> can-play;
     in property <bool> can-sync;
     in property <bool> can-continue;
     in property <bool> can-restore;
     in property <bool> can-resolve;
+    in property <bool> can-accept-save;
+    in property <bool> can-recover;
     in property <bool> can-manage;
     in property <bool> can-install;
     in property <bool> can-locate;
@@ -67,6 +108,23 @@ export component MainWindow inherits Window {
     in property <string> play-reason;
     in property <string> sync-reason;
     in property <string> save-state;
+    in property <string> game-status;
+    in property <string> game-message;
+    in property <string> verified-at;
+    in property <bool> saves-match;
+    in property <string> local-revision;
+    in property <string> remote-revision;
+    in property <string> base-revision;
+    in property <string> local-changes;
+    in property <string> remote-changes;
+    in property <string> comparison-reason;
+    in property <string> connection-setup;
+    in property <string> transfer;
+    in property <bool> management-available;
+    in-out property <bool> show-other-saves: false;
+    in-out property <bool> show-verification: false;
+    in-out property <bool> comparison-open: false;
+    in-out property <int> branch-choice: -1;
     in property <bool> source-mode;
     in property <bool> source-busy;
     in property <bool> operation-busy;
@@ -92,32 +150,59 @@ export component MainWindow inherits Window {
     in property <string> source-keys;
     in property <string> source-firmware;
     in property <string> release-tag;
+    in property <string> release-detail;
+    in property <string> install-reason;
     in property <string> network-name;
     in property <string> network-detail;
     in property <bool> network-trusted;
+    in property <bool> network-available;
+    in property <string> network-fingerprint;
+    in-out property <bool> show-network-details: false;
+    in property <bool> can-pair;
+    in property <bool> can-reconnect;
+    in property <bool> connecting;
     in property <bool> pairing-open;
     in property <string> pairing-code;
     in property <bool> pairing-approved;
+    in property <bool> remote-approved;
     in property <string> peer-name;
+    in property <string> peer-key;
+    in property <string> public-key;
+    in-out property <bool> show-peer-identity: false;
     in property <bool> startup;
     in property <bool> auto-updates;
     in property <string> app-update;
     in property <bool> can-update-app;
+    in property <bool> can-check-app;
+    in property <bool> has-app-release;
+    in property <string> app-release-detail;
+    in property <string> app-update-reason;
     in property <bool> disc-sharing;
     in property <string> iso-path;
     in property <bool> pending-iso;
+    in property <bool> can-send-iso;
+    in property <string> disc-offer;
+    in property <bool> can-accept-iso;
     in property <bool> history-more;
     in property <string> history-info;
+    in property <string> history-storage;
+    in property <float> history-usage;
+    in-out property <bool> show-history-storage: false;
     in property <string> preview-title;
+    in property <string> preview-id;
     in property <[SaveCard]> preview-saves;
     in property <string> texture-status;
-    in property <[string]> texture-creators;
+    in property <[TextureCreator]> texture-creators;
     in-out property <int> texture-creator: 0;
     in-out property <string> texture-version: "1.2.0";
     in property <bool> texture-consent;
     in property <bool> texture-busy;
     in property <bool> texture-cancellable;
     in property <bool> texture-recovery;
+    in property <bool> can-import-textures;
+    in property <bool> can-change-textures;
+    in property <bool> textures-active;
+    in property <string> texture-profile;
     in-out property <bool> about-open: false;
     in-out property <int> setup-step: 0;
     in-out property <bool> advanced-source: false;
@@ -127,51 +212,71 @@ export component MainWindow inherits Window {
     callback choose-input(int);
     callback clear-input(int);
     callback set-workers(int);
-    init => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
+    callback appearance-selected(AppearanceMode);
+    init => {
+        Theme.dark = root.dark-mode;
+        Theme.modal-open = false;
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+    }
     changed dark-mode => {
         Theme.dark = root.dark-mode;
         Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
     }
     changed section => { main-scroll.content-y = 0px; }
-    changed selected-game => { main-scroll.content-y = 0px; root.setup-step = 0; }
+    changed selected-game => {
+        main-scroll.content-y = 0px; root.setup-step = 0;
+        root.show-other-saves = false; root.comparison-open = false;
+    }
     changed setup-step => { main-scroll.content-y = 0px; }
+    changed comparison-open => { root.branch-choice = -1; Theme.modal-open = root.comparison-open || root.about-open; }
+    changed about-open => { Theme.modal-open = root.comparison-open || root.about-open; }
+    changed has-conflict => { root.branch-choice = -1; if !root.has-conflict { root.comparison-open = false; } }
+    changed local-revision => { root.branch-choice = -1; }
+    changed remote-revision => { root.branch-choice = -1; }
+    changed texture-creator => {
+        root.texture-version = root.texture-creators[root.texture-creator].version;
+        root.toggle(Toggle.texture-consent, false);
+    }
 
-    Rectangle { width: root.width; height: root.height; background: Theme.canvas; }
+    Rectangle {
+        width: root.width; height: root.height;
+        background: Theme.dark ? @linear-gradient(135deg, #242936 0%, #17171b 48%, #24212b 100%) : @linear-gradient(135deg, #e6edf9 0%, #f5f5f7 48%, #f1eaf4 100%);
+    }
     VerticalLayout {
         x: 0px; y: 0px;
         width: root.width; height: root.height;
         spacing: 0px;
         Rectangle {
-            height: 84px;
-            background: Theme.canvas;
+            height: 76px;
+            background: Theme.chrome;
             HorizontalLayout {
-                padding-left: 32px; padding-right: 32px; padding-top: 18px; padding-bottom: 18px; spacing: 16px;
-                Image { source: @image-url("../assets/app-icon-256.png"); width: 42px; height: 42px; }
+                padding-left: 24px; padding-right: 24px; padding-top: 14px; padding-bottom: 14px; spacing: 12px;
+                Image { source: @image-url("../assets/app-icon-256.png"); width: 38px; height: 38px; }
                 VerticalLayout {
-                    alignment: center; spacing: 0px;
-                    Text { text: "TWILIGHT SYNC"; font-weight: 700; font-size: 19px; letter-spacing: 2px; color: Theme.text; }
-                    Muted { text: root.demo-mode ? "INTERFACE PREVIEW · EXAMPLE DATA" : "YOUR ADVENTURES. CONNECTED."; font-size: 10px; }
+                    alignment: center; spacing: 2px;
+                    Text { text: "Twilight Sync"; font-weight: 700; font-size: 20px; color: Theme.text; }
+                    Muted { text: root.demo-mode ? "PREVIEW · EXAMPLE DATA" : "YOUR LIBRARY, IN SYNC"; font-size: 9px; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? Theme.success : Theme.muted; }
-                Text { text: root.connection; color: Theme.muted; font-size: 14px; vertical-alignment: center; }
-                ActionButton { text: "About"; min-width: 72px; subtle: true; clicked => { root.about-open = true; } }
+                StatusBadge { text: root.connection; tint: root.connected ? Theme.success : root.connecting || root.pairing-code != "" ? Theme.accent : Theme.muted; }
+                ActionButton { text: "About"; min-width: 64px; max-width: 80px; horizontal-stretch: 0; subtle: true; clicked => { root.about-open = true; } }
             }
         }
         Rectangle { height: 1px; background: Theme.line; }
         HorizontalLayout {
             spacing: 0px;
             Rectangle {
-                width: root.width < 1000px ? 134px : 174px; background: Theme.canvas;
+                width: root.width < 1000px ? 156px : 196px; background: Theme.chrome;
                 VerticalLayout {
-                    padding: 18px; spacing: 8px;
-                    for label[index] in ["Play", "Game setup", "Devices", "Save history", "Textures", "Settings"]: ActionButton {
-                        min-width: 0px;
-                        text: label; primary: root.section == index; subtle: root.section != index;
+                    padding: 12px; padding-top: 22px; spacing: 6px;
+                    Text { text: "WORKSPACE"; color: Theme.muted; font-size: 9px; letter-spacing: 1px; min-height: 24px; }
+                    for label[index] in ["Play", "Game setup", "Devices", "Save history", "Textures", "Settings"]: NavigationItem {
+                        text: label; icon: index; selected: root.section == index;
                         clicked => { root.section = index; }
                     }
                     Rectangle { vertical-stretch: 1; background: transparent; }
-                    Muted { text: "LOCAL FIRST\nPRIVATE BY DESIGN"; font-size: 10px; }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    Muted { text: "On your PCs.\nUnder your control."; font-size: 11px; }
                     Muted { text: "v" + root.version; font-size: 11px; }
                 }
             }
@@ -179,10 +284,36 @@ export component MainWindow inherits Window {
             main-scroll := ScrollView {
                 horizontal-stretch: 1;
                 VerticalLayout {
-                    padding: 28px; spacing: 20px; alignment: start;
+                    padding: root.width < 900px ? 20px : 30px; spacing: 18px; alignment: start;
                     if root.error != "": Rectangle {
-                        border-radius: 12px; background: Theme.dark ? #40262f : #f9dfe6;
+                        border-radius: 14px; background: Theme.danger-fill; border-width: 1px; border-color: Theme.line;
                         HorizontalLayout { padding: 16px; Text { text: root.error; color: Theme.danger; wrap: word-wrap; } }
+                    }
+                    for item in root.attention: Surface {
+                        HorizontalLayout {
+                            padding: 16px; spacing: 12px;
+                            VerticalLayout {
+                                spacing: 4px; horizontal-stretch: 1;
+                                Text { text: item.title; color: Theme.warning; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: item.detail; }
+                            }
+                            ActionButton { text: "Review decision"; clicked => { root.action(Action.view-game, item.game-index); } }
+                        }
+                    }
+                    if root.pending-iso && root.section != 5: Surface {
+                        HorizontalLayout {
+                            padding: 16px; spacing: 12px;
+                            Muted { text: "An incoming disc image needs your permission."; horizontal-stretch: 1; color: Theme.warning; }
+                            ActionButton { text: "Review disc offer"; clicked => { root.section = 5; } }
+                        }
+                    }
+                    if root.transfer != "": Surface {
+                        VerticalLayout {
+                            padding: 16px; spacing: 8px;
+                            Text { text: "Encrypted transfer"; color: Theme.accent; font-weight: 600; }
+                            Muted { text: root.transfer; }
+                            ProgressIndicator { indeterminate: true; }
+                        }
                     }
                     if root.section == 1 || root.section == 3: HorizontalLayout {
                         spacing: 12px;
@@ -192,11 +323,49 @@ export component MainWindow inherits Window {
                         }
                     }
                     if root.section == 0: VerticalLayout {
-                        spacing: 24px;
-                        Text { text: "Pick up your adventure."; color: Theme.text; font-size: 34px; font-weight: 600; wrap: word-wrap; }
-                        Muted { text: "One library. Three worlds. Your progress comes with you."; font-size: 16px; }
+                        spacing: 18px;
+                        PageHeading { title: "Your library"; description: "Three worlds. One place to pick up where you left off."; }
+                        if root.pending-save: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: root.has-conflict ? "Different progress needs your decision" : "A save is waiting for your decision"; }
+                                Muted { text: root.game-title + " · Compare before choosing. Your existing progress is retained before replacement."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Accept save"; primary: !root.has-conflict; available: root.can-accept-save; clicked => { root.action(Action.accept-save, 0); } }
+                                    ActionButton { text: "Keep this PC"; clicked => { root.action(Action.decline-save, 0); } }
+                                    if root.has-conflict: ActionButton { text: "Compare saves"; primary: true; clicked => { root.comparison-open = true; root.action(Action.compare, 0); } }
+                                }
+                                ActionButton { text: "Keep both, play here"; available: root.can-continue; clicked => { root.action(Action.continue-local, 0); } }
+                            }
+                        }
+                        if root.has-conflict && !root.pending-save: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "Two adventures. You choose."; }
+                                Muted { text: root.game-title + " · Both PCs have different progress. We never silently pick a winner."; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionButton { text: "Compare saves"; primary: true; clicked => { root.comparison-open = true; root.action(Action.compare, 0); } }
+                                    ActionButton { text: "Keep both, play here"; available: root.can-continue; clicked => { root.action(Action.continue-local, 0); } }
+                                }
+                            }
+                        }
+                        if root.recovery-needed: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "Finish the previous play session"; }
+                                Muted { text: root.game-title + " · Reservations protect your saves, even after a restart. Recover only after play has ended."; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    if !root.incoming-recovery: ActionButton { text: "Recover session"; available: root.can-recover; clicked => { root.action(Action.recover, 0); } }
+                                    if root.incoming-recovery: ActionButton { text: "Approve recovery"; available: root.can-recover; clicked => { root.action(Action.approve-recovery, 0); } }
+                                    if root.incoming-recovery: ActionButton { text: "Keep reservation"; clicked => { root.action(Action.decline-recovery, 0); } }
+                                }
+                            }
+                        }
                         HorizontalLayout {
-                            spacing: 18px;
+                            spacing: 14px;
                             for game[index] in root.games: GameTile {
                                 horizontal-stretch: 1;
                                 title: game.title; status: game.status; selected: root.selected-game == index;
@@ -206,93 +375,67 @@ export component MainWindow inherits Window {
                         }
                         Surface {
                             VerticalLayout {
-                                padding: 24px; spacing: 12px;
-                                HorizontalLayout {
-                                    VerticalLayout { spacing: 4px; SectionTitle { text: root.game-title; } Muted { text: root.game-subtitle; } }
-                                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                                    Text { text: root.installed ? "READY TO PLAY" : "LET'S GET YOU SET UP"; color: root.installed ? Theme.success : Theme.accent; font-size: 11px; font-weight: 600; vertical-alignment: center; }
-                                }
+                                padding: 22px; spacing: 14px;
                                 HorizontalLayout {
                                     spacing: 12px;
-                                    ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.section = 1; } } }
-                                    ActionButton { text: "Sync progress"; available: root.can-sync; clicked => { root.action(Action.sync-save, 0); } }
-                                    ActionButton { text: "Refresh"; subtle: true; clicked => { root.action(Action.refresh, 0); } }
+                                    VerticalLayout { spacing: 4px; horizontal-stretch: 1; SectionTitle { text: root.game-title; } Muted { text: root.game-subtitle; font-size: 12px; } }
+                                    StatusBadge { text: root.game-status; tint: root.saves-match ? Theme.success : root.has-conflict || root.recovery-needed || root.pending-save ? Theme.warning : Theme.accent; }
                                 }
-                                if root.play-reason != "": Muted { text: root.play-reason; }
-                                if root.sync-reason != "" && root.sync-reason != root.play-reason: Muted { text: root.sync-reason; }
-                            }
-                        }
-                        if root.pending-save: Surface {
-                            VerticalLayout {
-                                padding: 20px; spacing: 12px;
-                                SectionTitle { text: "A save is waiting for your decision"; }
-                                Muted { text: "Compare before choosing. Your existing progress is retained before replacement."; }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Accept save"; primary: true; clicked => { root.action(Action.accept-save, 0); } }
-                                    ActionButton { text: "Keep this PC"; clicked => { root.action(Action.decline-save, 0); } }
+                                    ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.section = 1; } } }
+                                    ActionButton { text: "Sync progress"; available: root.can-sync; clicked => { root.action(Action.sync-save, 0); } }
+                                    ActionButton { text: "History"; subtle: true; clicked => { root.section = 3; root.action(Action.history-refresh, 0); } }
+                                    ActionButton { text: "Refresh"; subtle: true; min-width: 76px; clicked => { root.action(Action.refresh, 0); } }
+                                }
+                                if root.game-message != "" && !root.saves-match && root.game-message != root.play-reason: Muted { text: root.game-message; }
+                                if root.play-reason != "": Muted { text: root.play-reason; }
+                                if root.sync-reason != "" && root.sync-reason != root.play-reason: Muted { text: root.sync-reason; }
+                                if root.verified-at != "": Muted { text: "Last verified: " + root.verified-at; font-size: 12px; }
+                                if root.connection-setup != "": HorizontalLayout {
+                                    spacing: 12px;
+                                    Muted { text: root.connection-setup; color: Theme.warning; horizontal-stretch: 1; }
+                                    ActionButton { text: "Open Devices"; subtle: true; clicked => { root.section = 2; } }
                                 }
                             }
                         }
-                        if root.has-conflict: Surface {
-                            VerticalLayout {
-                                padding: 20px; spacing: 12px;
-                                SectionTitle { text: "Two adventures. You choose."; }
-                                Muted { text: "Both PCs have different progress. We never silently pick a winner."; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    ActionButton { text: "Compare saves"; primary: true; clicked => { root.action(Action.compare, 0); } }
-                                    ActionButton { text: "Keep both, play here"; available: root.can-continue; clicked => { root.action(Action.continue-local, 0); } }
-                                }
-                            }
+                        HorizontalLayout {
+                            SectionTitle { text: root.saves-match ? "Progress on both PCs" : "This PC's progress"; horizontal-stretch: 1; }
+                            if root.saves-match: StatusBadge { text: "Matching revision"; tint: Theme.success; }
                         }
-                        if root.recovery-needed: Surface {
-                            VerticalLayout {
-                                padding: 20px; spacing: 12px;
-                                SectionTitle { text: "Finish the previous play session"; }
-                                Muted { text: "Reservations protect your saves, even after a restart. Recover only after play has ended."; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    if !root.incoming-recovery: ActionButton { text: "Recover session"; clicked => { root.action(Action.recover, 0); } }
-                                    if root.incoming-recovery: ActionButton { text: "Approve recovery"; clicked => { root.action(Action.approve-recovery, 0); } }
-                                    if root.incoming-recovery: ActionButton { text: "Keep reservation"; clicked => { root.action(Action.decline-recovery, 0); } }
-                                }
-                            }
-                        }
-                        SectionTitle { text: "Your progress"; }
                         Muted { text: root.save-state; }
-                        for save in root.local-saves: Surface {
+                        if root.local-saves.length == 0: Surface {
                             VerticalLayout {
-                                padding: 20px; spacing: 10px;
-                                HorizontalLayout { Text { text: save.title; color: Theme.text; font-weight: 600; } Text { text: save.kind; color: Theme.accent; horizontal-alignment: right; } }
-                                HorizontalLayout {
-                                    Text { text: "HEARTS  " + save.hearts; color: Theme.text; }
-                                    Text { text: "RUPEES  " + save.rupees; color: Theme.text; }
-                                    Text { text: "PLAYED  " + save.played; color: Theme.text; }
-                                }
-                                Muted { text: save.date + "\n" + save.extra; }
-                                if save.warning != "": Muted { text: save.warning; color: Theme.danger; }
+                                padding: 22px; spacing: 8px;
+                                Text { text: "Your next chapter starts here"; color: Theme.text; font-weight: 600; }
+                                Muted { text: "No verified occupied save slots yet. Play and save, or receive your paired PC's progress. Save folders are detected automatically."; }
                             }
+                        }
+                        for save in (root.show-other-saves ? root.local-saves : root.local-saves.length > 0 ? [root.local-saves[0]] : []): SaveProgress {
+                            title: save.title; kind: save.kind; date: save.date;
+                            hearts: save.hearts; rupees: save.rupees; played: save.played;
+                            extra: save.extra; warning: save.warning;
+                        }
+                        if root.local-saves.length > 1: ActionButton {
+                            text: root.show-other-saves ? "Hide other save slots" : "Other save slots (" + (root.local-saves.length - 1) + ")";
+                            subtle: true; clicked => { root.show-other-saves = !root.show-other-saves; }
                         }
                         if root.remote-saves.length > 0: SectionTitle { text: "Other PC · verified comparison"; }
-                        for save in root.remote-saves: Surface {
-                            VerticalLayout {
-                                padding: 20px; spacing: 8px;
-                                Text { text: save.title + " · " + save.kind; color: Theme.text; font-weight: 600; }
-                                Muted { text: "Hearts " + save.hearts + "   Rupees " + save.rupees + "   Played " + save.played + "\n" + save.date + "\n" + save.extra; }
-                                if save.warning != "": Muted { text: save.warning; color: Theme.danger; }
-                            }
+                        for save in root.remote-saves: SaveProgress {
+                            title: save.title; kind: save.kind; date: save.date;
+                            hearts: save.hearts; rupees: save.rupees; played: save.played;
+                            extra: save.extra; warning: save.warning;
                         }
-                        if root.has-conflict && root.remote-saves.length > 0: HorizontalLayout {
-                            spacing: 10px;
-                            ActionButton { text: "Use this PC's save"; available: root.can-resolve; clicked => { root.action(Action.use-local, 0); } }
-                            ActionButton { text: "Use other PC's save"; available: root.can-resolve; clicked => { root.action(Action.use-remote, 0); } }
+                        ActionButton { text: root.show-verification ? "Hide snapshot verification" : "Snapshot verification"; subtle: true; clicked => { root.show-verification = !root.show-verification; } }
+                        if root.show-verification: VerticalLayout {
+                            spacing: 8px;
+                            DetailBlock { title: "THIS PC · SHA-256"; text: root.local-revision == "" ? "No verified snapshot" : root.local-revision; }
+                            DetailBlock { title: "OTHER PC · SHA-256"; text: root.remote-revision == "" ? "No verified snapshot" : root.remote-revision; }
                         }
                     }
                     if root.section == 1: VerticalLayout {
                         spacing: 20px;
-                        Text { text: "Set up " + root.game-title; color: Theme.text; font-size: 28px; font-weight: 600; wrap: word-wrap; }
-                        Muted { text: "Install once. Update here. Your saves stay protected."; }
+                        PageHeading { title: "Game setup"; description: root.game-title + " · Install, update, or build your own copy."; }
                         if !root.preferences-valid: Surface {
                             VerticalLayout {
                                 padding: 20px; spacing: 12px;
@@ -312,6 +455,8 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Locate installed game"; available: root.can-locate; clicked => { root.action(Action.locate-game, 0); } }
                                 }
                                 Muted { text: root.installed-path == "" ? "New games are installed in your Games folder." : root.installed-path; }
+                                if root.installed-executable != "": DetailBlock { title: "SELECTED EXECUTABLE"; text: root.installed-executable; }
+                                if root.installed-release != "": Muted { text: "Installed release: " + root.installed-release; }
                             }
                         }
                         if root.source-mode: HorizontalLayout {
@@ -425,11 +570,15 @@ export component MainWindow inherits Window {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Ready when you are"; }
                                 Muted { text: root.release-tag == "" ? "Install the latest verified official release using your local game inputs." : "Latest official release: " + root.release-tag; }
+                                if root.release-detail != "": DetailBlock { title: "OFFICIAL DOWNLOAD VERIFICATION"; text: root.release-detail; }
+                                if root.install-reason != "": Muted { text: root.install-reason; color: Theme.warning; }
                                 HorizontalLayout {
                                     spacing: 10px;
                                     ActionButton { text: "Install / update"; primary: true; available: root.can-install; clicked => { root.action(Action.install-release, 0); } }
                                     ActionButton { text: "Check latest"; available: root.can-manage; clicked => { root.action(Action.check-release, 0); } }
                                 }
+                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. The protected desktop shortcut opens this manager's play controls." : "The official setup runs inside this managed workflow. Your game inputs and keys stay local; saves, settings and mods are preserved."; }
+                                if root.selected-game == 1: ActionButton { text: "Optional manual setup download"; subtle: true; clicked => { root.action(Action.official-help, 0); } }
                             }
                         }
                         if root.operation-busy || root.source-message != "" || root.source-error != "": Surface {
@@ -451,28 +600,41 @@ export component MainWindow inherits Window {
                     }
                     if root.section == 2: VerticalLayout {
                         spacing: 20px;
-                        Text { text: "Together, locally."; color: Theme.text; font-size: 34px; font-weight: 600; }
-                        Muted { text: "Pair two Windows PCs on your private home network. No cloud account. No subscription."; font-size: 16px; }
-                        Surface {
+                        PageHeading { title: "Your devices"; description: "A private connection between your PCs. No cloud account or relay."; }
+                        if root.pairing-code == "": Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "1   Your private network"; }
                                 Text { text: root.network-name; color: Theme.text; }
                                 Muted { text: root.network-detail; }
-                                ActionButton { text: root.network-trusted ? "Network approved" : "Approve this network"; primary: !root.network-trusted; available: !root.network-trusted && root.network-name != ""; clicked => { root.action(Action.trust-network, 0); } }
+                                ActionButton { text: root.network-trusted ? "Network approved" : "Approve this network"; primary: !root.network-trusted; available: !root.network-trusted && root.network-available && root.management-available; clicked => { root.action(Action.trust-network, 0); } }
+                                ActionButton { text: root.show-network-details ? "Hide network fingerprint" : "Network fingerprint"; subtle: true; clicked => { root.show-network-details = !root.show-network-details; } }
+                                if root.show-network-details: VerticalLayout {
+                                    spacing: 8px;
+                                    DetailBlock { title: "APPROVED ROUTER / SUBNET BINDING"; text: root.network-fingerprint; }
+                                    Muted { text: "A router fingerprint is a spoofable network policy check, not device authentication. Pairing and pinned keys provide a separate layer."; }
+                                }
                             }
                         }
-                        Surface {
+                        if root.pairing-code == "": Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
-                                SectionTitle { text: "2   Find your other PC"; }
-                                Muted { text: root.peer-name == "" ? "Open pairing on both PCs. Choose the other PC on just one screen." : "Paired with " + root.peer-name; }
-                                ActionButton { text: root.pairing-open ? "Pairing is open" : "Open pairing"; available: root.network-trusted; clicked => { root.action(Action.open-pairing, 0); } }
+                                SectionTitle { text: root.peer-key == "" ? "2   Find your other PC" : "Your paired device"; }
+                                Muted { text: root.peer-key == "" ? "Open the two-minute pairing window on both PCs. Choose Compare codes on just one screen. Discovery names are not verified identities." : "Paired with " + root.peer-name; }
+                                if root.peer-key != "": StatusBadge { text: root.connected ? "Connected · pinned identity verified" : root.connecting ? "Reconnecting…" : "Offline · device trust retained"; tint: root.connected ? Theme.success : Theme.muted; }
+                                if root.peer-key != "" && !root.connected: ActionButton { text: root.connecting ? "Reconnecting…" : "Reconnect"; available: root.can-reconnect; clicked => { root.action(Action.reconnect, 0); } }
+                                if root.peer-key == "": ActionButton { text: root.pairing-open ? "Restart pairing window" : "Open pairing"; available: root.can-pair; clicked => { root.action(Action.open-pairing, 0); } }
+                                if root.peer-key == "" && root.devices.length == 0: Muted { text: "No nearby devices yet. Open Twilight Sync on the other PC and approve the same router. Private-network firewall rules or guest Wi-Fi isolation may block discovery."; }
+                                if root.connecting: ProgressIndicator { indeterminate: true; }
+                                if root.peer-key == "": VerticalLayout {
                                 for device[index] in root.devices: HorizontalLayout {
                                     spacing: 10px;
-                                    VerticalLayout { Text { text: device.name; color: Theme.text; } Muted { text: device.detail; } }
+                                    VerticalLayout { horizontal-stretch: 1; Text { text: device.name; color: Theme.text; wrap: word-wrap; } Muted { text: device.detail; } }
                                     ActionButton { text: "Compare codes"; available: device.pairing; clicked => { root.action(Action.connect-device, index); } }
                                 }
+                                }
+                                if root.peer-key != "": ActionButton { text: root.show-peer-identity ? "Hide verified device identity" : "Verified device identity"; subtle: true; clicked => { root.show-peer-identity = !root.show-peer-identity; } }
+                                if root.peer-key != "" && root.show-peer-identity: DetailBlock { title: "PINNED DEVICE PUBLIC KEY"; text: root.peer-key; }
                             }
                         }
                         if root.pairing-code != "": Surface {
@@ -481,6 +643,12 @@ export component MainWindow inherits Window {
                                 SectionTitle { text: "3   Compare the full code on both PCs"; }
                                 Text { text: root.pairing-code; color: Theme.accent; font-size: 28px; font-weight: 600; wrap: word-wrap; }
                                 Muted { text: "Approve only if every part matches. Both PCs must confirm."; }
+                                Muted { text: "The code belongs to this handshake, not a reusable password. Reject the request if any digit differs."; }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    StatusBadge { text: root.pairing-approved ? "This PC · approved" : "This PC · waiting"; tint: root.pairing-approved ? Theme.success : Theme.muted; }
+                                    StatusBadge { text: root.remote-approved ? "Other PC · approved" : "Other PC · waiting"; tint: root.remote-approved ? Theme.success : Theme.muted; }
+                                }
                                 HorizontalLayout {
                                     spacing: 10px;
                                     ActionButton { text: root.pairing-approved ? "Approved · waiting" : "Codes match"; primary: true; available: !root.pairing-approved; clicked => { root.action(Action.approve-pairing, 0); } }
@@ -488,97 +656,161 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if root.peer-name != "": ActionButton { text: "Unpair this device"; clicked => { root.action(Action.unpair, 0); } }
+                        if root.peer-key != "": ActionButton { text: "Unpair this device"; available: root.management-available; clicked => { root.action(Action.unpair, 0); } }
                     }
                     if root.section == 3: VerticalLayout {
                         spacing: 20px;
-                        Text { text: "A way back, always."; color: Theme.text; font-size: 34px; font-weight: 600; }
-                        Muted { text: "Compact snapshots keep complete save branches. Restore with a clear choice, never a guess."; }
+                        PageHeading { title: "Save history"; description: root.game-title + " · Complete branches, with a way back."; }
                         HorizontalLayout {
                             spacing: 10px;
                             ActionButton { text: "Refresh history"; clicked => { root.action(Action.history-refresh, 0); } }
                             ActionButton { text: "Older snapshots"; available: root.history-more; clicked => { root.action(Action.history-older, 0); } }
                         }
-                        Muted { text: root.history-info; }
-                        for item[index] in root.history: Surface {
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Snapshot storage"; }
+                                Muted { text: root.history-info; }
+                                Rectangle {
+                                    height: 6px; border-radius: 3px; background: Theme.raised;
+                                    Rectangle { width: parent.width * root.history-usage; border-radius: 3px; background: Theme.accent-fill; }
+                                }
+                                Muted { text: "Unchanged blocks are shared. Oldest snapshots are pruned at the managed budget; filesystem overhead is separate."; }
+                                ActionButton { text: root.show-history-storage ? "Hide storage details" : "How snapshots work"; subtle: true; clicked => { root.show-history-storage = !root.show-history-storage; } }
+                                if root.show-history-storage: Muted { text: root.history-storage + "\nValid stable saves are captured automatically, including autosaves. Restore creates a new commit and retains normal sync conflict checks. A corrupt current file must be moved aside first."; }
+                            }
+                        }
+                        if root.history.length == 0: Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 8px;
+                                SectionTitle { text: "No snapshots yet"; }
+                                Muted { text: "Play and save, or receive your paired PC's progress. Verified saves are recorded automatically for this game."; }
+                            }
+                        }
+                        for item[index] in root.history: history-card := Surface {
+                            property <bool> expanded: false;
                             VerticalLayout {
                                 padding: 20px; spacing: 12px;
-                                Text { text: item.title + (item.current ? " · CURRENT" : ""); color: item.current ? Theme.accent : Theme.text; font-weight: 600; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Rectangle { width: 10px; height: 10px; border-radius: 5px; background: item.branch == 1 ? Theme.warning : item.branch == 2 ? Theme.success : Theme.accent; }
+                                    Text { text: item.title + (item.current ? " · CURRENT" : ""); color: item.current ? Theme.accent : Theme.text; font-weight: 600; wrap: word-wrap; }
+                                }
                                 Muted { text: item.detail; }
+                                Muted { text: item.ancestry; font-size: 12px; }
                                 HorizontalLayout {
                                     spacing: 10px;
                                     ActionButton { text: "View progress"; clicked => { root.action(Action.history-preview, index); } }
                                     ActionButton { text: "Restore"; available: !item.current && root.can-restore; clicked => { root.action(Action.history-restore, index); } }
                                 }
-                            }
-                        }
-                        if root.preview-title != "": Surface {
-                            VerticalLayout {
-                                padding: 20px; spacing: 10px;
-                                SectionTitle { text: root.preview-title; }
-                                for save in root.preview-saves: Muted { text: save.title + " · Hearts " + save.hearts + " · Rupees " + save.rupees + " · Played " + save.played + "\n" + save.extra; }
-                                ActionButton { text: "Close preview"; clicked => { root.action(Action.close-preview, 0); } }
+                                ActionButton { text: history-card.expanded ? "Hide snapshot details" : "Snapshot details"; subtle: true; clicked => { history-card.expanded = !history-card.expanded; } }
+                                if history-card.expanded: DetailBlock { title: "SNAPSHOT / BRANCH DETAILS"; text: item.metadata; }
+                                if root.preview-title != "" && root.preview-id == item.id: VerticalLayout {
+                                    spacing: 12px;
+                                    SectionTitle { text: root.preview-title; }
+                                    Muted { text: "Read-only preview. Nothing is restored until you approve a Restore action."; }
+                                    for save in root.preview-saves: SaveProgress {
+                                        title: save.title; kind: save.kind; date: save.date;
+                                        hearts: save.hearts; rupees: save.rupees; played: save.played;
+                                        extra: save.extra; warning: save.warning; expanded: true;
+                                    }
+                                    if root.preview-saves.length == 0: Muted { text: "No occupied save slots in this verified snapshot."; }
+                                    ActionButton { text: "Close preview"; clicked => { root.action(Action.close-preview, 0); } }
+                                }
                             }
                         }
                     }
                     if root.section == 4: VerticalLayout {
                         spacing: 20px;
-                        Text { text: "A fresh look for Hyrule."; color: Theme.text; font-size: 34px; font-weight: 600; }
-                        Muted { text: "Optional Dusklight texture packs. Download from the creator, then import files you are authorized to use."; }
+                        PageHeading { title: "Texture library"; description: "Optional Dusklight packs, imported from files you're authorized to use."; }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Your Dusklight profile"; }
+                                Muted { text: root.texture-profile == "" ? "Locate or install Dusklight first. Its active texture profile is detected automatically." : root.texture-profile; }
+                                Muted { text: "Changes apply to the next launch. Games must be stopped; no game is forcibly restarted."; }
+                                if root.texture-recovery: Muted { text: "An interrupted texture change needs recovery before protected play."; color: Theme.warning; }
+                            }
+                        }
                         Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Make it your own"; }
-                                for creator[index] in root.texture-creators: ActionButton { text: creator; primary: root.texture-creator == index; clicked => { root.texture-creator = index; } }
-                                ActionButton { text: "Visit creator download page"; clicked => { root.action(Action.open-texture-site, root.texture-creator); } }
-                                LineEdit { text <=> root.texture-version; placeholder-text: "Version label"; }
+                                for creator[index] in root.texture-creators: ActionButton { text: creator.name; primary: root.texture-creator == index; available: !root.texture-busy; clicked => { root.texture-creator = index; } }
+                                Muted { text: root.texture-creators[root.texture-creator].description; }
+                                if root.texture-creators[root.texture-creator].has-site: ActionButton { text: "Visit creator download page"; clicked => { root.action(Action.open-texture-site, root.texture-creator); } }
+                                LineEdit { text <=> root.texture-version; placeholder-text: "Version label"; enabled: !Theme.modal-open; }
                                 SwitchRow { title: "I have permission to use these textures"; checked: root.texture-consent; toggled(value) => { root.toggle(Toggle.texture-consent, value); } }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Import ZIP"; available: root.texture-consent && !root.texture-busy; clicked => { root.action(Action.import-texture-zip, 0); } }
-                                    ActionButton { text: "Import folder"; available: root.texture-consent && !root.texture-busy; clicked => { root.action(Action.import-texture-folder, 0); } }
+                                    ActionButton { text: "Import ZIP"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-zip, 0); } }
+                                    ActionButton { text: "Import folder"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-folder, 0); } }
                                 }
                                 Muted { text: root.texture-status; }
+                                if root.texture-busy: ProgressIndicator { indeterminate: true; }
                                 if root.texture-busy && root.texture-cancellable: ActionButton { text: "Cancel import safely"; clicked => { root.action(Action.cancel-textures, 0); } }
+                                Muted { text: "Only validated texture images are installed. Creator sign-in, paid access, quotas and hosting restrictions are never bypassed."; }
                             }
                         }
-                        for pack[index] in root.packs: Surface {
+                        for pack[index] in root.packs: pack-card := Surface {
+                            property <bool> expanded: false;
                             VerticalLayout {
                                 padding: 20px; spacing: 10px;
                                 Text { text: pack.title + (pack.active ? " · ACTIVE" : ""); color: pack.active ? Theme.accent : Theme.text; font-weight: 600; }
                                 Muted { text: pack.detail; }
-                                ActionButton { text: "Use this pack"; available: !root.texture-busy && !pack.active; clicked => { root.action(Action.activate-texture, index); } }
+                                ActionButton { text: pack-card.expanded ? "Hide version details" : "Version details"; subtle: true; clicked => { pack-card.expanded = !pack-card.expanded; } }
+                                if pack-card.expanded: DetailBlock { title: "VERSION / CONTENT ID"; text: pack.metadata; }
+                                ActionButton { text: "Use this pack"; available: root.can-change-textures && !pack.active; clicked => { root.action(Action.activate-texture, index); } }
                             }
                         }
+                        if root.packs.length == 0: Muted { text: "No texture packs installed. Import a complete ZIP or folder above."; }
                         HorizontalLayout {
                             spacing: 10px;
-                            ActionButton { text: "Disable textures"; available: !root.texture-busy; clicked => { root.action(Action.disable-textures, 0); } }
-                            ActionButton { text: "Refresh"; clicked => { root.action(Action.refresh-textures, 0); } }
-                            if root.texture-recovery: ActionButton { text: "Recover interrupted change"; clicked => { root.action(Action.recover-textures, 0); } }
+                            ActionButton { text: "Disable textures"; available: root.can-change-textures && root.textures-active; clicked => { root.action(Action.disable-textures, 0); } }
+                            ActionButton { text: "Refresh"; available: root.management-available; clicked => { root.action(Action.refresh-textures, 0); } }
+                            if root.texture-recovery: ActionButton { text: "Recover interrupted change"; available: root.management-available; clicked => { root.action(Action.recover-textures, 0); } }
                         }
                     }
                     if root.section == 5: VerticalLayout {
                         spacing: 20px;
-                        Text { text: "Your space, your way."; color: Theme.text; font-size: 34px; font-weight: 600; }
+                        PageHeading { title: "Settings & security"; description: "Your appearance, your privacy, your rules."; }
                         Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 14px;
-                                SectionTitle { text: "Comfort & convenience"; }
-                                SwitchRow { title: "Midnight theme"; description: "Switch off for a bright, quiet workspace."; checked: root.dark-mode; toggled(value) => { root.dark-mode = value; root.toggle(Toggle.dark-mode, value); } }
+                                SectionTitle { text: "Appearance"; }
+                                Muted { text: "Soft glass surfaces, in light or dark. System follows your Windows app setting."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "System"; primary: root.appearance-mode == AppearanceMode.system; clicked => { root.appearance-selected(AppearanceMode.system); } }
+                                    ActionButton { text: "Light"; primary: root.appearance-mode == AppearanceMode.light; clicked => { root.appearance-selected(AppearanceMode.light); } }
+                                    ActionButton { text: "Dark"; primary: root.appearance-mode == AppearanceMode.dark; clicked => { root.appearance-selected(AppearanceMode.dark); } }
+                                }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: "Startup & background"; }
                                 SwitchRow { title: "Ready when Windows starts"; description: "Start quietly in the tray."; checked: root.startup; toggled(value) => { root.toggle(Toggle.startup, value); } }
                                 SwitchRow { title: "Check for app updates"; description: "Metadata only. Updates still need your approval."; checked: root.auto-updates; toggled(value) => { root.toggle(Toggle.updates, value); } }
+                                Muted { text: "Closing the window keeps sync running in the tray. Double-click the moon icon to reopen it, or use Quit to exit."; }
                             }
                         }
                         Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Keep the good things coming"; }
+                                Muted { text: "Installed version: " + root.version; }
                                 Muted { text: root.app-update; }
+                                if root.app-release-detail != "": DetailBlock { title: "APP RELEASE / VERIFICATION"; text: root.app-release-detail; }
+                                if root.app-update-reason != "": Muted { text: root.app-update-reason; color: Theme.warning; }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Check for updates"; clicked => { root.action(Action.check-app-update, 0); } }
+                                    ActionButton { text: "Check for updates"; available: root.can-check-app; clicked => { root.action(Action.check-app-update, 0); } }
                                     ActionButton { text: "Update Twilight Sync"; available: root.can-update-app; primary: root.can-update-app; clicked => { root.action(Action.update-app, 0); } }
                                 }
+                                if root.has-app-release: ActionButton { text: "Release notes"; subtle: true; clicked => { root.action(Action.app-release-notes, 0); } }
+                                Muted { text: "Downloads are checked against the release's SHA-256. The app is currently unsigned: integrity is not publisher trust."; }
                             }
                         }
                         Surface {
@@ -591,18 +823,46 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 10px;
                                     ActionButton { text: "Choose ISO / RVZ"; clicked => { root.action(Action.choose-iso, 0); } }
-                                    ActionButton { text: "Offer verified disc"; available: root.disc-sharing; clicked => { root.action(Action.send-iso, 0); } }
+                                    ActionButton { text: "Offer verified disc"; available: root.can-send-iso; clicked => { root.action(Action.send-iso, 0); } }
                                 }
-                                if root.pending-iso: HorizontalLayout {
+                                if root.pending-iso: VerticalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Accept disc"; available: root.disc-sharing; clicked => { root.action(Action.accept-iso, 0); } }
-                                    ActionButton { text: "Decline"; clicked => { root.action(Action.decline-iso, 0); } }
+                                    Muted { text: root.disc-offer; color: Theme.warning; }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        ActionButton { text: "Accept disc"; available: root.can-accept-iso; clicked => { root.action(Action.accept-iso, 0); } }
+                                        ActionButton { text: "Decline"; clicked => { root.action(Action.decline-iso, 0); } }
+                                    }
                                 }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: "Private by design"; }
+                                Muted { text: "Saves travel directly between your paired PCs, not through a cloud relay. Public discovery names are unverified hints; the full pinned device key is checked on reconnect."; }
+                                DetailBlock { title: "THIS DEVICE · PUBLIC IDENTITY"; text: root.public-key; }
+                                Muted { text: "The private identity key is protected by Windows DPAPI for your user account. Save snapshots are not encrypted at rest. Local logs contain usernames, paths, hashes, peer identities and security decisions—keep them private."; }
+                                ActionButton { text: "Open local data"; clicked => { root.action(Action.open-data, 0); } }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: "How the secure channel works"; }
+                                StatusBadge { text: "twilightProto/1 · Noise XX"; tint: Theme.success; }
+                                Text { text: "Encrypted, authenticated, identity-pinned"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: "X25519 key agreement, ChaCha20-Poly1305 authenticated encryption and SHA-256. Each direction rekeys after 4,096 authenticated events. Pairing requires both PCs to compare the entire session-specific code and approve."; }
+                                Text { text: "Your network is an explicit boundary"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: "A private physical IPv4 interface, direct subnet and approved router fingerprint gate LAN activity. Router changes or stale verification close the channel. Router identities can be spoofed; they do not replace pairing."; }
+                                Text { text: "Validated data, not remote execution"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: "Bounded, game-scoped save events are checked before replacement. Games have separate histories, common bases and play reservations. No peer shell commands, executable attachments, console keys or arbitrary directories."; }
+                                Text { text: "Protection without false promises"; color: Theme.text; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: "Different progress requires a branch choice; prior saves are retained. Play reservations survive disconnects and restarts. Direct game launches can bypass cooperative protection. Save validation is not proof against every game exploit. This early release has not had an independent security audit; a compromised PC remains outside the trust boundary."; }
                             }
                         }
                         HorizontalLayout {
                             spacing: 10px;
-                            ActionButton { text: "Open local data"; clicked => { root.action(Action.open-data, 0); } }
                             ActionButton { text: "Licenses & credits"; clicked => { root.about-open = true; } }
                             ActionButton { text: "Quit"; clicked => { root.action(Action.quit, 0); } }
                         }
@@ -613,30 +873,103 @@ export component MainWindow inherits Window {
         }
         Rectangle { height: 1px; background: Theme.line; }
         Rectangle {
-            height: 42px; background: Theme.canvas;
+            height: 36px; background: Theme.chrome;
             HorizontalLayout {
                 padding-left: 24px; padding-right: 24px;
                 Text { text: root.status; color: Theme.muted; font-size: 11px; overflow: elide; vertical-alignment: center; }
-                Text { text: "PRIVATE LAN   /   PROTECTED SAVES"; color: Theme.muted; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+                Text { text: "Local first. Private by design."; color: Theme.muted; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
             }
         }
     }
-    if root.about-open: Rectangle {
-        background: #000a;
-        TouchArea { }
+    if root.comparison-open: FocusScope {
+        init => { self.focus(); }
         Rectangle {
-            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: min(parent.width - 80px, 600px); height: min(parent.height - 60px, 520px);
-            background: Theme.panel; border-radius: 24px; border-width: 1px; border-color: Theme.line;
-            VerticalLayout {
-                padding: 30px; spacing: 16px;
-                SectionTitle { text: "Twilight Sync"; }
-                Muted { text: "Your adventures, across your PCs.\nVersion " + root.version + "\nOriginal console-inspired interface. Not affiliated with Nintendo."; }
-                AboutSlint { }
-                ActionButton { text: "View third-party licenses"; clicked => { root.action(Action.open-licenses, 0); } }
-                if root.demo-mode: ActionButton { text: "Save example screenshot"; clicked => { root.action(Action.export-preview, 0); } }
-                ActionButton { text: "Back to your adventure"; primary: true; clicked => { root.about-open = false; } }
+            background: #0008;
+            TouchArea { scroll-event(event) => { accept } }
+            Surface {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: min(parent.width - 40px, 1040px); height: parent.height - 48px;
+                background: Theme.dialog;
+                VerticalLayout {
+                    padding: 24px; spacing: 16px;
+                    PageHeading { title: "Compare complete saves"; description: root.game-title + " · No default winner. Both original branches are retained."; }
+                    if root.base-revision != "": DetailBlock { title: "LAST COMMON SAVE → THIS PC / OTHER PC"; text: root.base-revision; }
+                    if root.base-revision == "": Muted { text: "No verified common save. Compare both complete branches before choosing."; }
+                    ScrollView {
+                        horizontal-stretch: 1; vertical-stretch: 1;
+                        HorizontalLayout {
+                            spacing: 14px; alignment: start;
+                            BranchPreview {
+                                horizontal-stretch: 1;
+                                title: "This PC"; revision: root.local-revision; changes: root.local-changes;
+                                saves: root.local-saves; selectable: root.can-resolve; selected: root.branch-choice == 0;
+                                choose => { root.branch-choice = 0; }
+                            }
+                            BranchPreview {
+                                horizontal-stretch: 1;
+                                title: root.peer-name == "" ? "Other PC" : "Other PC · " + root.peer-name; remote: true; revision: root.remote-revision; changes: root.remote-changes;
+                                saves: root.remote-saves; selectable: root.can-resolve; selected: root.branch-choice == 1;
+                                choose => { root.branch-choice = 1; }
+                            }
+                        }
+                    }
+                    Muted { text: "A choice applies to every save slot, not just the visible one. Your other PC must still approve replacement of different progress."; }
+                    if root.comparison-reason != "": Muted { text: root.comparison-reason; color: Theme.warning; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        ActionButton {
+                            text: root.branch-choice == 0 ? "Use this PC's save" : root.branch-choice == 1 ? "Use other PC's save" : "Choose a branch above";
+                            primary: true; available: root.branch-choice >= 0 && root.can-resolve; modal-control: true;
+                            clicked => { root.action(root.branch-choice == 0 ? Action.use-local : Action.use-remote, 0); }
+                        }
+                        ActionButton { text: "Keep both, play here"; available: root.can-continue; modal-control: true; clicked => { root.action(Action.continue-local, 0); } }
+                        ActionButton { text: "Not now"; modal-control: true; clicked => { root.comparison-open = false; } }
+                    }
+                }
             }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.comparison-open = false; return accept; }
+            return reject;
+        }
+    }
+    if root.about-open: FocusScope {
+        init => { self.focus(); }
+        Rectangle {
+            background: #000a;
+            TouchArea { scroll-event(event) => { accept } }
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: min(parent.width - 80px, 600px); height: min(parent.height - 60px, 520px);
+                background: Theme.dialog; border-radius: 24px; border-width: 1px; border-color: Theme.line;
+                VerticalLayout {
+                    padding: 30px; spacing: 16px;
+                    SectionTitle { text: "Twilight Sync"; }
+                    Muted { text: "Your adventures, across your PCs.\nVersion " + root.version + "\nA local-first library with encrypted save sharing. Not affiliated with Nintendo."; }
+                    ScrollView {
+                        VerticalLayout {
+                            spacing: 12px;
+                            AboutSlint { }
+                            ActionButton { text: "View third-party licenses"; modal-control: true; clicked => { root.action(Action.open-licenses, 0); } }
+                            if root.demo-mode: VerticalLayout {
+                                spacing: 10px;
+                                Muted { text: "Synthetic preview scenarios. No real saves, pairing or settings are changed."; }
+                                for scenario[index] in ["Synchronized saves", "Divergent saves", "Pairing", "Offline", "Connecting"]: ActionButton {
+                                    text: "Preview: " + scenario;
+                                    modal-control: true;
+                                    clicked => { root.action(Action.preview-scenario, index); }
+                                }
+                                ActionButton { text: "Save example screenshot"; modal-control: true; clicked => { root.action(Action.export-preview, 0); } }
+                            }
+                        }
+                    }
+                    ActionButton { text: "Back to your adventure"; primary: true; modal-control: true; clicked => { root.about-open = false; } }
+                }
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.about-open = false; return accept; }
+            return reject;
         }
     }
 }

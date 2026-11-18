@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use slint::winit_030::{WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::{
     cell::RefCell,
@@ -182,6 +183,7 @@ struct Controller {
     tray: Tray,
     background: Option<background::BackgroundGuard>,
     appearance: appearance::Store,
+    native_appearance: Option<appearance::Appearance>,
     game: GameId,
     game_path: Option<PathBuf>,
     approval: Option<Approval>,
@@ -200,6 +202,7 @@ enum Interaction {
     ChooseInput(i32),
     ClearInput(i32),
     SetWorkers(i32),
+    Appearance(widgets::AppearanceMode),
 }
 
 impl Interaction {
@@ -219,6 +222,14 @@ impl Interaction {
                     .clone();
                 preference.jobs = u8::try_from(workers).context("Invalid build worker count")?;
                 controller.set_preference(preference)
+            }
+            Self::Appearance(mode) => {
+                controller.appearance.set(match mode {
+                    widgets::AppearanceMode::System => appearance::Appearance::System,
+                    widgets::AppearanceMode::Light => appearance::Appearance::Light,
+                    widgets::AppearanceMode::Dark => appearance::Appearance::Dark,
+                })?;
+                controller.refresh_view()
             }
         }
     }
@@ -414,10 +425,6 @@ impl Controller {
                 self.texture_consent = value;
                 self.refresh_view()
             }
-            Toggle::DarkMode => {
-                self.appearance.set_dark(value)?;
-                self.refresh_view()
-            }
             Toggle::SourceMode
             | Toggle::ManagedTools
             | Toggle::Renodx
@@ -585,10 +592,12 @@ impl Controller {
             Action::Refresh => self.refresh_game(),
             Action::Compare => {
                 ui.set_section(0);
-                if self.game != GameId::Dusklight {
-                    self.native(NativeCommand::Refresh)?;
-                }
-                Ok(())
+                ui.set_comparison_open(true);
+                self.refresh_game()
+            }
+            Action::ViewGame => {
+                ui.set_section(0);
+                self.select_game(index)
             }
             Action::ContinueLocal => {
                 ensure!(
@@ -657,6 +666,10 @@ impl Controller {
             }
             Action::AcceptSave | Action::DeclineSave => {
                 let approved = action == Action::AcceptSave;
+                ensure!(
+                    !approved || model::can_accept(&self.snapshot, self.game),
+                    "Close this game's sessions and finish conflicting operations before receiving a save"
+                );
                 if approved
                     && !self.confirm(
                         "Receive the complete save",
@@ -672,6 +685,10 @@ impl Controller {
                 }
             }
             Action::Recover => {
+                ensure!(
+                    model::can_recover(&self.snapshot, self.game),
+                    "Close this game on both PCs and finish transfers before recovering a session"
+                );
                 if self.confirm(
                     "Recover a completed play session",
                     "Have you stopped playing on both PCs? Recover only a completed session. Saves and both branches are retained; another PC's offline reservation is never silently removed.",
@@ -686,6 +703,10 @@ impl Controller {
             }
             Action::ApproveRecovery | Action::DeclineRecovery => {
                 let approved = action == Action::ApproveRecovery;
+                ensure!(
+                    !approved || model::can_recover(&self.snapshot, self.game),
+                    "Close this game on both PCs before approving recovery"
+                );
                 if approved
                     && !self.confirm(
                         "Approve completed-session recovery",
@@ -848,13 +869,37 @@ impl Controller {
                 }
                 Ok(())
             }
-            Action::OpenPairing => self.dispatch(Command::OpenPairing),
+            Action::OpenPairing => {
+                ensure!(
+                    model::can_pair(&self.snapshot),
+                    "Approve a private network and finish active operations before pairing; unpair an existing partner first"
+                );
+                self.dispatch(Command::OpenPairing)
+            }
+            Action::Reconnect => {
+                ensure!(
+                    model::can_reconnect(&self.snapshot),
+                    "Your pinned partner must be discovered on the approved LAN before reconnecting"
+                );
+                let peer = self
+                    .snapshot
+                    .settings
+                    .peer
+                    .as_ref()
+                    .context("No paired device")?;
+                self.dispatch(Command::Connect(peer.public_key.clone()))
+            }
             Action::ConnectDevice => {
+                ensure!(
+                    model::can_pair(&self.snapshot) && self.snapshot.pairing_open,
+                    "Open pairing on both PCs before comparing codes"
+                );
                 let device = self
                     .snapshot
                     .devices
                     .get(usize::try_from(index)?)
                     .context("The device list changed; try again")?;
+                ensure!(device.pairing, "Open pairing on the other PC too");
                 self.dispatch(Command::Connect(device.key.clone()))
             }
             Action::ApprovePairing => {
@@ -938,6 +983,19 @@ impl Controller {
             }
             Action::ClosePreview => self.dispatch(Command::ClearHistoryPreview),
             Action::CheckAppUpdate => self.dispatch(Command::CheckSelfUpdate),
+            Action::AppReleaseNotes => open_url(
+                &self
+                    .snapshot
+                    .self_updates
+                    .latest
+                    .as_ref()
+                    .context("Check for an app release first")?
+                    .notes_url,
+            ),
+            Action::OfficialHelp => {
+                ensure!(self.game == GameId::Totk, "Select TotK Recomp first");
+                open_url(crate::totk_update::SETUP_DOWNLOAD_URL)
+            }
             Action::UpdateApp => {
                 ensure!(
                     model::app_update_blocker(&self.snapshot).is_none(),
@@ -962,10 +1020,29 @@ impl Controller {
                 }
                 Ok(())
             }
-            Action::SendIso => self.dispatch(Command::SendIso),
+            Action::SendIso => {
+                ensure!(
+                    model::can_send_disc(&self.snapshot),
+                    "Enable disc sharing, choose a verified disc, and finish active work on the connected PCs first"
+                );
+                self.dispatch(Command::SendIso)
+            }
             Action::AcceptIso => {
+                ensure!(
+                    model::can_accept_disc(&self.snapshot),
+                    "Enable disc sharing and finish active work before accepting the offered image"
+                );
+                let format = self
+                    .snapshot
+                    .pending_disc_format
+                    .context("Image format missing; decline and request a new offer")?;
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Save the offered game disc")
+                    .add_filter(
+                        format!("GameCube {}", format.label()),
+                        &[format.extension()],
+                    )
+                    .set_file_name(format!("Twilight Princess.{}", format.extension()))
                     .save_file()
                 {
                     self.dispatch(Command::AcceptIso(Some(path)))?;
@@ -983,6 +1060,10 @@ impl Controller {
                 ensure!(
                     self.texture_consent,
                     "Confirm that you have permission to use these textures"
+                );
+                ensure!(
+                    model::can_import_textures(&self.snapshot),
+                    "Set up Dusklight and finish active work or texture recovery before importing"
                 );
                 let creator = textures::CATALOG
                     .get(usize::try_from(ui.get_texture_creator())?)
@@ -1006,6 +1087,10 @@ impl Controller {
                 Ok(())
             }
             Action::ActivateTexture => {
+                ensure!(
+                    model::can_change_textures(&self.snapshot),
+                    "Finish active work or texture recovery and verify the Dusklight profile first"
+                );
                 let pack = self
                     .snapshot
                     .textures
@@ -1021,6 +1106,10 @@ impl Controller {
                 Ok(())
             }
             Action::DisableTextures => {
+                ensure!(
+                    model::can_change_textures(&self.snapshot),
+                    "Finish active work or texture recovery and verify the Dusklight profile first"
+                );
                 if self.preserve_textures().await? {
                     self.dispatch(Command::ActivateTextures {
                         id: None,
@@ -1037,6 +1126,32 @@ impl Controller {
                 let path = self.data_directory()?.join("THIRD_PARTY_NOTICES.txt");
                 crate::files::atomic_write(&path, NOTICES.as_bytes())?;
                 open_path(&path)
+            }
+            Action::PreviewScenario => {
+                ensure!(
+                    self.demo,
+                    "Example scenarios are only available in the isolated preview"
+                );
+                #[cfg(debug_assertions)]
+                {
+                    let scenario = match index {
+                        0 => "ready",
+                        1 => "attention",
+                        2 => "pairing",
+                        3 => "offline",
+                        4 => "connecting",
+                        _ => bail!("Unknown preview scenario"),
+                    };
+                    let backend = crate::runtime::ui_smoke_backend(scenario)?;
+                    self.snapshot = backend.snapshot()?;
+                    backend.command(Command::Shutdown)?;
+                    self.approval = None;
+                    ui.set_about_open(false);
+                    ui.set_comparison_open(false);
+                    self.refresh_view()
+                }
+                #[cfg(not(debug_assertions))]
+                bail!("Example scenarios require a debug build")
             }
             Action::ExportPreview => self.export_preview(),
             Action::Quit => self.backend.command(Command::Shutdown),
@@ -1080,14 +1195,36 @@ impl Controller {
             self.approval = None;
         }
         ui.set_dark_mode(self.appearance.dark()?);
+        if self.native_appearance != Some(self.appearance.appearance) {
+            let theme = match self.appearance.appearance {
+                appearance::Appearance::System => None,
+                appearance::Appearance::Light => Some(winit::window::Theme::Light),
+                appearance::Appearance::Dark => Some(winit::window::Theme::Dark),
+            };
+            if ui
+                .window()
+                .with_winit_window(|window| window.set_theme(theme))
+                .is_some()
+            {
+                self.native_appearance = Some(self.appearance.appearance);
+            }
+        }
+        ui.set_appearance_mode(match self.appearance.appearance {
+            appearance::Appearance::System => widgets::AppearanceMode::System,
+            appearance::Appearance::Light => widgets::AppearanceMode::Light,
+            appearance::Appearance::Dark => widgets::AppearanceMode::Dark,
+        });
         ui.set_version(env!("CARGO_PKG_VERSION").into());
         ui.set_connected(snapshot.ready);
+        ui.set_connecting(snapshot.connecting);
         ui.set_connection(
             if snapshot.ready {
                 format!(
                     "Connected · {}",
                     snapshot.peer_name.as_deref().unwrap_or("other PC")
                 )
+            } else if snapshot.comparison_code.is_some() {
+                "Pairing · compare both screens".into()
             } else if snapshot.connecting {
                 "Connecting…".into()
             } else {
@@ -1114,17 +1251,110 @@ impl Controller {
                 title: model::title(game).into(),
                 subtitle: model::subtitle(game).into(),
                 installed: model::installed(snapshot, game),
-                status: if model::installed(snapshot, game) {
-                    "Installed · ready for your next chapter"
-                } else {
-                    "Set up your adventure"
-                }
-                .into(),
+                status: model::game_status(snapshot, game).into(),
             })
             .collect();
         replace_rows(ui.get_games(), games, |rows| ui.set_games(rows));
         ui.set_game_title(model::title(game).into());
         ui.set_game_subtitle(model::subtitle(game).into());
+        ui.set_game_status(model::game_status(snapshot, game).into());
+        ui.set_game_message(
+            model::native(snapshot, game)
+                .map_or(snapshot.message.as_str(), |state| state.message.as_str())
+                .into(),
+        );
+        ui.set_verified_at(
+            model::native(snapshot, game)
+                .and_then(|state| state.verified_at.as_deref())
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_saves_match(model::saves_match(snapshot, game));
+        ui.set_local_revision(model::local_hash(snapshot, game).unwrap_or_default().into());
+        ui.set_remote_revision(
+            model::native(snapshot, game)
+                .map_or(snapshot.remote_hash.as_deref(), |state| {
+                    state.remote_hash.as_deref()
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_base_revision(
+            model::native(snapshot, game)
+                .map_or_else(
+                    || {
+                        snapshot
+                            .conflict
+                            .as_ref()
+                            .and_then(|conflict| conflict.base_hash.as_deref())
+                    },
+                    |state| state.base.as_deref(),
+                )
+                .unwrap_or_default()
+                .into(),
+        );
+        let changes = |summary: Option<&crate::save_data::Summary>| {
+            if game == GameId::Dusklight {
+                summary
+                    .zip(
+                        snapshot
+                            .conflict
+                            .as_ref()
+                            .and_then(|conflict| conflict.base.as_ref()),
+                    )
+                    .map(|(summary, base)| summary.changes_from(base).join("\n"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
+        ui.set_local_changes(changes(snapshot.local_save.as_ref()).into());
+        ui.set_remote_changes(
+            changes(
+                snapshot
+                    .conflict
+                    .as_ref()
+                    .and_then(|conflict| conflict.remote.as_ref()),
+            )
+            .into(),
+        );
+        ui.set_connection_setup(
+            if snapshot.ready {
+                ""
+            } else if !model::network_trusted(snapshot) {
+                "Approve your private home network to connect another PC."
+            } else if snapshot.settings.peer.is_none() {
+                "Pair your other PC to bring your progress along."
+            } else {
+                ""
+            }
+            .into(),
+        );
+        ui.set_transfer(snapshot.transfer.clone().into());
+        ui.set_management_available(model::management_available(snapshot));
+        let attention = model::GAMES
+            .iter()
+            .filter_map(|&game| {
+                if game == self.game && ui.get_section() == 0 {
+                    return None;
+                }
+                let (pending, recovery) = model::native(snapshot, game).map_or(
+                    (snapshot.pending_save, snapshot.pending_recovery),
+                    |state| (state.pending, state.recovery_pending),
+                );
+                (pending || recovery).then(|| widgets::AttentionCard {
+                    game_index: model::index(game),
+                    title: model::title(game).into(),
+                    detail: if recovery {
+                        "A completed-session recovery needs your decision."
+                    } else {
+                        "An incoming complete save needs your decision."
+                    }
+                    .into(),
+                })
+            })
+            .collect();
+        replace_rows(ui.get_attention(), attention, |rows| ui.set_attention(rows));
         ui.set_installed(model::installed(snapshot, game));
         let path = model::native(snapshot, game)
             .and_then(|state| state.install_path.as_ref())
@@ -1147,11 +1377,35 @@ impl Controller {
                 .unwrap_or_default()
                 .into(),
         );
+        ui.set_installed_executable(
+            model::native(snapshot, game)
+                .map_or(snapshot.settings.game_exe.as_ref(), |state| {
+                    state.executable.as_ref()
+                })
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_installed_release(
+            if game == GameId::Dusklight {
+                snapshot.selected_release.as_deref().unwrap_or_default()
+            } else {
+                ""
+            }
+            .into(),
+        );
         ui.set_can_play(model::play_blocker(snapshot, game).is_none());
         ui.set_can_sync(model::sync_blocker(snapshot, game).is_none());
         ui.set_can_continue(model::can_continue(snapshot, game));
         ui.set_can_restore(model::can_restore(snapshot, game));
         ui.set_can_resolve(model::can_resolve(snapshot, game));
+        ui.set_comparison_reason(
+            model::comparison_blocker(snapshot, game)
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_can_accept_save(model::can_accept(snapshot, game));
+        ui.set_can_recover(model::can_recover(snapshot, game));
         ui.set_play_reason(
             model::play_blocker(snapshot, game)
                 .unwrap_or_default()
@@ -1163,7 +1417,6 @@ impl Controller {
                 .into(),
         );
         ui.set_can_manage(model::configuration_available(snapshot));
-        ui.set_can_install(model::can_install(snapshot, game));
         ui.set_can_locate(model::can_locate(snapshot, game));
         ui.set_operation_busy(snapshot.install_busy);
         ui.set_preferences_valid(snapshot.source.preferences_valid);
@@ -1357,6 +1610,48 @@ impl Controller {
                 .unwrap_or_default()
                 .into(),
         );
+        ui.set_release_detail(
+            release
+                .map(|release| {
+                    format!(
+                        "{} · {:.1} MiB\nSHA-256: {}",
+                        release.asset,
+                        release.size as f64 / 1_048_576.0,
+                        release.sha256
+                    )
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        let official_inputs = (|| -> Result<()> {
+            if game == GameId::Totk {
+                let directory = snapshot
+                    .totk
+                    .install_path
+                    .as_deref()
+                    .context("Waiting for the managed TotK installation location")?;
+                if crate::totk_update::needs_setup(directory)? {
+                    crate::totk_update::validate_setup_inputs(
+                        directory,
+                        &crate::totk_update::SetupInputs::from(preference),
+                    )?;
+                }
+            }
+            Ok(())
+        })()
+        .err()
+        .map(|error| format!("{error:#}"));
+        ui.set_can_install(model::can_install(snapshot, game) && official_inputs.is_none());
+        ui.set_install_reason(
+            if !model::can_install(snapshot, game) {
+                model::source_blocker(snapshot).unwrap_or(
+                    "Finish verification, active sessions or transfers before installing.",
+                )
+            } else {
+                official_inputs.as_deref().unwrap_or_default()
+            }
+            .into(),
+        );
         ui.set_network_name(
             snapshot
                 .network
@@ -1366,9 +1661,18 @@ impl Controller {
                 .into(),
         );
         ui.set_network_detail(snapshot.network.as_ref().map(|network| format!("This PC: {}/{}\nRouter: {} · MAC {}\nOnly approve your own private home network.", network.address, network.prefix, network.gateway, network.router_mac)).unwrap_or_else(|| "Connect to your home network. Public networks are never trusted automatically.".into()).into());
-        ui.set_network_trusted(snapshot.network.as_ref().is_some_and(|network| {
-            snapshot.settings.network.as_deref() == Some(network.fingerprint.as_str())
-        }));
+        ui.set_network_trusted(model::network_trusted(snapshot));
+        ui.set_network_available(snapshot.network.is_some());
+        ui.set_network_fingerprint(
+            snapshot
+                .network
+                .as_ref()
+                .map(|network| network.fingerprint.as_str())
+                .unwrap_or("No eligible private physical network. Public and VPN-only interfaces are not accepted.")
+                .into(),
+        );
+        ui.set_can_pair(model::can_pair(snapshot));
+        ui.set_can_reconnect(model::can_reconnect(snapshot));
         ui.set_pairing_open(snapshot.pairing_open);
         ui.set_pairing_code(
             snapshot
@@ -1378,14 +1682,34 @@ impl Controller {
                 .into(),
         );
         ui.set_pairing_approved(snapshot.local_approved);
-        ui.set_peer_name(snapshot.peer_name.as_deref().unwrap_or_default().into());
+        ui.set_remote_approved(snapshot.remote_approved);
+        ui.set_peer_name(
+            snapshot
+                .settings
+                .peer
+                .as_ref()
+                .map(|peer| peer.name.as_str())
+                .or(snapshot.peer_name.as_deref())
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_peer_key(
+            snapshot
+                .settings
+                .peer
+                .as_ref()
+                .map(|peer| peer.public_key.as_str())
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_public_key(snapshot.public_key.clone().into());
         let devices = snapshot
             .devices
             .iter()
             .map(|device| widgets::DeviceCard {
                 name: device.name.clone().into(),
                 detail: format!(
-                    "{} · {}",
+                    "{} · unverified discovery announcement\n{}",
                     device.address,
                     if device.pairing {
                         "Ready to compare codes"
@@ -1394,7 +1718,7 @@ impl Controller {
                     }
                 )
                 .into(),
-                pairing: device.pairing,
+                pairing: device.pairing && snapshot.pairing_open && model::can_pair(snapshot),
             })
             .collect();
         replace_rows(ui.get_devices(), devices, |rows| ui.set_devices(rows));
@@ -1403,15 +1727,42 @@ impl Controller {
             .entries
             .iter()
             .map(|entry| widgets::HistoryCard {
+                id: entry.id.clone().into(),
                 title: format!("Snapshot #{} · {}", entry.sequence, entry.timestamp).into(),
                 detail: format!(
-                    "{} · {} on {}\n{}",
+                    "{} · {}\n{}",
                     entry.reason.label(),
                     entry.username,
-                    entry.device,
                     entry.changes.join("\n")
                 )
                 .into(),
+                metadata: format!(
+                    "Game: {} / {}\nCommit: {}\nSave SHA-256: {}\nDevice: {}\nParent: {}\nPartner branch: {}\nRestored from: {}",
+                    entry.game,
+                    entry.name,
+                    entry.id,
+                    entry.hash,
+                    entry.device,
+                    entry.parent.as_deref().unwrap_or("None"),
+                    entry.merge_parent.as_deref().unwrap_or("None"),
+                    entry.restored_from.as_deref().unwrap_or("None"),
+                )
+                .into(),
+                ancestry: if entry.merge_parent.is_some() {
+                    "Reconciled save · both parent branches retained"
+                } else if entry.reason == crate::history::Reason::PeerBranch {
+                    "Preserved partner branch"
+                } else {
+                    "Local save branch"
+                }
+                .into(),
+                branch: if entry.merge_parent.is_some() {
+                    2
+                } else if entry.reason == crate::history::Reason::PeerBranch {
+                    1
+                } else {
+                    0
+                },
                 current: model::local_hash(snapshot, game) == Some(entry.hash.as_str()),
             })
             .collect();
@@ -1424,6 +1775,19 @@ impl Controller {
                 history.stats.stored_bytes as f64 / 1_048_576.0,
                 history.stats.budget as f64 / 1_048_576.0,
                 history.notice.as_deref().unwrap_or_default()
+            )
+            .into(),
+        );
+        ui.set_history_usage(
+            (history.stats.stored_bytes as f32 / history.stats.budget.max(1) as f32)
+                .clamp(0.0, 1.0),
+        );
+        ui.set_history_storage(
+            format!(
+                "{} shared blocks · {:.2} MiB as full copies · {} oldest snapshots pruned.",
+                history.stats.blocks,
+                history.stats.logical_bytes as f64 / 1_048_576.0,
+                history.stats.pruned
             )
             .into(),
         );
@@ -1442,6 +1806,12 @@ impl Controller {
         replace_rows(ui.get_preview_saves(), preview_cards, |rows| {
             ui.set_preview_saves(rows)
         });
+        ui.set_preview_id(
+            preview
+                .map(|preview| preview.id.as_str())
+                .unwrap_or_default()
+                .into(),
+        );
         ui.set_preview_title(
             preview
                 .map(|_| "Snapshot preview · read only")
@@ -1461,8 +1831,45 @@ impl Controller {
         ui.set_can_update_app(
             snapshot.self_updates.available() && model::app_update_blocker(snapshot).is_none(),
         );
+        ui.set_can_check_app(!snapshot.self_updates.checking && !snapshot.self_updates.preparing);
+        ui.set_has_app_release(snapshot.self_updates.latest.is_some());
+        ui.set_app_release_detail(
+            snapshot
+                .self_updates
+                .latest
+                .as_ref()
+                .map(|release| {
+                    format!(
+                        "{} · {:.1} MiB\nSHA-256: {}\nLast checked: {}",
+                        release.tag,
+                        release.size as f64 / 1_048_576.0,
+                        release.sha256,
+                        snapshot
+                            .self_updates
+                            .checked_at
+                            .as_deref()
+                            .unwrap_or("Not yet checked")
+                    )
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_app_update_reason(
+            model::app_update_blocker(snapshot)
+                .unwrap_or_default()
+                .into(),
+        );
         ui.set_disc_sharing(snapshot.settings.iso_enabled);
         ui.set_pending_iso(snapshot.pending_iso);
+        ui.set_can_send_iso(model::can_send_disc(snapshot));
+        ui.set_can_accept_iso(model::can_accept_disc(snapshot));
+        ui.set_disc_offer(
+            snapshot
+                .pending_disc_format
+                .map(|format| format!("Incoming {} image. Confirm you own this game, then choose a new destination. Existing files are never overwritten.", format.label()))
+                .unwrap_or_else(|| "Image format missing; decline and request a new offer.".into())
+                .into(),
+        );
         ui.set_iso_path(
             snapshot
                 .settings
@@ -1477,16 +1884,41 @@ impl Controller {
         ui.set_texture_cancellable(snapshot.textures.cancellable);
         ui.set_texture_recovery(snapshot.textures.recovery_needed);
         ui.set_texture_consent(self.texture_consent);
+        ui.set_can_import_textures(model::can_import_textures(snapshot));
+        ui.set_can_change_textures(model::can_change_textures(snapshot));
+        ui.set_textures_active(snapshot.textures.active.is_some());
+        ui.set_texture_profile(
+            snapshot
+                .settings
+                .texture_profile
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+                .into(),
+        );
         let packs = snapshot
             .textures
             .packs
             .iter()
             .map(|pack| widgets::PackCard {
-                title: format!("{} · {}", pack.source, pack.version).into(),
+                title: format!(
+                    "{} · {}",
+                    textures::CATALOG
+                        .iter()
+                        .find(|creator| creator.id == pack.source)
+                        .map_or(pack.source.as_str(), |creator| creator.name),
+                    pack.version
+                )
+                .into(),
                 detail: format!(
                     "{} textures · {:.1} MiB",
                     pack.files,
                     pack.bytes as f64 / 1_048_576.0
+                )
+                .into(),
+                metadata: format!(
+                    "Imported: {}\nContent ID: {}\nSkipped entries: {}",
+                    pack.imported, pack.id, pack.skipped
                 )
                 .into(),
                 active: snapshot.textures.active.as_deref() == Some(pack.id.as_str()),
@@ -1688,9 +2120,23 @@ fn run_window(
     ui.set_texture_creators(rows(
         textures::CATALOG
             .iter()
-            .map(|entry| SharedString::from(entry.name))
+            .map(|entry| widgets::TextureCreator {
+                name: entry.name.into(),
+                description: entry.description.into(),
+                version: entry
+                    .suggested_version
+                    .map_or_else(
+                        || format!("Imported {}", time::OffsetDateTime::now_utc().date()),
+                        str::to_owned,
+                    )
+                    .into(),
+                has_site: entry.creator_url.is_some(),
+            })
             .collect(),
     ));
+    if let Some(creator) = ui.get_texture_creators().row_data(0) {
+        ui.set_texture_version(creator.version);
+    }
     ui.window()
         .set_size(slint::LogicalSize::new(1200.0 / scale, 820.0 / scale));
     let mut controller = Controller {
@@ -1700,6 +2146,7 @@ fn run_window(
         tray,
         background: None,
         appearance,
+        native_appearance: None,
         game,
         game_path,
         approval: None,
@@ -1753,6 +2200,12 @@ fn run_window(
     ui.on_set_workers(move |workers| {
         if let Some(controller) = weak.upgrade() {
             controller.run(Interaction::SetWorkers(workers));
+        }
+    });
+    let weak = Rc::downgrade(&controller);
+    ui.on_appearance_selected(move |mode| {
+        if let Some(controller) = weak.upgrade() {
+            controller.run(Interaction::Appearance(mode));
         }
     });
     ui.window().on_close_requested(move || {
