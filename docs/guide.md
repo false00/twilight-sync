@@ -628,7 +628,11 @@ The flow:
    a user/peer-provided shell command. Source child processes receive a limited
    OS/build environment, not arbitrary inherited credential environment variables.
    Compiler workers are selected automatically from the PC's available CPU
-   threads and memory. Triforce prepares shaders before the new installation is
+   threads and memory. Compiling and owned shader-preparation processes are not reported
+   as gameplay, so the paired PC can still reserve and play its existing game.
+   Actual running games and play reservations remain protected; a completed
+   build cannot replace the selected installation until play has finished.
+   Triforce prepares shaders before the new installation is
    selected by default. It seeds rebuilds with shader caches from the previous
    local install; Triforce checks compatibility and still prepares missing
    shaders. A cold cache can take hours. The advanced graphics option to skip

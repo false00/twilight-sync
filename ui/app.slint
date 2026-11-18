@@ -1,4 +1,4 @@
-import { AboutSlint, ScrollView, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
+import { ScrollView, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
 import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile, NavigationItem, PageHeading, StatusBadge, DetailBlock, SaveProgress } from "components.slint";
 
 export enum Action {
@@ -1133,7 +1133,6 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Muted { text: "CREDITS & LICENSES"; font-size: 11px; }
-                            AboutSlint { max-width: 240px; height: 145px; }
                             ActionButton { text: "View third-party licenses"; modal-control: true; clicked => { root.action(Action.open-licenses, 0); } }
                             if root.demo-mode: VerticalLayout {
                                 spacing: 10px;

@@ -48,7 +48,30 @@ impl ProcessMonitor {
         self.system
             .processes()
             .values()
-            .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(executable))
+            .filter(|process| {
+                process
+                    .name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(executable)
+            })
+            .any(|process| {
+                #[cfg(windows)]
+                match crate::process_job::is_source_build_process(process.pid().as_u32()) {
+                    Ok(build_process) => !build_process,
+                    Err(error) => {
+                        eprintln!(
+                            "Cannot distinguish gameplay from source-build process {}: {error:#}",
+                            process.pid()
+                        );
+                        true
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = process;
+                    true
+                }
+            })
     }
 }
 
@@ -110,6 +133,119 @@ pub fn matches(lock: Option<&PlayLock>, owner: &str, token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn build_process_trees_do_not_hide_an_unrelated_running_game() -> Result<()> {
+        use std::{
+            fs,
+            os::windows::process::CommandExt,
+            time::{Duration, Instant},
+        };
+        let temporary = tempfile::tempdir()?;
+        let name = format!(
+            "twilight-process-{}.exe",
+            crate::files::sha256(temporary.path().as_os_str().as_encoded_bytes())
+        );
+        let executable = temporary.path().join(&name);
+        fs::copy(std::env::current_exe()?, &executable)?;
+        let ready = temporary.path().join("build-ready");
+        let descendant = temporary.path().join("descendant-ready");
+        let go = temporary.path().join("go");
+        let mut command = Command::new(&executable);
+        command
+            .args(["--exact", "play::tests::owned_process_fixture", "--ignored"])
+            .env("TWILIGHT_PROCESS_READY", &ready)
+            .env("TWILIGHT_PROCESS_DESCENDANT", &descendant)
+            .env("TWILIGHT_PROCESS_GO", &go)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000);
+        let build_job = crate::process_job::Job::for_source_build()?;
+        let mut child = command.spawn()?;
+        build_job.assign(&child)?;
+        fs::write(&go, b"go")?;
+        let wait_for = |path: &Path| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !path.try_exists()? {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Process fixture did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        };
+        wait_for(&descendant)?;
+        assert!(crate::process_job::is_source_build_process(child.id())?);
+        let descendant_pid = fs::read_to_string(&descendant)?.parse::<u32>()?;
+        assert!(crate::process_job::is_source_build_process(descendant_pid)?);
+        let mut monitor = ProcessMonitor {
+            fake_running: None,
+            ..Default::default()
+        };
+        assert!(!monitor.named_game_running(&name));
+        let unrelated_ready = temporary.path().join("unrelated-ready");
+        command
+            .env_remove("TWILIGHT_PROCESS_DESCENDANT")
+            .env_remove("TWILIGHT_PROCESS_GO")
+            .env("TWILIGHT_PROCESS_READY", &unrelated_ready);
+        let unrelated_job = crate::process_job::Job::new(None, None)?;
+        let mut unrelated = command.spawn()?;
+        unrelated_job.assign(&unrelated)?;
+        wait_for(&unrelated_ready)?;
+        assert!(!crate::process_job::is_source_build_process(
+            unrelated.id()
+        )?);
+        assert!(
+            monitor.named_game_running(&name),
+            "A genuine matching process was hidden by the build"
+        );
+        drop(unrelated_job);
+        unrelated.wait()?;
+        assert!(!monitor.named_game_running(&name));
+        drop(build_job);
+        child.wait()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "Internal subprocess fixture for build/game process classification"]
+    fn owned_process_fixture() -> Result<()> {
+        use std::{
+            os::windows::process::CommandExt,
+            time::{Duration, Instant},
+        };
+        let ready =
+            std::env::var_os("TWILIGHT_PROCESS_READY").context("Missing fixture ready path")?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut descendant = None;
+        if let Some(path) = std::env::var_os("TWILIGHT_PROCESS_DESCENDANT") {
+            let go =
+                std::env::var_os("TWILIGHT_PROCESS_GO").context("Missing fixture start path")?;
+            while !Path::new(&go).try_exists()? {
+                ensure!(Instant::now() < deadline, "Fixture start timed out");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            descendant = Some(
+                Command::new(std::env::current_exe()?)
+                    .args(["--exact", "play::tests::owned_process_fixture", "--ignored"])
+                    .env_remove("TWILIGHT_PROCESS_DESCENDANT")
+                    .env("TWILIGHT_PROCESS_READY", path)
+                    .creation_flags(0x08000000)
+                    .spawn()?,
+            );
+        }
+        crate::files::atomic_write(Path::new(&ready), std::process::id().to_string().as_bytes())?;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(mut child) = descendant {
+            child.wait()?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn locks_do_not_expire_or_allow_a_second_owner() -> Result<()> {

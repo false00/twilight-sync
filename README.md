@@ -17,6 +17,8 @@ handheld with private, encrypted save sharing over your home network.
 &nbsp;·&nbsp; [Get started](#up-and-playing)
 &nbsp;·&nbsp; [Report a problem](https://github.com/false00/twilight-sync/issues)
 
+<a href="https://slint.dev"><img src="assets/slint-attribution.png" width="160" alt="Made with Slint"></a>
+
 **Windows 10/11 x64** · **Desktop + handheld** · **Encrypted LAN** · **Offline play**
 
 <picture>
@@ -308,6 +310,7 @@ history, and protected-play checks are independent of the UI.
 - [Project license](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.txt)
 
 Original project code is MIT-licensed. Slint and other dependencies retain
-their own licenses; Slint attribution is available from the main **About**
-button. Twilight Sync is not affiliated with Nintendo or the upstream game
+their own licenses; the required Slint attribution badge appears beside the
+download links above. Third-party licenses remain available from **About**.
+Twilight Sync is not affiliated with Nintendo or the upstream game
 projects. Supply only game files you are legally entitled to use.

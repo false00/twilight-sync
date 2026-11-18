@@ -323,8 +323,10 @@ pwsh -NoProfile -File .\scripts\Generate-Notices.ps1
 ```
 
 The generator uses the Windows dependency graph and includes Slint's selected
-royalty-free desktop license text. The main About screen displays AboutSlint
-attribution. Packaging refuses stale Cargo
+royalty-free desktop license text. Slint attribution uses the license's public
+webpage option: retain the official badge beside the download links in the
+public repository README before distributing binaries without AboutSlint.
+The main About screen links to the third-party licenses. Packaging refuses stale Cargo
 manifest/lockfile notice stamps. Fingerprints normalize CRLF to LF so clean
 Windows and Linux checkouts agree; original third-party license whitespace is
 otherwise preserved.

@@ -249,6 +249,8 @@ fn slint_navigation_game_selection_and_build_gates_route_real_component_actions(
     }
     activate(&ui, "About")?;
     assert!(ui.get_about_open());
+    activate(&ui, "View third-party licenses")?;
+    assert_eq!(actions.borrow().last(), Some(&(Action::OpenLicenses, 0)));
     activate(&ui, "Devices")?;
     assert_eq!(ui.get_section(), 5);
     activate(&ui, "Done")?;

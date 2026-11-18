@@ -1407,8 +1407,6 @@ impl Engine {
                 self.install_busy = false;
                 self.source.busy = false;
                 self.source.building = false;
-                self.totk.status.updating = false;
-                self.triforce.status.updating = false;
                 ensure!(
                     self.source.game == Some(game),
                     "Unexpected source-build result"
@@ -2084,10 +2082,6 @@ impl Engine {
         self.source.sdk_setup = None;
         self.source.error = None;
         self.install_busy = true;
-        if building {
-            self.totk.status.updating = true;
-            self.triforce.status.updating = true;
-        }
         Ok(())
     }
 
@@ -3901,7 +3895,7 @@ impl Engine {
                 let result = (|| -> Result<PlayLock> {
                     ensure!(
                         self.no_transfer()
-                            && !self.install_busy
+                            && (!self.install_busy || self.source.building)
                             && !self.texture_busy
                             && !self.self_updates.preparing,
                         "A transfer or installation is active"
@@ -4782,13 +4776,13 @@ impl Engine {
     fn send_state(&mut self) -> Result<()> {
         if self.ready() {
             self.send(&Event::State {
-                hash: if self.save_valid && !self.maintenance && !self.source.building {
+                hash: if self.save_valid && !self.maintenance {
                     self.local_hash.clone()
                 } else {
                     None
                 },
-                save_ready: self.save_valid && !self.maintenance && !self.source.building,
-                game: self.game_running || self.source.building,
+                save_ready: self.save_valid && !self.maintenance,
+                game: self.game_running,
                 lock: self.settings.play_lock.clone(),
             })?;
         }
@@ -6913,18 +6907,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_and_cancelled_source_builds_unpause_games_without_selecting_or_changing_saves()
-    -> Result<()> {
+    fn failed_and_cancelled_source_builds_leave_game_state_and_saves_unchanged() -> Result<()> {
         let mut harness = Harness::new(Some(variant(1)), None)?;
         let before = harness.left.current_hash()?;
         let settings = fs::read(harness.left.root.join("settings.json"))?;
         for cancelled in [false, true] {
-            harness.left.source.game = Some(protocol::GameId::Triforce);
-            harness.left.source.busy = true;
-            harness.left.source.building = true;
-            harness.left.install_busy = true;
-            harness.left.totk.status.updating = true;
-            harness.left.triforce.status.updating = true;
+            harness
+                .left
+                .begin_source_operation(protocol::GameId::Triforce, true)?;
             let error = if cancelled {
                 anyhow::Error::new(source_build::Cancelled)
             } else {
@@ -6945,6 +6935,112 @@ mod tests {
             assert_eq!(harness.left.current_hash()?, before);
             assert_eq!(fs::read(harness.left.root.join("settings.json"))?, settings);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_builds_advertise_idle_games_and_allow_the_paired_pc_to_reserve_play() -> Result<()> {
+        for building in [
+            protocol::GameId::Dusklight,
+            protocol::GameId::Totk,
+            protocol::GameId::Triforce,
+        ] {
+            let mut h = Harness::new(Some(variant(1)), Some(variant(1)))?;
+            h.pair()?;
+            for (folder, executable, profile) in [
+                ("TotKRecomp", "totk.exe", "profile"),
+                ("Triforce", "Triforce.exe", "user"),
+            ] {
+                let directory = h.left.root.join(folder);
+                fs::create_dir_all(directory.join(profile))?;
+                fs::write(
+                    directory.join(executable),
+                    b"synthetic game, never executed",
+                )?;
+                if folder == "Triforce" {
+                    fs::write(directory.join("image.bin"), b"synthetic marker")?;
+                    fs::create_dir(directory.join("romfs"))?;
+                } else {
+                    fs::write(
+                        directory.join(profile).join("account.uid"),
+                        1_u128.to_le_bytes(),
+                    )?;
+                }
+            }
+            let before = h.left.current_hash()?;
+            h.left.begin_source_operation(building, true)?;
+            h.right.remote = None;
+            h.left.send_state()?;
+            h.pump_until(|h| h.right.remote.is_some())?;
+            let remote = h
+                .right
+                .remote
+                .as_ref()
+                .context("Missing building PC state")?;
+            assert!(!remote.game && remote.save_ready);
+            assert_eq!(remote.hash, before);
+            assert!(!h.left.totk.status.updating && !h.left.triforce.status.updating);
+            for game in [protocol::GameId::Totk, protocol::GameId::Triforce] {
+                let peer = h.right.identity.public.clone();
+                let channel = h.left.native_channel(game)?;
+                channel.bind_peer(&peer)?;
+                let frames = channel.handle(Event::LeaseRequest {
+                    token: token(),
+                    hash: channel.status.local_hash.clone(),
+                })?;
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| matches!(frame, Event::LeaseGranted { .. })),
+                    "{game:?} denied paired play during a {building:?} build"
+                );
+                assert!(matches!(
+                    channel.shared_state(),
+                    Event::State {
+                        game: false,
+                        save_ready: true,
+                        lock: Some(_),
+                        ..
+                    }
+                ));
+                assert!(channel.require_update_idle().is_err());
+            }
+            let token = token();
+            h.left.event(Event::LeaseRequest {
+                token: token.clone(),
+                hash: before.clone(),
+            })?;
+            assert!(play::matches(
+                h.left.settings.play_lock.as_ref(),
+                &h.right.identity.public,
+                &token
+            ));
+            assert_eq!(h.left.current_hash()?, before);
+            h.left.install_busy = false;
+            h.left.source.busy = false;
+            h.left.source.building = false;
+            assert!(
+                h.left.require_source_idle().is_err(),
+                "Activation ignored the paired play reservation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_real_game_still_denies_paired_play_while_a_source_build_is_active() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        h.pair()?;
+        h.left
+            .begin_source_operation(protocol::GameId::Triforce, true)?;
+        h.left.process = ProcessMonitor::for_test(true);
+        h.left.event(Event::LeaseRequest {
+            token: token(),
+            hash: h.left.local_hash.clone(),
+        })?;
+        assert!(h.left.settings.play_lock.is_none());
+        assert!(h.left.game_running);
+        assert!(h.left.source.building);
         Ok(())
     }
 

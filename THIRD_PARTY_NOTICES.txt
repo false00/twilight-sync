@@ -1,7 +1,7 @@
 Generated third-party notices for Twilight Sync.
 Manifest fingerprints use UTF-8 text with LF-normalized line endings.
-Cargo.toml SHA-256: ed312bb31f86888fac2bcedc3d79f29496e4bf77c142a93e08e22ffe9cfb159b
-Cargo.lock SHA-256: 30680892fdd6af1b9f982842483eae0c233472cf4b4663e379d64ca9909747de
+Cargo.toml SHA-256: 20c11e31b5caf0ecc94f7a4cd099032637fdfb5b6c8a4abc4fa15f7c55160df1
+Cargo.lock SHA-256: 884eda36873816c9662788951428ce541801304b80938b949f66b65ff220a193
 
 Twilight Sync - third-party notices
 ==================================
@@ -6779,7 +6779,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License
 ----------------------------------------------------------------------
 Used by:
-  twilight-sync 0.17.0 - https://crates.io/crates/twilight-sync/0.17.0
+  twilight-sync 0.17.1 - https://crates.io/crates/twilight-sync/0.17.1
 
 MIT License
 
@@ -8195,7 +8195,7 @@ the following restrictions:
 
 
 Slint and the i-slint components are used under LicenseRef-Slint-Royalty-free-2.0.
-The required AboutSlint attribution is accessible from the main About button.
+The required Slint attribution badge is displayed beside the download links at https://github.com/false00/twilight-sync.
 Source: https://github.com/slint-ui/slint/blob/v1.19.0/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md
 SPDX identifier: LicenseRef-Slint-Royalty-free-2.0
 

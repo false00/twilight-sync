@@ -23,10 +23,10 @@ try {
     $null = $text.AppendLine()
     $null = $text.AppendLine($generated)
     $null = $text.AppendLine('Slint and the i-slint components are used under LicenseRef-Slint-Royalty-free-2.0.')
-    $null = $text.AppendLine('The required AboutSlint attribution is accessible from the main About button.')
+    $null = $text.AppendLine('The required Slint attribution badge is displayed beside the download links at https://github.com/false00/twilight-sync.')
     $null = $text.AppendLine([IO.File]::ReadAllText((Join-Path $root 'assets\licenses\Slint-Royalty-Free-2.0.txt')))
     [IO.File]::WriteAllText((Join-Path $root 'THIRD_PARTY_NOTICES.txt'), $text.ToString(), [Text.UTF8Encoding]::new($false))
-    Write-Host 'Generated THIRD_PARTY_NOTICES.txt. Slint attribution is available from the app About screen.'
+    Write-Host 'Generated THIRD_PARTY_NOTICES.txt. Slint attribution is on the public project/download page.'
 } finally {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
 }

@@ -147,7 +147,7 @@ impl<'a> Runner<'a> {
             command.creation_flags(0x08000000);
         }
         #[cfg(windows)]
-        let job = crate::process_job::Job::new(None, None)?;
+        let job = crate::process_job::Job::for_source_build()?;
         let mut child = command
             .spawn()
             .with_context(|| format!("Starting {label}"))?;
