@@ -1,0 +1,994 @@
+use super::{
+    Prerequisite, Request, checkout, copy_tree,
+    runner::Runner,
+    tools::{Package, Toolset},
+};
+use crate::{
+    files::{self, ensure_safe_path},
+    protocol::GameId,
+};
+use anyhow::{Context, Result, ensure};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+const VS_URL: &str = "https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio";
+const MSYS: &str = r"C:\msys64\ucrt64";
+
+fn on_path(name: &str) -> Result<bool> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(false);
+    };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.try_exists()? && candidate.metadata()?.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn vs_dev() -> Result<Option<PathBuf>> {
+    for program_files in ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+    {
+        let root = PathBuf::from(program_files).join("Microsoft Visual Studio");
+        if !root.try_exists()? {
+            continue;
+        }
+        for year in fs::read_dir(root)? {
+            let year = year?;
+            if !year.file_type()?.is_dir() {
+                continue;
+            }
+            for edition in fs::read_dir(year.path())? {
+                let edition = edition?;
+                if !edition.file_type()?.is_dir() {
+                    continue;
+                }
+                let directory = edition.path();
+                let script = directory.join("Common7").join("Tools").join("VsDevCmd.bat");
+                let compilers = directory.join("VC").join("Tools").join("MSVC");
+                if script.is_file() && compilers.try_exists()? {
+                    for version in fs::read_dir(compilers)? {
+                        if version?
+                            .path()
+                            .join("bin")
+                            .join("Hostx64")
+                            .join("x64")
+                            .join("cl.exe")
+                            .is_file()
+                        {
+                            ensure_safe_path(&script)?;
+                            return Ok(Some(script));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn dotnet_root() -> Result<Option<PathBuf>> {
+    let mut candidates = Vec::new();
+    if let Some(root) = std::env::var_os("DOTNET_ROOT") {
+        candidates.push(PathBuf::from(root));
+    }
+    if let Some(root) = std::env::var_os("ProgramFiles") {
+        candidates.push(PathBuf::from(root).join("dotnet"));
+    }
+    for root in candidates {
+        let sdk = root.join("sdk");
+        if !root.join("dotnet.exe").is_file() || !sdk.try_exists()? {
+            continue;
+        }
+        for version in fs::read_dir(sdk)? {
+            if version?.file_name().to_string_lossy().starts_with("10.") {
+                return Ok(Some(root));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn missing_msys2_files(ucrt: &Path) -> Result<Vec<String>> {
+    let found = |relative: &Path| -> Result<bool> {
+        let path = ucrt.join(relative);
+        ensure_safe_path(&path)?;
+        Ok(path.try_exists()? && path.metadata()?.is_file())
+    };
+    let mut missing = Vec::new();
+    for relative in [
+        Path::new("bin").join("gcc.exe"),
+        Path::new("bin").join("ninja.exe"),
+        Path::new("bin").join("SDL3.dll"),
+        Path::new("include").join("vulkan").join("vulkan.h"),
+        Path::new("include").join("opus").join("opus.h"),
+        Path::new("include").join("vpx").join("vpx_decoder.h"),
+    ] {
+        if !found(&relative)? {
+            missing.push(ucrt.join(relative).display().to_string());
+        }
+    }
+    let nested = Path::new("include").join("vma").join("vk_mem_alloc.h");
+    let flat = Path::new("include").join("vk_mem_alloc.h");
+    if !found(&nested)? && !found(&flat)? {
+        missing.push(format!(
+            "{} or {}",
+            ucrt.join(nested).display(),
+            ucrt.join(flat).display()
+        ));
+    }
+    Ok(missing)
+}
+
+pub(super) fn prerequisites(game: GameId) -> Result<Vec<Prerequisite>> {
+    let mut prerequisites = vec![Prerequisite {
+        name: "Windows x64 (source builds are not sandboxed)",
+        ready: cfg!(all(windows, target_arch = "x86_64")),
+        url: "https://learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/",
+        setup: None,
+        detail: None,
+    }];
+    if game != GameId::Triforce {
+        prerequisites.push(Prerequisite {
+            name: "Visual Studio C++ Build Tools and Windows SDK",
+            ready: vs_dev()?.is_some(),
+            url: VS_URL,
+            setup: None,
+            detail: None,
+        });
+    }
+    match game {
+        GameId::Dusklight => prerequisites.push(Prerequisite {
+            name: "Rust toolchain (Aurora dependency)",
+            ready: on_path("rustc.exe")? && on_path("cargo.exe")?,
+            url: "https://www.rust-lang.org/tools/install",
+            setup: None,
+            detail: None,
+        }),
+        GameId::Totk => {
+            prerequisites.push(Prerequisite {
+                name: ".NET SDK 10 (source-built shader translator)",
+                ready: dotnet_root()?.is_some(),
+                url: "https://dotnet.microsoft.com/download/dotnet/10.0",
+                setup: Some(super::SdkSetup::DotNet10),
+                detail: None,
+            });
+            let missing = if cfg!(windows) {
+                missing_msys2_files(Path::new(MSYS))?
+            } else {
+                vec!["MSYS2 UCRT64 source-build dependencies require Windows".into()]
+            };
+            prerequisites.push(Prerequisite {
+                name: "MSYS2 UCRT64 dependencies at C:\\msys64 (one-time setup)",
+                ready: missing.is_empty(),
+                url: "https://github.com/valentderah/totk-pc-recomp/blob/main/docs/building.md#toolchain",
+                setup: Some(super::SdkSetup::Msys2Ucrt64),
+                detail: (!missing.is_empty()).then(|| format!("Missing required files: {}", missing.join("; "))),
+            });
+        }
+        GameId::Triforce => {}
+    }
+    Ok(prerequisites)
+}
+
+pub fn validate_inputs(request: &Request) -> Result<()> {
+    validate_input_paths(
+        request.plan.game,
+        &request.preference,
+        request.previous_install.as_deref(),
+    )
+}
+
+pub(super) fn validate_input_paths(
+    game: GameId,
+    preference: &super::Preference,
+    previous: Option<&Path>,
+) -> Result<()> {
+    let file = |path: Option<&Path>, label: &str| -> Result<()> {
+        let path = path.with_context(|| format!("Choose {label} before building"))?;
+        ensure_safe_path(path)?;
+        ensure!(path.is_file(), "{label} was not found");
+        Ok(())
+    };
+    match game {
+        GameId::Dusklight => {}
+        GameId::Totk => {
+            file(preference.game_input.as_deref(), "your TotK base NSP/XCI")?;
+            file(preference.update.as_deref(), "your TotK update NSP/NSZ")?;
+            file(preference.keys.as_deref(), "your console's prod.keys file")?;
+            if let Some(firmware) = &preference.firmware {
+                ensure_safe_path(firmware)?;
+                ensure!(
+                    firmware.is_dir(),
+                    "The optional firmware folder was not found"
+                );
+            }
+        }
+        GameId::Triforce => {
+            let input = input_paths(preference, previous)?;
+            ensure_safe_path(&input)?;
+            ensure!(
+                input.is_file()
+                    || (input.join("romfs").is_dir()
+                        && (input.join(".triforce_exefs").is_dir()
+                            || input.join("exefs").is_dir())),
+                "Choose your Triforce .nup or a folder with romfs and exefs/.triforce_exefs"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn triforce_input(request: &Request) -> Result<PathBuf> {
+    input_paths(&request.preference, request.previous_install.as_deref())
+}
+
+fn input_paths(preference: &super::Preference, previous: Option<&Path>) -> Result<PathBuf> {
+    if let Some(input) = &preference.game_input {
+        return Ok(input.clone());
+    }
+    let current = previous.context("Choose your own Triforce .nup or existing game folder")?;
+    ensure!(
+        current.join("romfs").is_dir() && current.join(".triforce_exefs").is_dir(),
+        "This Triforce installation has no retained build inputs; choose your own .nup or extracted game folder"
+    );
+    Ok(current.to_path_buf())
+}
+
+struct ContextData<'a> {
+    workspace: &'a Path,
+    source: &'a Path,
+    output: &'a Path,
+    paths: Vec<PathBuf>,
+}
+
+impl ContextData<'_> {
+    fn command(&self, program: &Path) -> Result<Command> {
+        let mut command = Command::new(program);
+        let mut paths = self.paths.clone();
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        command
+            .current_dir(self.source)
+            .env("PATH", std::env::join_paths(paths)?)
+            .env("UV_PYTHON_PREFERENCE", "only-managed")
+            .env("UV_PYTHON_INSTALL_DIR", self.workspace.join("python"))
+            .env("UV_CACHE_DIR", self.workspace.join("uv-cache"))
+            .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+            .env("VSCMD_SKIP_SENDTELEMETRY", "1")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_ALLOW_PROTOCOL", "https")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        Ok(command)
+    }
+
+    fn vs_command(&self, script: &str, vs: &Path, python: &Path) -> Result<Command> {
+        let windows = std::env::var_os("SystemRoot").context("SystemRoot is not available")?;
+        let mut command = self.command(&PathBuf::from(windows).join("System32").join("cmd.exe"))?;
+        command.args(["/d", "/s", "/c"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.raw_arg(script);
+        }
+        #[cfg(not(windows))]
+        command.arg(script);
+        command
+            .env("TS_VSDEV", vs)
+            .env("TS_PYTHON", python)
+            .env("TS_SOURCE", self.source)
+            .env("TS_OUTPUT", self.output);
+        Ok(command)
+    }
+}
+
+fn python(
+    context: &ContextData<'_>,
+    uv: &Path,
+    directory: &Path,
+    version: &str,
+    requirements: &[PathBuf],
+    runner: &mut Runner<'_>,
+) -> Result<PathBuf> {
+    runner.run(
+        context
+            .command(uv)?
+            .args(["venv", "--python", version])
+            .arg(directory),
+        "Preparing a fresh managed Python environment",
+    )?;
+    let python = directory.join("Scripts").join("python.exe");
+    let mut install = context.command(uv)?;
+    install.args(["pip", "install", "--python"]).arg(&python);
+    for requirement in requirements {
+        install.arg("-r").arg(requirement);
+    }
+    if !requirements.is_empty() {
+        runner.run(
+            &mut install,
+            "Installing the project's declared Python dependencies",
+        )?;
+    }
+    Ok(python)
+}
+
+fn shader_reference(source: &Path) -> Result<String> {
+    let bytes = super::read_bounded(&source.join("tools").join("fetch_refs.sh"), 64 * 1024)?;
+    let text = std::str::from_utf8(&bytes)?;
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::split_whitespace)
+        .map(Iterator::collect::<Vec<_>>)
+        .filter(|fields| {
+            fields.first() == Some(&"fetch") && fields.get(1) == Some(&"MacNativeGames")
+        })
+        .collect();
+    ensure!(
+        lines.len() == 1,
+        "The approved source has no unique shader-support reference"
+    );
+    let fields = &lines[0];
+    ensure!(
+        fields.len() == 5
+            && fields[2] == "https://github.com/ly05010419/MacNativeGames.git"
+            && super::valid_commit(fields[3])
+            && fields[4] == "history",
+        "The source's shader-support declaration changed; update the manager before building it"
+    );
+    Ok(fields[3].into())
+}
+
+fn fetch_shader_reference(source: &Path, git: &Path, runner: &mut Runner<'_>) -> Result<()> {
+    let commit = shader_reference(source)?;
+    let reference = source.join("refs").join("MacNativeGames");
+    ensure_safe_path(&reference)?;
+    fs::create_dir_all(&reference)?;
+    for (arguments, label) in [
+        (
+            vec!["init", "-q"],
+            "Preparing the pinned source shader reference",
+        ),
+        (
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ly05010419/MacNativeGames.git",
+            ],
+            "Configuring the source-only shader reference",
+        ),
+        (
+            vec!["fetch", "--no-tags", "origin", commit.as_str()],
+            "Fetching the source-pinned shader history",
+        ),
+        (
+            vec!["checkout", "--detach", commit.as_str()],
+            "Selecting the verified shader reference commit",
+        ),
+        (
+            vec!["update-ref", "refs/remotes/origin/HEAD", commit.as_str()],
+            "Binding the shader reference history",
+        ),
+    ] {
+        runner.run(
+            super::git_command(git)
+                .arg("-C")
+                .arg(&reference)
+                .args(arguments),
+            label,
+        )?;
+    }
+    Ok(())
+}
+
+fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Command> {
+    // Dev-mode layout uses the running interpreter when no embedded Python exists.
+    let python = context
+        .source
+        .join(".venv-py314")
+        .join("Scripts")
+        .join("python.exe");
+    let mut command = context.command(&python)?;
+    command
+        .args(["-B", "-m", "installer", "--root"])
+        .arg(context.source)
+        .arg("--dest")
+        .arg(context.output)
+        .arg("--base")
+        .arg(
+            request
+                .preference
+                .game_input
+                .as_ref()
+                .context("Missing TotK base game")?,
+        )
+        .arg("--update")
+        .arg(
+            request
+                .preference
+                .update
+                .as_ref()
+                .context("Missing TotK update")?,
+        )
+        .arg("--keys")
+        .arg(
+            request
+                .preference
+                .keys
+                .as_ref()
+                .context("Missing console keys file")?,
+        )
+        .env("TOTK_LIFT_JOBS", request.preference.jobs.to_string());
+    if let Some(firmware) = &request.preference.firmware {
+        command.arg("--firmware").arg(firmware);
+    }
+    Ok(command)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build(
+    request: &Request,
+    workspace: &Path,
+    source: &Path,
+    output: &Path,
+    git: &Path,
+    uv: &Path,
+    tools: &mut Toolset,
+    runner: &mut Runner<'_>,
+) -> Result<()> {
+    let mut context = ContextData {
+        workspace,
+        source,
+        output,
+        paths: vec![git.parent().context("Git tool has no directory")?.into()],
+    };
+    let allowed = request.preference.managed_tools;
+    let cancel = runner.cancel;
+    match request.plan.game {
+        GameId::Dusklight => {
+            let cmake = tools.ensure(Package::Cmake, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let ninja = tools.ensure(Package::Ninja, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            context.paths.push(
+                cmake
+                    .entry
+                    .parent()
+                    .context("CMake has no directory")?
+                    .into(),
+            );
+            context.paths.push(ninja.root.clone());
+            let python = python(&context, uv, &workspace.join("venv"), "3.14", &[], runner)?;
+            runner.run(
+                context
+                    .command(uv)?
+                    .args(["pip", "install", "--python"])
+                    .arg(&python)
+                    .arg("markupsafe"),
+                "Preparing Dusklight's resource generator",
+            )?;
+            context.paths.insert(
+                0,
+                python.parent().context("Python has no directory")?.into(),
+            );
+            let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            let mut configure = context.vs_command(
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --preset windows-msvc-relwithdebinfo \"-DCMAKE_INSTALL_PREFIX=%TS_OUTPUT%\" \"-DPython3_EXECUTABLE=%TS_PYTHON%\" \"-DCMAKE_MAKE_PROGRAM=%TS_NINJA%\"",
+                &vs, &python,
+            )?;
+            configure
+                .env("TS_CMAKE", &cmake.entry)
+                .env("TS_NINJA", &ninja.entry);
+            runner.run(
+                &mut configure,
+                "Configuring Dusklight from the approved source",
+            )?;
+            let mut compile = context.vs_command(
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --build --preset windows-msvc-relwithdebinfo --parallel %TS_JOBS%",
+                &vs, &python,
+            )?;
+            compile
+                .env("TS_CMAKE", &cmake.entry)
+                .env("TS_JOBS", request.preference.jobs.to_string());
+            runner.run(&mut compile, "Compiling Dusklight locally")?;
+            let mut install = context.vs_command(
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --install \"%TS_SOURCE%\\build\\windows-msvc-relwithdebinfo\" --prefix \"%TS_OUTPUT%\"",
+                &vs, &python,
+            )?;
+            install.env("TS_CMAKE", &cmake.entry);
+            runner.run(
+                &mut install,
+                "Staging the source-built Dusklight program and resources",
+            )?;
+        }
+        GameId::Totk => {
+            fetch_shader_reference(source, git, runner)?;
+            let llvm = tools.ensure(Package::Llvm, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let llvm_destination = source
+                .join("toolchain")
+                .join("llvm-mingw-managed")
+                .join("llvm-mingw-managed");
+            runner.message(
+                "Preparing the official compiler and installed MSYS2 development libraries...",
+            )?;
+            copy_tree(&llvm.root, &llvm_destination)?;
+            let deps = source.join("toolchain").join("deps-mingw");
+            for relative in ["include", "lib"] {
+                copy_tree(&Path::new(MSYS).join(relative), &deps.join(relative))?;
+            }
+            fs::create_dir_all(deps.join("bin"))?;
+            for entry in fs::read_dir(Path::new(MSYS).join("bin"))? {
+                let entry = entry?;
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+                {
+                    copy_tree(&entry.path(), &deps.join("bin").join(entry.file_name()))?;
+                }
+            }
+            context.paths.insert(0, Path::new(MSYS).join("bin"));
+            if let Some(dotnet) = dotnet_root()? {
+                context.paths.push(dotnet);
+            }
+            if let Some(program_files) = std::env::var_os("ProgramFiles(x86)") {
+                context.paths.push(
+                    PathBuf::from(program_files)
+                        .join("Microsoft Visual Studio")
+                        .join("Installer"),
+                );
+            }
+            let main = python(
+                &context,
+                uv,
+                &source.join(".venv"),
+                "3.12",
+                &[source.join("tools").join("requirements.txt")],
+                runner,
+            )?;
+            python(
+                &context,
+                uv,
+                &source.join(".venv-py314"),
+                "3.14",
+                &[source.join("tools").join("requirements-installer.txt")],
+                runner,
+            )?;
+            let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            for (script, label) in [
+                (
+                    "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_PYTHON%\" tools\\build_hactool.py",
+                    "Building the extraction helper from source",
+                ),
+                (
+                    "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_PYTHON%\" tools\\build_xlate.py",
+                    "Building the shader translator from source",
+                ),
+            ] {
+                runner.run(&mut context.vs_command(script, &vs, &main)?, label)?;
+            }
+            runner.run(&mut totk_installer(&context, request)?, "Compiling and preparing TotK from the checked-out source (shader preparation may open a window)")?;
+        }
+        GameId::Triforce => {
+            let llvm = tools.ensure(Package::Llvm, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let sdl2 = tools.ensure(Package::Sdl2, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let sdl3 = tools.ensure(Package::Sdl3, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let codecs = tools.ensure(Package::Ffmpeg, allowed, cancel, &mut |text| {
+                runner.message(&text)
+            })?;
+            let sdl = source.join("third_party").join("sdl2");
+            for relative in ["include", "lib"] {
+                copy_tree(&sdl2.root.join(relative), &sdl.join(relative))?;
+            }
+            copy_tree(
+                &sdl2.root.join("lib").join("x64").join("SDL2.dll"),
+                &sdl.join("SDL2.dll"),
+            )?;
+            copy_tree(&sdl3.entry, &sdl.join("SDL3.dll"))?;
+            let python = python(
+                &context,
+                uv,
+                &workspace.join("venv"),
+                "3.14",
+                &[source.join("requirements.txt")],
+                runner,
+            )?;
+            let headers = workspace.join("headers");
+            fs::create_dir_all(&headers)?;
+            let mut locations = Vec::new();
+            let mut dependency_records = Vec::new();
+            for (repository, tag, commit, name, environment) in [
+                (
+                    "KhronosGroup/Vulkan-Headers",
+                    "vulkan-sdk-1.4.363.0",
+                    "6802bb4733b63ed5efd3adb308a6c885ef180ea1",
+                    "vulkan",
+                    "HOOKSHOT_VULKAN_HEADERS",
+                ),
+                (
+                    "KhronosGroup/SPIRV-Headers",
+                    "vulkan-sdk-1.4.363.0",
+                    "496543121ce6419f23d6fa5d7194ba66c36212d2",
+                    "spirv",
+                    "HOOKSHOT_SPIRV_HEADERS",
+                ),
+                (
+                    "GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator",
+                    "v3.4.0",
+                    "3aa921224c154a0d2c43912bc88e1c42ce1f7607",
+                    "vma",
+                    "HOOKSHOT_VMA_HEADERS",
+                ),
+            ] {
+                let target = headers.join(name);
+                checkout(
+                    git,
+                    &format!("https://github.com/{repository}.git"),
+                    tag,
+                    commit,
+                    &target,
+                    false,
+                    runner,
+                )?;
+                dependency_records
+                    .push(serde_json::json!({"repository":repository,"tag":tag,"commit":commit}));
+                locations.push((environment, target));
+            }
+            files::atomic_write(
+                &workspace.join("source-dependencies.json"),
+                &serde_json::to_vec_pretty(&dependency_records)?,
+            )?;
+            let no_wgpu = workspace.join("no-webgpu");
+            fs::create_dir(&no_wgpu)?;
+            let cpm = workspace.join("cpm");
+            let ffmpeg = cpm.join("ffmpeg").join("9.0.2-av1-1-windows-amd64");
+            runner.message("Preparing required AV1 movie/audio codec libraries from the verified codec supplier archive...")?;
+            copy_tree(&codecs.root, &ffmpeg)?;
+            for library in ["avcodec.lib", "avutil.lib", "swscale.lib", "swresample.lib"] {
+                ensure!(
+                    ffmpeg.join("lib").join(library).is_file(),
+                    "Required FFmpeg library is missing: {library}"
+                );
+            }
+            let input = triforce_input(request)?;
+            let mut command = context.command(&python)?;
+            command
+                .args(triforce_arguments(
+                    &input,
+                    output,
+                    &workspace.join("work"),
+                    &request.preference,
+                )?)
+                .env("HOOKSHOT_MINGW", &llvm.root)
+                .env("HOOKSHOT_KEEP_BUILD_FILES", "1")
+                .env("WGPU_NATIVE", no_wgpu)
+                .env("RX_CPM", cpm)
+                .env("RX_RELEASE", "1");
+            if request.preference.nvidia_dlss {
+                command
+                    .env("HOOKSHOT_NGX_SDK", workspace.join("nvidia-ngx"))
+                    .env(
+                        "HOOKSHOT_STREAMLINE_SDK",
+                        workspace.join("nvidia-streamline"),
+                    );
+            }
+            for (environment, location) in locations {
+                command.env(environment, location);
+            }
+            // Vulkan is built locally; the unverified custom wgpu-native binary is not used.
+            ensure!(
+                !source
+                    .parent()
+                    .context("Source directory has no parent")?
+                    .join("HookshotBuilder-Setup.exe")
+                    .try_exists()?,
+                "Unexpected prebuilt Triforce launcher in the source workspace"
+            );
+            runner.run(&mut command, "Building Triforce and its Vulkan renderer from source (this can take an hour or more)")?;
+        }
+    }
+    Ok(())
+}
+
+fn triforce_arguments(
+    input: &Path,
+    output: &Path,
+    work: &Path,
+    preference: &super::Preference,
+) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = ["-I", "-B", "nx2/make_game.py", "--out"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    args.push(output.into());
+    args.push("--work".into());
+    args.push(work.into());
+    args.push("--jobs".into());
+    args.push(preference.jobs.to_string().into());
+    if !preference.renodx_hdr {
+        args.push("--no-renodx".into());
+    }
+    if preference.amd_fsr4 {
+        args.push("--fsr".into());
+    }
+    if preference.nvidia_dlss {
+        args.extend(
+            ["--fetch-ngx-sdk", "--accept-nvidia-license"]
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    if !preference.prepare_shaders {
+        args.push("--no-prepare-shaders".into());
+    }
+    if input.is_dir() {
+        let exefs = if input.join(".triforce_exefs").is_dir() {
+            input.join(".triforce_exefs")
+        } else {
+            input.join("exefs")
+        };
+        ensure!(
+            exefs.is_dir() && input.join("romfs").is_dir(),
+            "The selected Triforce folder has no build inputs"
+        );
+        args.push("--exefs".into());
+        args.push(exefs.into());
+        args.push("--romfs".into());
+        args.push(input.join("romfs").into());
+    } else {
+        args.push("--nup".into());
+        args.push(input.into());
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn totk_source_installer_uses_its_python314_environment_and_local_inputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let output = temp.path().join("new game");
+        let context = ContextData {
+            workspace: temp.path(),
+            source: &source,
+            output: &output,
+            paths: Vec::new(),
+        };
+        let request = Request {
+            plan: super::super::Plan {
+                game: GameId::Totk,
+                tag: "v0.4.1".into(),
+                commit: "a".repeat(40),
+                review_url: String::new(),
+            },
+            preference: super::super::Preference {
+                game_input: Some(temp.path().join("base game.nsp")),
+                update: Some(temp.path().join("update.nsp")),
+                keys: Some(temp.path().join("prod.keys")),
+                ..Default::default()
+            },
+            previous_install: None,
+            previous_executable: None,
+            approved: true,
+            log: temp.path().join("not-created.log"),
+        };
+        let command = totk_installer(&context, &request)?;
+        assert_eq!(
+            command.get_program(),
+            source
+                .join(".venv-py314")
+                .join("Scripts")
+                .join("python.exe")
+        );
+        let args: Vec<_> = command.get_args().collect();
+        for (flag, path) in [
+            ("--root", source.as_path()),
+            ("--dest", output.as_path()),
+            (
+                "--base",
+                request
+                    .preference
+                    .game_input
+                    .as_deref()
+                    .context("Missing fixture base")?,
+            ),
+            (
+                "--update",
+                request
+                    .preference
+                    .update
+                    .as_deref()
+                    .context("Missing fixture update")?,
+            ),
+            (
+                "--keys",
+                request
+                    .preference
+                    .keys
+                    .as_deref()
+                    .context("Missing fixture keys")?,
+            ),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|args| args == [flag.as_ref(), path.as_os_str()])
+            );
+        }
+        assert!(!request.log.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn msys2_detection_accepts_both_upstream_vma_layouts_and_reports_missing_dependencies()
+    -> Result<()> {
+        for nested in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let ucrt = temp.path().join("ucrt64");
+            for relative in [
+                Path::new("bin").join("gcc.exe"),
+                Path::new("bin").join("ninja.exe"),
+                Path::new("bin").join("SDL3.dll"),
+                Path::new("include").join("vulkan").join("vulkan.h"),
+                Path::new("include").join("opus").join("opus.h"),
+                Path::new("include").join("vpx").join("vpx_decoder.h"),
+            ] {
+                let path = ucrt.join(relative);
+                fs::create_dir_all(path.parent().context("Fixture file has no parent")?)?;
+                fs::write(path, b"synthetic SDK data, never executed")?;
+            }
+            let include = ucrt.join("include");
+            let header = if nested {
+                fs::create_dir(include.join("vma"))?;
+                include.join("vma").join("vk_mem_alloc.h")
+            } else {
+                include.join("vk_mem_alloc.h")
+            };
+            fs::write(&header, b"synthetic allocator header")?;
+            assert!(missing_msys2_files(&ucrt)?.is_empty());
+            let staged = temp.path().join("deps-mingw").join("include");
+            copy_tree(&include, &staged)?;
+            assert_eq!(
+                fs::read(staged.join(header.strip_prefix(&include)?))?,
+                b"synthetic allocator header"
+            );
+            fs::remove_file(ucrt.join("bin").join("SDL3.dll"))?;
+            let missing = missing_msys2_files(&ucrt)?;
+            assert_eq!(
+                missing,
+                [ucrt.join("bin").join("SDL3.dll").display().to_string()]
+            );
+            fs::remove_file(header)?;
+            let missing = missing_msys2_files(&ucrt)?;
+            assert_eq!(missing.len(), 2);
+            assert!(missing[1].contains("vk_mem_alloc.h") && missing[1].contains(" or "));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_source_builds_never_update_an_existing_installation_in_place() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let current = temp.path().join("existing game");
+        fs::create_dir_all(current.join(".triforce_exefs"))?;
+        fs::create_dir(current.join("romfs"))?;
+        let output = temp.path().join("staged output");
+        let preference = super::super::Preference {
+            renodx_hdr: false,
+            prepare_shaders: false,
+            ..Default::default()
+        };
+        let args = triforce_arguments(&current, &output, &temp.path().join("work"), &preference)?;
+        assert!(args.contains(&OsString::from("--no-prepare-shaders")));
+        assert!(args.contains(&OsString::from("--no-renodx")));
+        assert!(args.contains(&current.join(".triforce_exefs").into_os_string()));
+        assert!(args.contains(&output.into_os_string()));
+        assert!(!args.contains(&OsString::from("--update")));
+        assert!(!current.join("Triforce.exe").try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_feature_flags_keep_upstream_defaults_and_require_nvidia_opt_in() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("own-game.nup");
+        let output = temp.path().join("new-game");
+        let work = temp.path().join("work");
+        let mut preference = super::super::Preference::default();
+        let args = triforce_arguments(&input, &output, &work, &preference)?;
+        for flag in [
+            "--no-renodx",
+            "--no-prepare-shaders",
+            "--fsr",
+            "--fetch-ngx-sdk",
+            "--accept-nvidia-license",
+        ] {
+            assert!(!args.contains(&OsString::from(flag)));
+        }
+        preference.amd_fsr4 = true;
+        preference.nvidia_dlss = true;
+        let args = triforce_arguments(&input, &output, &work, &preference)?;
+        for flag in ["--fsr", "--fetch-ngx-sdk", "--accept-nvidia-license"] {
+            assert!(args.contains(&OsString::from(flag)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_game_inputs_fail_before_running_project_code() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for game in [GameId::Totk, GameId::Triforce] {
+            let request = Request {
+                plan: super::super::Plan {
+                    game,
+                    tag: "v1.0.0".into(),
+                    commit: "a".repeat(40),
+                    review_url: String::new(),
+                },
+                preference: super::super::Preference::default(),
+                previous_install: None,
+                previous_executable: None,
+                approved: true,
+                log: temp.path().join("not-created.log"),
+            };
+            assert!(validate_inputs(&request).is_err());
+            assert!(!request.log.try_exists()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn compiler_environment_and_command_share_one_process_with_quoted_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("tools and source with spaces");
+        fs::create_dir(&directory)?;
+        let script = directory.join("local environment.cmd");
+        fs::write(&script, b"@set TS_FROM_VS=ready\r\n")?;
+        let context = ContextData {
+            workspace: &directory,
+            source: &directory,
+            output: &directory,
+            paths: Vec::new(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = |_| Ok(());
+        let mut runner = Runner::new(&directory.join("test.log"), &cancel, &mut progress)?;
+        let output = runner.capture(
+            &mut context.vs_command(
+                "call \"%TS_VSDEV%\" >nul && set TS_FROM_VS",
+                &script,
+                &directory.join("not-run.exe"),
+            )?,
+            "Checking the locally authored environment fixture",
+        )?;
+        assert!(std::str::from_utf8(&output)?.contains("TS_FROM_VS=ready"));
+        Ok(())
+    }
+}

@@ -4,8 +4,9 @@
 
 **Your Zelda saves, across your desktop and handheld.**
 
-Keep your [Dusklight](https://twilitrealm.dev/) and native TotK Recomp saves in
-sync between two Windows PCs over your home network. Play offline and transfer
+Keep your [Dusklight](https://twilitrealm.dev/), native TotK Recomp, and
+[Triforce / Ocarina of Time](https://git.triforceproject.com/triforce/source)
+saves in sync between two Windows PCs over your home network. Play offline and transfer
 your progress when you reconnect. No cloud account, subscription, or
 administrator access required.
 
@@ -25,7 +26,7 @@ themes are included. No game assets or real save files are bundled.*
 - **Desktop to handheld:** pair two PCs once and sync over your home network.
 - **No connection required to play:** keep playing offline, then sync or compare
    your progress when both PCs are back online.
-- **One interface for both games:** shared Home and Games layouts, save cards,
+- **One interface for all three games:** shared Home and Games layouts, save cards,
    comparison dialogs, approvals, and on-demand history previews.
 - **See what you are choosing:** compare hearts, rupees, and play time before
    replacing a save, with verified game-specific details where available.
@@ -124,6 +125,10 @@ Play controls, reusing the running manager if necessary; it never launches the
 game directly or bypasses local save, process, and profile checks.
 Unrelated or independently modified shortcuts are not overwritten.
 
+New managed Dusklight builds are installed side-by-side under
+`%USERPROFILE%\Games\Dusklight`. Existing installations and custom executable
+selections are not moved automatically.
+
 If Windows Firewall asks, allow the app on **Private networks only**.
 Guest Wi-Fi isolation, routed VLANs, and blocked local VPN traffic may prevent
 discovery. The app does not open router ports or create public firewall rules.
@@ -141,27 +146,43 @@ their existing Dusklight protocol; TotK channels are enabled only for peers
 that advertise support.
 
 TotK is discovered at `%USERPROFILE%\Games\TotKRecomp` by default, or select
-its native `totk.exe` under **Games**. Twilight Sync does not download the game,
-game assets or console keys. A separate **Tears of the Kingdom (Twilight Sync)**
+its native `totk.exe` under **Games**. Select **Tears of the Kingdom** and choose
+**Install / update TotK Recomp**. For a first installation, select your local
+base game, supported update and console's `prod.keys` once; firmware fonts are
+optional. Twilight Sync downloads and verifies the official tools, then runs
+setup automatically. You do not need to run a separate installer or install the
+source-build SDKs. No game assets or console keys are downloaded.
+
+Fresh installations use a stable, versioned subfolder beneath
+`%USERPROFILE%\Games\TotKRecomp` and are selected automatically when verified.
+Existing custom installations with a supported `totk-install.json` receipt are
+updated in place. Saves, settings and mods are preserved; an unmanaged old folder
+is retained rather than overwritten. Play and save sync pause during setup.
+Failures retain logs and block play/sync until **Install / update TotK Recomp**
+finishes successfully. The [manual official setup](https://github.com/valentderah/totk-pc-recomp/releases/latest)
+remains an optional alternative. **Build from source** below also supports fresh
+installation using the same local input selections.
+A separate **Tears of the Kingdom (Twilight Sync)**
 desktop shortcut opens its protected Play controls in the existing manager.
 Unrelated and modified desktop shortcuts are never overwritten.
 
-The two games use the same authenticated Noise connection, bounded game-scoped
+All three games use the same authenticated Noise connection, bounded game-scoped
 protocol envelopes, common-base reconciliation rules, content-addressed history
 implementation and exclusive-play helpers. Their saves, bases, history,
 reservations and recovery state are separate. A TotK event cannot enter the
 Dusklight channel or release its lock.
 
-| Workflow | Dusklight | Native TotK Recomp |
-| --- | --- | --- |
-| Stable-save observation and safe one-sided automatic sync | Yes | Yes |
-| Different progress requires an explicit complete-branch choice | Yes | Yes |
-| Keep both branches and continue this PC, including offline | Yes | Yes |
-| Compact snapshots, retained partner branches and restore | Yes | Yes |
-| Online play grant, durable reservation, release and recovery | Yes | Yes |
-| Managed desktop shortcut and game-aware tray controls | Yes | Yes |
-| Decoded save information | Hearts, quests, play time and inventory | Hearts, rupees, stamina, play time, caption date/type and map/position for supported layouts |
-| Game-program installation and texture management | Dusklight tools | Existing native installation only |
+| Workflow | Dusklight | Native TotK Recomp | Triforce / OoT |
+| --- | --- | --- | --- |
+| Stable-save observation and safe one-sided automatic sync | Yes | Yes | Yes |
+| Different progress requires an explicit complete-branch choice | Yes | Yes | Yes |
+| Keep both branches and continue this PC, including offline | Yes | Yes | Yes |
+| Compact snapshots, retained partner branches and restore | Yes | Yes | Yes |
+| Online play grant, durable reservation, release and recovery | Yes | Yes | Yes |
+| Managed desktop shortcut and game-aware tray controls | Yes | Yes | Yes |
+| Decoded save information | Hearts, quests, play time and inventory | Hearts, rupees, stamina, play time, caption date/type and map/position for supported layouts | Hearts, rupees, play time and caption date/type for the recognized native layout |
+| Game-program installation and updates | Official releases or source builds | Official setup/updates or source builds | Source builds |
+| Texture management | Dusklight tools | Managed separately | Managed separately |
 
 Matching saves establish a common base. After playing on one PC, close the game
 and let the connected managers sync the safe one-sided change. If both PCs
@@ -212,6 +233,75 @@ path, checksum or stale-progress guards.
 **Startup is enabled by default on the first normal launch.** Turn it off in
 **Settings** or the tray menu if you prefer. The installer does not
 override a startup preference you already changed.
+
+### Native Ocarina of Time / Triforce saves
+
+Update both managers to a build with Triforce support, then select **Ocarina of
+Time** on Home, Games, or Save history. The default game folder is
+`%USERPROFILE%\Games\Triforce`; existing custom installs can be located with
+their native `Triforce.exe`. Managed launch prefers the actual game under `bin`
+when present, not the upstream Setup launcher.
+
+Triforce gets its own encrypted save channel, automatic common-base sync,
+complete-branch choices, retained history, restore, play reservations and protected
+desktop shortcut. The committed active-user save is transferred, including
+`account.sav`, `option.sav`, and each slot's progress/caption files. Graphics
+settings, mods, inactive accounts, game transaction working copies and game-owned
+backups stay local. Unfinished native commits pause sync until you launch and
+close the game normally; unknown account layouts are not guessed.
+
+Older managers keep their existing Dusklight/TotK channels; Triforce traffic is
+enabled only when the paired manager advertises support. Complete save hashes,
+slot/file counts and branch comparisons are available. The recognized native
+layout also shows hearts, rupees, play time and save date/type. Dates come from
+the game's caption, not filesystem timestamps. Unknown layouts remain explicitly
+unavailable; malformed recognized metadata fails verification. Quest, inventory,
+stamina and map details are not inferred.
+
+### Build any game from source
+
+In **Games**, each game has an **Installation method** control. Keep the official
+workflow for Dusklight/TotK, or choose **Build from source**. Triforce defaults to
+source builds rather than its publisher's Setup.
+
+1. Choose **Check source version / prerequisites** and review the exact commit.
+   The build is pinned to that stable source revision, not a moving branch.
+2. Use **Prepare / verify official tools** to approve per-user tool downloads.
+   The app verifies published SHA-256 digests and caches archives; each build
+   extracts fresh tool copies. Some SDKs require a one-time setup: Visual Studio
+   C++/Windows SDK and Rust for Dusklight; C++ tools, .NET 10 and MSYS2 UCRT64 for
+   TotK. Missing .NET/MSYS2 rows offer automatic setup after approval, or
+   **Copy setup commands**. The .NET option uses
+   `winget install --id Microsoft.DotNet.SDK.10 --exact --source winget`.
+   MSYS2 setup installs if missing, updates core packages in two fresh sessions,
+   then installs the required UCRT64 packages. Close other MSYS2 terminals first.
+3. Choose your local inputs. Dusklight compiles without game assets. TotK needs
+   your base game, supported update and console keys. Triforce can reuse a native
+   install's retained game files or use your own `.nup` / extracted game folder.
+4. Choose the worker count, accept the source/build-script warning, and select
+   **Build / update from source**. Progress, cancellation and a local build log
+   are provided. Builds are staged under your `Games` folder, preserving the
+   previous install and verifying save progress before selection.
+
+**Slower does not mean proven safer.** Local compilation reduces reliance on
+prebuilt game executables, but is **not confirmed to be safer**. Build scripts
+and dependencies run with your Windows user's permissions; this is **not a
+sandbox**. Use a separate VM for code you do not trust. Tool checksums verify
+download integrity, not the absence of malware in tools or source.
+
+Allow at least **8 GiB** free for a Dusklight build and **64 GiB** for a native
+TotK/Triforce build, plus room for copied mods/portable data. Triforce can take an
+hour or more. Workspaces and old installs are retained and can consume substantial
+disk space. No normal gameplay starts automatically; shader preparation can open
+a window. Triforce builds include and validate the Vulkan renderer and SDL
+runtimes, plus AV1/audio codec libraries from the disclosed
+[Takoroka/ffmpeg-av1 supplier](https://github.com/Takoroka/ffmpeg-av1), not
+FFmpeg.org binaries. Checksums do not prove source-to-binary safety.
+The custom WebGPU fallback is not needed for Vulkan and is excluded; the new
+folder explicitly selects Vulkan while retaining the old folder's settings.
+RenoDX HDR and shader preparation retain upstream defaults. Optional graphics
+controls offer AMD FSR 4 and NVIDIA DLSS/frame generation; NVIDIA requires explicit
+license acceptance. These options can download additional dependencies.
 
 ### App updates and stored play reservations
 
@@ -332,7 +422,7 @@ remain available.
 
 When a newer version exists, the tray shows **Update Twilight Sync to v...**:
 
-1. Stop both games and finish any save/disc-image/texture work.
+1. Stop all games and finish any save/disc-image/texture/source-build work.
 2. Choose the update action and confirm the version/download size.
 3. The app checks the published SHA-256 digest and checksum list, stages a
    verified native helper, and waits for its readiness acknowledgement.

@@ -1,7 +1,7 @@
 Generated third-party and bundled-font notices for Twilight Sync.
 Manifest fingerprints use UTF-8 text with LF-normalized line endings.
-Cargo.toml SHA-256: 9b802613d5089c2382cc8ea0b9a882c643fd55ba00dd3d1a36e28093dd0c5df7
-Cargo.lock SHA-256: 4f311ce958f2798444c3a4928f1cd16f3b2e1b0f35c31d7e7ceffa5f3ba216dc
+Cargo.toml SHA-256: 9b8cd11988c286081a194c112c7a97d362c9f88d6dd79bc5e4719b12883dcc78
+Cargo.lock SHA-256: 0a19db4c54c30716801f247c5599304450d8e4d834d87279bb2e0f0deb60e377
 
 Twilight Sync - third-party notices
 ==================================
@@ -2576,6 +2576,7 @@ MIT License
 Used by:
   bzip2 0.4.4 - https://crates.io/crates/bzip2/0.4.4
   cfg-if 1.0.5 - https://crates.io/crates/cfg-if/1.0.5
+  filetime 0.2.30 - https://crates.io/crates/filetime/0.2.30
   socket2 0.6.5 - https://crates.io/crates/socket2/0.6.5
 
 Copyright (c) 2014 Alex Crichton
@@ -5075,6 +5076,38 @@ DEALINGS IN THE SOFTWARE.
 MIT License
 ----------------------------------------------------------------------
 Used by:
+  tar 0.4.46 - https://crates.io/crates/tar/0.4.46
+
+Copyright (c) The tar-rs Project Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+MIT License
+----------------------------------------------------------------------
+Used by:
   synstructure 0.14.0 - https://crates.io/crates/synstructure/0.14.0
 
 Copyright 2016 Nika Layzell
@@ -5744,7 +5777,7 @@ SOFTWARE.
 MIT License
 ----------------------------------------------------------------------
 Used by:
-  twilight-sync 0.12.1 - https://crates.io/crates/twilight-sync/0.12.1
+  twilight-sync 0.13.0 - https://crates.io/crates/twilight-sync/0.13.0
 
 MIT License
 

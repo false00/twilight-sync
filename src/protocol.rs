@@ -23,6 +23,7 @@ const PREFACE: &[u8; 4] = b"TWP1";
 pub enum GameId {
     Dusklight,
     Totk,
+    Triforce,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,6 +328,20 @@ mod game_channel_tests {
             }
         ));
         assert!(game_packet(GameId::Dusklight, &Event::GamePacket { game, bytes }).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_appends_a_wire_id_without_reassigning_existing_games() -> Result<()> {
+        assert_eq!(postcard::to_allocvec(&GameId::Dusklight)?, [0]);
+        assert_eq!(postcard::to_allocvec(&GameId::Totk)?, [1]);
+        let packet = game_packet(GameId::Triforce, &Event::TotkRequest)?;
+        let Event::GamePacket { game, bytes } = packet else {
+            anyhow::bail!("Missing Triforce envelope");
+        };
+        assert_eq!(postcard::to_allocvec(&game)?, [2]);
+        assert!(matches!(game_event(&bytes)?, Event::TotkRequest));
+        assert!(!allowed_in_game(GameId::Dusklight, &game_event(&bytes)?));
         Ok(())
     }
 }

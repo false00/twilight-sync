@@ -314,7 +314,7 @@ fn checksum(text: &str, filename: &str) -> Result<String> {
     Ok(matches[0].to_ascii_lowercase())
 }
 
-fn validate_pe(path: &Path) -> Result<()> {
+pub(crate) fn validate_pe(path: &Path) -> Result<()> {
     let mut file = File::open(path)?;
     let length = file.metadata()?.len();
     let mut dos = [0; 64];

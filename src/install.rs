@@ -1,4 +1,7 @@
-use crate::files::{ensure_safe_path, valid_hash};
+use crate::{
+    files::{ensure_safe_path, valid_hash},
+    protocol::GameId,
+};
 use anyhow::{Context, Result, ensure};
 use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
@@ -7,12 +10,15 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+const MAX_TOTK_DOWNLOAD: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
 const OFFICIAL_REPOSITORY: &str = "https://github.com/TwilitRealm/dusklight/releases/download/";
+const TOTK_REPOSITORY: &str = "https://github.com/valentderah/totk-pc-recomp/releases/download/";
 
 #[derive(Deserialize)]
 struct Release {
@@ -41,7 +47,7 @@ pub struct ReleaseInfo {
     pub size: u64,
     pub sha256: String,
     pub asset: String,
-    url: String,
+    pub(crate) url: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +66,17 @@ struct Receipt {
     archive_sha256: String,
     executable: PathBuf,
     files: Vec<InstalledFile>,
+}
+
+pub fn default_directory(game: GameId) -> Result<PathBuf> {
+    let home = directories::UserDirs::new().context("Cannot find the user Games directory")?;
+    let directory = home.home_dir().join("Games").join(match game {
+        GameId::Dusklight => "Dusklight",
+        GameId::Totk => "TotKRecomp",
+        GameId::Triforce => "Triforce",
+    });
+    ensure_safe_path(&directory)?;
+    Ok(directory)
 }
 
 fn allowed_download_url(url: &reqwest::Url) -> bool {
@@ -100,28 +117,38 @@ pub(crate) fn official_client() -> Result<Client> {
 }
 
 pub fn latest_release() -> Result<ReleaseInfo> {
-    release_with(&official_client()?)
+    release_with(&official_client()?, GameId::Dusklight)
 }
 
-fn release_with(client: &Client) -> Result<ReleaseInfo> {
+pub fn latest_totk_release() -> Result<ReleaseInfo> {
+    release_with(&official_client()?, GameId::Totk)
+}
+
+fn release_with(client: &Client, game: GameId) -> Result<ReleaseInfo> {
+    let url = match game {
+        GameId::Dusklight => "https://api.github.com/repos/TwilitRealm/dusklight/releases/latest",
+        GameId::Totk => "https://api.github.com/repos/valentderah/totk-pc-recomp/releases/latest",
+        GameId::Triforce => {
+            anyhow::bail!("Triforce is built from source; use its source-build controls")
+        }
+    };
     let metadata = client
-        .get("https://api.github.com/repos/TwilitRealm/dusklight/releases/latest")
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()?
         .error_for_status()?;
     ensure!(
-        metadata.url().as_str()
-            == "https://api.github.com/repos/TwilitRealm/dusklight/releases/latest",
+        metadata.url().as_str() == url,
         "Unexpected release metadata redirect"
     );
     let mut bytes = Vec::new();
     metadata.take(128 * 1024 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 128 * 1024, "Release metadata exceeds limit");
     let release: Release = serde_json::from_slice(&bytes)?;
-    validate_release(release)
+    validate_release(release, game)
 }
 
-fn validate_release(release: Release) -> Result<ReleaseInfo> {
+fn validate_release(release: Release, game: GameId) -> Result<ReleaseInfo> {
     ensure!(
         !release.tag_name.is_empty()
             && release.tag_name.len() <= 48
@@ -131,23 +158,49 @@ fn validate_release(release: Release) -> Result<ReleaseInfo> {
                 .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
         "Unsafe release tag"
     );
-    #[cfg(target_arch = "x86_64")]
-    let suffix = "-win32-x86_64.zip";
-    #[cfg(target_arch = "aarch64")]
-    let suffix = "-win32-arm64.zip";
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    anyhow::bail!("This CPU architecture is not supported by the official Windows installer");
-    let expected_name = format!("Dusklight-{}{}", release.tag_name, suffix);
+    let (expected_name, repository, max_download) = match game {
+        GameId::Dusklight => {
+            let arch = match std::env::consts::ARCH {
+                "x86_64" => "x86_64",
+                "aarch64" => "arm64",
+                _ => anyhow::bail!(
+                    "This CPU architecture is not supported by the official Windows installer"
+                ),
+            };
+            (
+                format!("Dusklight-{}-win32-{arch}.zip", release.tag_name),
+                OFFICIAL_REPOSITORY,
+                MAX_DOWNLOAD,
+            )
+        }
+        GameId::Totk => {
+            ensure!(
+                cfg!(target_arch = "x86_64"),
+                "The official TotK Recomp Windows installer requires an x86-64 CPU"
+            );
+            let version = release
+                .tag_name
+                .strip_prefix('v')
+                .unwrap_or(&release.tag_name);
+            semver::Version::parse(version).context("Invalid TotK release version")?;
+            (
+                format!("TotK-Setup-{version}-windows.zip"),
+                TOTK_REPOSITORY,
+                MAX_TOTK_DOWNLOAD,
+            )
+        }
+        GameId::Triforce => anyhow::bail!("Triforce does not use a prebuilt game release"),
+    };
     let asset = release
         .assets
         .iter()
         .find(|a| a.name == expected_name)
         .context("Official Windows release asset was not found")?;
     ensure!(
-        asset.size > 0 && asset.size <= MAX_DOWNLOAD,
+        asset.size > 0 && asset.size <= max_download,
         "Release archive exceeds download limit"
     );
-    let expected_url = format!("{OFFICIAL_REPOSITORY}{}/{}", release.tag_name, asset.name);
+    let expected_url = format!("{repository}{}/{}", release.tag_name, asset.name);
     ensure!(
         asset.browser_download_url == expected_url,
         "Asset URL is not in the official repository"
@@ -167,7 +220,7 @@ fn validate_release(release: Release) -> Result<ReleaseInfo> {
     })
 }
 
-fn digest_file(path: &Path, expected: u64) -> Result<String> {
+pub(crate) fn digest_file(path: &Path, expected: u64) -> Result<String> {
     ensure_safe_path(path)?;
     let mut file = File::open(path)?;
     ensure!(
@@ -275,21 +328,36 @@ fn verify_receipt(root: &Path, release: &ReleaseInfo) -> Result<PathBuf> {
     Ok(root.join(receipt.executable))
 }
 
-pub fn selected_release(root: &Path, executable: Option<&Path>) -> Result<Option<String>> {
+pub fn selected_release(
+    root: &Path,
+    install_directory: &Path,
+    executable: Option<&Path>,
+) -> Result<Option<String>> {
     let Some(executable) = executable else {
         return Ok(None);
     };
-    let apps = root.join("apps");
-    if !executable.starts_with(&apps) {
+    let legacy = root.join("apps");
+    let Some(directory) = [install_directory, legacy.as_path()]
+        .into_iter()
+        .find(|directory| executable.starts_with(directory))
+    else {
         return Ok(None);
-    }
-    let relative = executable.strip_prefix(&apps)?;
+    };
+    let relative = executable.strip_prefix(directory)?;
     let Some(std::path::Component::Normal(version)) = relative.components().next() else {
         return Ok(None);
     };
-    let receipt = apps.join(version).join("twilight-install.json");
+    let receipt = directory.join(version).join("twilight-install.json");
     ensure_safe_path(&receipt)?;
     if !receipt.try_exists()? {
+        let source_receipt = directory.join(version).join("twilight-source.json");
+        ensure_safe_path(&source_receipt)?;
+        if source_receipt.try_exists()? {
+            return Ok(Some(crate::source_build::selected_version(
+                &source_receipt,
+                GameId::Dusklight,
+            )?));
+        }
         return Ok(Some(format!(
             "{} (legacy install)",
             version.to_string_lossy()
@@ -304,13 +372,12 @@ pub fn selected_release(root: &Path, executable: Option<&Path>) -> Result<Option
     Ok(Some(receipt.tag))
 }
 
-pub fn install_official(root: &Path) -> Result<Installed> {
+pub fn install_official(directory: &Path) -> Result<Installed> {
     let client = official_client()?;
-    let release = release_with(&client)?;
-    let apps = root.join("apps");
-    ensure_safe_path(&apps)?;
-    fs::create_dir_all(&apps)?;
-    let destination = apps.join(format!("{}-{}", release.tag, &release.sha256[..12]));
+    let release = release_with(&client, GameId::Dusklight)?;
+    ensure_safe_path(directory)?;
+    fs::create_dir_all(directory)?;
+    let destination = directory.join(format!("{}-{}", release.tag, &release.sha256[..12]));
     ensure_safe_path(&destination)?;
     if destination.try_exists()? {
         let executable = verify_receipt(&destination, &release)?;
@@ -323,9 +390,53 @@ pub fn install_official(root: &Path) -> Result<Installed> {
     }
     let staging = tempfile::Builder::new()
         .prefix("install-")
-        .tempdir_in(&apps)?;
+        .tempdir_in(directory)?;
     let archive_path = staging.path().join("release.zip");
-    let mut archive_file = File::create(&archive_path)?;
+    download_archive(&client, &release, &archive_path)?;
+    let unpack = staging.path().join("unpacked");
+    fs::create_dir(&unpack)?;
+    let relative_executable = extract_archive(&archive_path, &unpack)?;
+    ensure!(
+        !unpack.join("twilight-install.json").try_exists()?,
+        "Release archive uses the updater's reserved receipt name"
+    );
+    let receipt = Receipt {
+        version: 1,
+        tag: release.tag.clone(),
+        archive_sha256: release.sha256.clone(),
+        executable: relative_executable.clone(),
+        files: installation_files(&unpack)?,
+    };
+    crate::files::atomic_write(
+        &unpack.join("twilight-install.json"),
+        &serde_json::to_vec(&receipt)?,
+    )?;
+    ensure_safe_path(&destination)?;
+    fs::rename(&unpack, &destination).context("Committing verified Dusklight installation")?;
+    Ok(Installed {
+        executable: destination.join(relative_executable),
+        tag: release.tag,
+        sha256: release.sha256,
+        reused: false,
+    })
+}
+
+pub(crate) fn download_archive(client: &Client, release: &ReleaseInfo, path: &Path) -> Result<()> {
+    download_archive_cancel(client, release, path, &AtomicBool::new(false))
+}
+
+pub(crate) fn download_archive_cancel(
+    client: &Client,
+    release: &ReleaseInfo,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    ensure!(
+        !cancel.load(Ordering::Acquire),
+        "Release download cancelled"
+    );
+    ensure_safe_path(path)?;
+    let mut archive_file = File::create_new(path)?;
     let mut response = client.get(&release.url).send()?.error_for_status()?;
     ensure!(
         allowed_download_url(response.url()),
@@ -335,6 +446,10 @@ pub fn install_official(root: &Path) -> Result<Installed> {
     let mut buffer = [0; 64 * 1024];
     let mut total = 0_u64;
     loop {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "Release download cancelled"
+        );
         let count = response.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -351,43 +466,49 @@ pub fn install_official(root: &Path) -> Result<Installed> {
     ensure!(total == release.size, "Release download was truncated");
     let hash = hex::encode(sha.finalize());
     ensure!(hash == release.sha256, "Release archive SHA-256 mismatch");
-    drop(archive_file);
-    let unpack = staging.path().join("unpacked");
-    fs::create_dir(&unpack)?;
-    let relative_executable = extract_archive(&archive_path, &unpack)?;
-    ensure!(
-        !unpack.join("twilight-install.json").try_exists()?,
-        "Release archive uses the updater's reserved receipt name"
-    );
-    let receipt = Receipt {
-        version: 1,
-        tag: release.tag.clone(),
-        archive_sha256: hash.clone(),
-        executable: relative_executable.clone(),
-        files: installation_files(&unpack)?,
-    };
-    crate::files::atomic_write(
-        &unpack.join("twilight-install.json"),
-        &serde_json::to_vec(&receipt)?,
-    )?;
-    ensure_safe_path(&destination)?;
-    fs::rename(&unpack, &destination).context("Committing verified Dusklight installation")?;
-    Ok(Installed {
-        executable: destination.join(relative_executable),
-        tag: release.tag,
-        sha256: hash,
-        reused: false,
-    })
+    Ok(())
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf> {
+    extract_package(archive, destination, "dusklight.exe", 512, MAX_EXPANDED)
+}
+
+pub(crate) fn extract_package(
+    archive: &Path,
+    destination: &Path,
+    executable_name: &str,
+    max_entries: usize,
+    max_expanded: u64,
+) -> Result<PathBuf> {
+    let files = extract_files(archive, destination, max_entries, max_expanded)?;
+    let mut executables = files.into_iter().filter(|relative| {
+        relative
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(executable_name))
+    });
+    let executable = executables
+        .next()
+        .with_context(|| format!("Official release did not contain {executable_name}"))?;
+    ensure!(
+        executables.next().is_none(),
+        "Release contains multiple {executable_name} executables"
+    );
+    Ok(executable)
+}
+
+pub(crate) fn extract_files(
+    archive: &Path,
+    destination: &Path,
+    max_entries: usize,
+    max_expanded: u64,
+) -> Result<Vec<PathBuf>> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
     ensure!(
-        zip.len() <= 512,
+        zip.len() <= max_entries,
         "Release archive contains too many entries"
     );
     let mut total = 0_u64;
-    let mut executable = None;
+    let mut files = Vec::new();
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
         ensure!(entry.name().len() <= 180, "Archive path is too long");
@@ -404,7 +525,7 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf> {
             .checked_add(entry.size())
             .context("Archive size overflow")?;
         ensure!(
-            total <= MAX_EXPANDED && entry.size() <= MAX_DOWNLOAD,
+            total <= max_expanded && entry.size() <= MAX_DOWNLOAD,
             "Archive expansion limit exceeded"
         );
         let path = destination.join(&relative);
@@ -419,23 +540,14 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf> {
             let copied = std::io::copy(&mut entry.by_ref().take(expected + 1), &mut output)?;
             ensure!(copied == expected, "Archive entry length mismatch");
             output.sync_all()?;
-            if relative
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("dusklight.exe"))
-            {
-                ensure!(
-                    executable.is_none(),
-                    "Release contains multiple Dusklight executables"
-                );
-                executable = Some(relative);
-            }
+            files.push(relative);
         }
     }
-    executable.context("Official release did not contain dusklight.exe")
+    Ok(files)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn release_fixture() -> Release {
@@ -456,18 +568,59 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn totk_metadata() -> Release {
+        let name = "TotK-Setup-0.4.1-windows.zip";
+        Release {
+            tag_name: "v0.4.1".into(),
+            assets: vec![Asset {
+                name: name.into(),
+                browser_download_url: format!("{TOTK_REPOSITORY}v0.4.1/{name}"),
+                size: 300 * 1024 * 1024,
+                digest: Some(format!("sha256:{}", "b".repeat(64))),
+            }],
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn totk_release_fixture() -> Result<ReleaseInfo> {
+        validate_release(totk_metadata(), GameId::Totk)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn totk_releases_require_the_exact_windows_setup_and_its_published_digest() -> Result<()> {
+        let release = totk_release_fixture()?;
+        assert_eq!(release.asset, "TotK-Setup-0.4.1-windows.zip");
+        assert_eq!(release.tag, "v0.4.1");
+        let mut bad = totk_metadata();
+        bad.assets[0].browser_download_url =
+            format!("{OFFICIAL_REPOSITORY}v0.4.1/TotK-Setup-0.4.1-windows.zip");
+        assert!(validate_release(bad, GameId::Totk).is_err());
+        let mut bad = totk_metadata();
+        bad.assets[0].digest = None;
+        assert!(validate_release(bad, GameId::Totk).is_err());
+        let mut bad = totk_metadata();
+        bad.assets[0].name = "TotK-Setup-0.4.1-x86_64.AppImage".into();
+        assert!(validate_release(bad, GameId::Totk).is_err());
+        let mut bad = totk_metadata();
+        bad.assets[0].size = MAX_TOTK_DOWNLOAD + 1;
+        assert!(validate_release(bad, GameId::Totk).is_err());
+        Ok(())
+    }
+
     #[test]
     fn latest_release_requires_the_official_asset_url_and_published_digest() -> Result<()> {
-        let plan = validate_release(release_fixture())?;
+        let plan = validate_release(release_fixture(), GameId::Dusklight)?;
         assert_eq!(plan.tag, "v9.9.9");
         assert_eq!(plan.sha256, "a".repeat(64));
         let mut bad = release_fixture();
         bad.assets[0].browser_download_url =
             "https://github.com/other/project/releases/download/bad.zip".into();
-        assert!(validate_release(bad).is_err());
+        assert!(validate_release(bad, GameId::Dusklight).is_err());
         let mut bad = release_fixture();
         bad.assets[0].digest = None;
-        assert!(validate_release(bad).is_err());
+        assert!(validate_release(bad, GameId::Dusklight).is_err());
         Ok(())
     }
 
@@ -476,7 +629,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let executable = temp.path().join("dusklight.exe");
         crate::files::atomic_write(&executable, b"synthetic test file, never executed")?;
-        let plan = validate_release(release_fixture())?;
+        let plan = validate_release(release_fixture(), GameId::Dusklight)?;
         let receipt = Receipt {
             version: 1,
             tag: plan.tag.clone(),
@@ -499,7 +652,7 @@ mod tests {
     #[test]
     fn receipt_paths_cannot_escape_the_managed_install() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let plan = validate_release(release_fixture())?;
+        let plan = validate_release(release_fixture(), GameId::Dusklight)?;
         for path in [
             PathBuf::from("..").join("dusklight.exe"),
             PathBuf::from(r"\Windows\dusklight.exe"),
@@ -525,20 +678,66 @@ mod tests {
     }
 
     #[test]
+    fn selected_releases_recognize_games_and_legacy_directories_without_moving_files() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("manager");
+        let games = temp.path().join("Games").join("Dusklight");
+        for (directory, tag) in [
+            (root.join("apps").join("v1.0.0-legacy"), "v1.0.0"),
+            (games.join("v2.0.0-current"), "v2.0.0"),
+        ] {
+            fs::create_dir_all(&directory)?;
+            let executable = directory.join("dusklight.exe");
+            fs::write(&executable, b"never executed or moved")?;
+            let receipt = Receipt {
+                version: 1,
+                tag: tag.into(),
+                archive_sha256: "a".repeat(64),
+                executable: PathBuf::from("dusklight.exe"),
+                files: installation_files(&directory)?,
+            };
+            crate::files::atomic_write(
+                &directory.join("twilight-install.json"),
+                &serde_json::to_vec(&receipt)?,
+            )?;
+            assert_eq!(
+                selected_release(&root, &games, Some(&executable))?.as_deref(),
+                Some(tag)
+            );
+            assert_eq!(fs::read(&executable)?, b"never executed or moved");
+        }
+        assert!(
+            selected_release(
+                &root,
+                &games,
+                Some(&temp.path().join("custom").join("dusklight.exe"))
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "Downloads the official public release into an isolated temporary directory"]
     fn official_release_installs_and_reuses_in_an_isolated_directory() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let first = install_official(temp.path())?;
+        let root = temp.path().join("manager");
+        let directory = temp.path().join("Games").join("Dusklight");
+        let first = install_official(&directory)?;
         ensure!(
-            first.executable.is_file() && !first.reused,
+            first.executable.is_file()
+                && first.executable.starts_with(&directory)
+                && !first.reused
+                && !root.join("apps").try_exists()?,
             "Official release was not installed"
         );
         ensure!(
-            selected_release(temp.path(), Some(&first.executable))?.as_deref()
+            selected_release(&root, &directory, Some(&first.executable))?.as_deref()
                 == Some(first.tag.as_str()),
             "Installed version receipt differs"
         );
-        let second = install_official(temp.path())?;
+        let second = install_official(&directory)?;
         ensure!(
             second.reused && second.executable == first.executable && second.sha256 == first.sha256,
             "Existing official build was not verified and reused"

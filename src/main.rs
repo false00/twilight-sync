@@ -21,6 +21,7 @@ fn main() {
                 || a == "--apply-update"
                 || a == twilight_sync::desktop::OPEN_ARGUMENT
                 || a == twilight_sync::desktop::OPEN_TOTK_ARGUMENT
+                || a == twilight_sync::desktop::OPEN_TRIFORCE_ARGUMENT
         }) {
             rfd::MessageDialog::new()
                 .set_title("Twilight Sync - action needed")
@@ -60,9 +61,22 @@ fn run() -> Result<()> {
             "Twilight Sync\n\n  twilight-sync                 Open the native dashboard and tray\n  twilight-sync --background    Start in the tray (Windows startup)\n  twilight-sync --open-dusklight Open protected Play controls, reusing the running manager\n  twilight-sync --check-save-location\n                                Show the automatically detected Dusklight save\n  twilight-sync --check-save PATH\n                                Validate a GCI or raw-card save without changes\n  twilight-sync --check-iso PATH\n                                Verify your unmodified GameCube ISO or RVZ\n  twilight-sync --check-network Check the current router without trusting it\n  twilight-sync --check-updates Check official Dusklight release metadata\n  twilight-sync --check-app-updates\n                                Check Twilight Sync's own release metadata\n  twilight-sync --licenses      Print embedded project/dependency licenses\n\nThe first desktop launch enables Windows startup by default. No LAN is trusted automatically. App update checks are optional; installation requires approval."
         );
         println!(
-            "\nTotK saves:\n  twilight-sync --open-totk       Open protected TotK Play controls\n  twilight-sync --check-totk-save\n  twilight-sync --export-totk-save ABSOLUTE_PATH\n  twilight-sync --import-totk-save ABSOLUTE_PATH --expected HASH|missing\n\nChoose a game on Home, Games, or Save history. Both updated PCs share the encrypted protocol, safe automatic sync, branch choices, compact history and game-scoped play protection."
+            "\nNative games and source builds:\n  twilight-sync --open-totk       Open protected TotK Play controls\n  twilight-sync --open-triforce   Open protected Ocarina of Time controls\n  twilight-sync --check-totk-updates\n                                 Check official TotK Recomp release metadata\n  twilight-sync --check-source-updates dusklight|totk|triforce\n                                 Check a stable source tag and full commit; executes no upstream code\n  twilight-sync --check-triforce-save\n  twilight-sync --check-totk-save\n  twilight-sync --export-totk-save ABSOLUTE_PATH\n  twilight-sync --import-totk-save ABSOLUTE_PATH --expected HASH|missing\n\nChoose a game on Home, Games, or Save history. Updated PCs share the encrypted protocol, safe automatic sync, branch choices, compact history and game-scoped play protection. Source builds require separate approval and are not confirmed to be safer."
         );
         return Ok(());
+    }
+    #[cfg(windows)]
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == twilight_sync::desktop::OPEN_TRIFORCE_ARGUMENT)
+    {
+        if arguments.next().is_some() {
+            bail!("Unexpected desktop shortcut arguments");
+        }
+        if twilight_sync::ui::open_triforce_controls()? {
+            return Ok(());
+        }
+        return twilight_sync::ui::run_triforce(twilight_sync::runtime::start()?);
     }
     #[cfg(windows)]
     if first
@@ -95,6 +109,84 @@ fn run() -> Result<()> {
             bail!("Unexpected extra arguments");
         }
         println!("{PROJECT_LICENSE}\n\n{DEPENDENCY_NOTICES}");
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--check-source-updates")
+    {
+        let game = arguments
+            .next()
+            .context("Choose dusklight, totk or triforce")?;
+        let game = match game.to_str().context("Game name must be UTF-8")? {
+            "dusklight" => twilight_sync::protocol::GameId::Dusklight,
+            "totk" => twilight_sync::protocol::GameId::Totk,
+            "triforce" => twilight_sync::protocol::GameId::Triforce,
+            _ => bail!("Choose dusklight, totk or triforce"),
+        };
+        if arguments.next().is_some() {
+            bail!("Unexpected source-check arguments");
+        }
+        let (plan, prerequisites) = twilight_sync::source_build::check(game)?;
+        println!(
+            "SOURCE RELEASE\nGame: {game:?}\nTag: {}\nCommit: {}\nReview: {}",
+            plan.tag, plan.commit, plan.review_url
+        );
+        for prerequisite in prerequisites {
+            println!(
+                "{}: {} ({})",
+                prerequisite.name,
+                if prerequisite.ready {
+                    "found"
+                } else {
+                    "setup needed"
+                },
+                prerequisite.url
+            );
+            if let Some(detail) = prerequisite.detail {
+                println!("  {detail}");
+            }
+        }
+        println!("No project code, build tools or game were executed. No settings were changed.");
+        return Ok(());
+    }
+    if first
+        .as_deref()
+        .is_some_and(|argument| argument == "--check-triforce-save")
+    {
+        if arguments.next().is_some() {
+            bail!("Triforce save discovery does not accept a custom profile");
+        }
+        twilight_sync::triforce::ensure_stopped()?;
+        let profile = twilight_sync::triforce::default_install()?.join("user");
+        let save = twilight_sync::triforce::snapshot(&profile)?;
+        let summary = save
+            .as_ref()
+            .map(|save| twilight_sync::triforce::summary(&save.bytes))
+            .transpose()?;
+        let slots: Vec<_> = summary
+            .as_ref()
+            .into_iter()
+            .flat_map(|summary| summary.slots.iter())
+            .map(|slot| {
+                serde_json::json!({
+                    "slot": slot.number + 1, "files": slot.files, "bytes": slot.bytes,
+                    "sha256": slot.hash, "details": slot.details,
+                    "details_unavailable": slot.details_error,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "game": "triforce", "profile": profile, "hash": save.as_ref().map(|save| &save.hash),
+                "files": save.as_ref().map_or(0, |save| save.files),
+                "bytes": save.as_ref().map_or(0, |save| save.bytes.len()),
+                "slots": slots,
+                "decoded_details_available": summary.as_ref().is_some_and(|summary| summary.slots.iter().any(|slot| slot.details.is_some())),
+                "changed": false,
+            })
+        );
         return Ok(());
     }
     if first
@@ -253,13 +345,26 @@ fn run() -> Result<()> {
         println!("UI_SMOKE_OK");
         return Ok(());
     }
-    if first.as_deref().is_some_and(|a| a == "--check-updates") {
+    if first
+        .as_deref()
+        .is_some_and(|a| a == "--check-updates" || a == "--check-totk-updates")
+    {
         if arguments.next().is_some() {
             bail!("Unexpected extra arguments");
         }
-        let release = twilight_sync::install::latest_release()?;
+        let (name, release) = if first
+            .as_deref()
+            .is_some_and(|a| a == "--check-totk-updates")
+        {
+            (
+                "TOTK RECOMP",
+                twilight_sync::install::latest_totk_release()?,
+            )
+        } else {
+            ("DUSKLIGHT", twilight_sync::install::latest_release()?)
+        };
         println!(
-            "OFFICIAL DUSKLIGHT RELEASE\nVersion: {}\nAsset: {}\nSize: {}\nSHA-256: {}\nNo program or settings were changed.",
+            "OFFICIAL {name} RELEASE\nVersion: {}\nAsset: {}\nSize: {}\nSHA-256: {}\nNo program or settings were changed.",
             release.tag, release.asset, release.size, release.sha256
         );
         return Ok(());

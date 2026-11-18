@@ -35,6 +35,9 @@ It does not include game assets, saves, disc images, or a copy of Dusklight.
 | Private audit trail | Rotating JSON-lines logs under your home `.twilight-sync` directory |
 | Optional disc transfer | Separate, disabled-by-default, per-transfer consent for verified GameCube ISO / RVZ images |
 | Dusklight updates | Check the latest official release; install/update side-by-side and verify existing managed files before reuse |
+| TotK Recomp updates | Verify the official setup and automatically rebuild an existing native installation, with play and save sync paused |
+| Source builds | Stable-tag/commit review, approved official tool archives, per-game local inputs and side-by-side builds for Dusklight, TotK and Triforce |
+| Triforce saves | Separate native save channel with common-base sync, branches, history, restore and durable protected play |
 | Texture library | Creator-download workflow for Henriko's 4K/1080p packs, authorized local HD imports, and safe per-user switching |
 
 **v0.2 targets Windows 10/11 and one partner per device.** There is no multi-device
@@ -456,8 +459,8 @@ local-only networking:
 - Extraction rejects traversal, links, special files, unsafe Windows names,
   duplicate destinations, more than 512 entries, oversized paths, and expansion
   beyond 512 MiB.
-- The verified installation is moved into the private application's `apps`
-  directory and selected locally. **It is not automatically run.**
+- The verified installation is moved into `%USERPROFILE%\Games\Dusklight`
+  and selected locally. **It is not automatically run.**
 - Each release gets a version-and-archive-hash directory, so updating does not
   overwrite an existing executable or change the game profile, texture selection,
   save path, pairing, or play lock.
@@ -465,12 +468,197 @@ local-only networking:
   Selecting an already-installed build rechecks the receipt and file inventory;
   changed or untracked files cause an explicit error instead of being overwritten.
   Earlier v0.1 installs are left intact; the updater creates a separate managed build.
+- Older builds under `.twilight-sync\apps` remain recognized and are never moved
+  automatically. New installs and updates use the user's `Games\Dusklight`
+  directory; existing custom selections remain unchanged until explicitly replaced.
 
 The published digest is integrity metadata obtained from GitHub over HTTPS, not
 an independent publisher signature. This flow still trusts the official
 repository, release account, GitHub, and certificate infrastructure. It does not
 claim to detect a compromised upstream release. Existing installations can
 instead be selected with **Locate dusklight.exe**.
+
+### Automatic TotK Recomp updates
+
+On **Games**, select **Tears of the Kingdom**, locate the existing native
+installation if necessary, then choose **Install / update TotK Recomp**. **Check latest
+release** only retrieves metadata. Like Dusklight's updater, these are explicit
+Internet exceptions; there is no scheduled or unapproved game-program installation.
+
+For a clean install, select the local base game, supported update and console
+keys in Games, then choose **Install / update TotK Recomp**. Setup runs
+automatically using its bundled tools, without the separate source-build SDKs.
+The missing-installation action opens this managed setup rather than redirecting
+to a download. **Download official TotK Recomp setup** remains an optional manual
+alternative. Existing custom install folders are respected; updates do not move them.
+
+- Metadata comes from
+  `api.github.com/repos/valentderah/totk-pc-recomp/releases/latest`. Only the exact
+  `TotK-Setup-<version>-windows.zip` asset from that repository/tag is accepted.
+  The published SHA-256 digest, HTTPS and GitHub redirect allowlist are required.
+- Downloads are bounded to 512 MiB. Extraction uses the same path/link checks as
+  Dusklight, with a separate 16,384-entry and 2 GiB expansion limit for the
+  bundled compiler, runtime and Python. The setup's `VERSION` must match the release.
+- **This runs the verified upstream installer**, unlike Dusklight's side-by-side
+  binary installation. Its bundled Python runs `-m installer --dest <folder>
+  --root <verified setup folder>` without a shell or system Python dependency.
+  The game executable and shaders are rebuilt in place; shader preparation can
+  briefly open a window. Both games must be stopped and pending transfers,
+  reservations and recovery completed before updating.
+- Existing installations with a supported `totk-install.json` receipt update in
+  place. Without that receipt, local inputs are required before any download.
+  First setup adds `--base`, `--update`, `--keys` and optional `--firmware`, and
+  uses a stable `Games\TotKRecomp\release-<tag>-<sha>-<id>\game` target. It is not
+  prepopulated or renamed because upstream rebuild commands can embed its path.
+  Existing profile/mods/fonts/settings are copied and saves verified before the
+  new executable is selected. Unmanaged previous files are not overwritten.
+  No game assets, console keys or optional DLSS library are downloaded by this flow.
+- TotK play, incoming saves and automatic synchronization pause while rebuilding;
+  the partner receives an unavailable game state. A normal successful setup exit,
+  its final success event, the resulting executable and the exact installed
+  version are checked. The committed save must still match its pre-update hash.
+  The upstream setup preserves settings and mods, including its language-code
+  normalization when updating an older configuration.
+- Private pending-install metadata under the manager root blocks play/save sync
+  for the requested and staged folders after a restart. Legacy game-folder
+  update markers are also recognized. Failures retain installer logs.
+  Retry **Install / update TotK Recomp** to resume at the same target;
+  only verified success clears the marker.
+  Newer installed versions are never silently downgraded.
+- Verified setup folders, logs and build caches remain under
+  `.twilight-sync\apps\totk`; the game's mod-rebuild command needs that setup to
+  remain available. They consume additional disk space and are not automatically
+  pruned. Failed program rebuilds are resumable, not atomic program rollbacks.
+
+## Source builds: one workflow for all games
+
+**Games > Installation method > Build from source** uses the same check, setup,
+input, consent, build/log and cancellation controls for all three games.
+Dusklight/TotK retain their official-release/setup option. Triforce is built from
+source; the manager does not invoke its publisher's Setup.
+
+Source builds are slower and **not confirmed to be safer**. They reduce reliance
+on prebuilt game executables, not on all prebuilt software. The code, build scripts
+and dependencies run as the user, outside a sandbox. For code you do not trust,
+build and run it inside a separate VM. Neither a Git commit nor an archive
+checksum is a malware review or independent publisher signature.
+
+The flow:
+
+1. Query the official GitHub release tag for Dusklight/TotK or the stable tags on
+   `git.triforceproject.com/triforce/source`. Resolve a full commit and offer its
+   review URL. Metadata checks execute no upstream code.
+2. Explicitly approve official tool archives. Git, uv, CMake/Ninja or LLVM-MinGW
+   and SDL SDK packages come from their publisher repositories over HTTPS and
+   require published SHA-256 metadata. Cached archives are rehashed before use;
+   each operation extracts new copies rather than trusting a previous mutable
+   tool directory. Python/project package setup occurs in an approved build.
+3. Finish the displayed one-time SDK prerequisites. Some require the vendor's
+   installer/permissions; Twilight Sync does not bypass signing, UAC, antivirus,
+   SmartScreen or Windows policy. TotK currently follows the upstream
+   `C:\msys64\ucrt64` development layout. Missing .NET 10 and MSYS2 rows offer
+   **Copy setup commands** and approved automatic setup. The .NET command is
+   `winget install --id Microsoft.DotNet.SDK.10 --exact --source winget`.
+   MSYS2 is installed via `MSYS2.MSYS2` if absent, updated twice using fresh
+   `bash -lc` sessions, then provisioned with the UCRT64 package list. Close other
+   MSYS2 sessions first; core upgrades can close them. Signing checks stay on.
+   SDK package updates are not game-build jobs and cannot be cancelled by
+   **Cancel source build**. Prerequisites are rechecked after completion.
+   When using copied commands outside the app, click **Check source version /
+   prerequisites** afterwards to refresh cached results. Missing MSYS2 checks
+   list the exact files; both `include\vma\vk_mem_alloc.h` and the flat
+   allocator-header layout are accepted and preserved for the upstream compiler.
+4. Supply legally obtained local inputs: no build assets for Dusklight's engine;
+   TotK base/update/keys and optional firmware fonts; Triforce `.nup` or extracted
+   files. A current Triforce install's `.triforce_exefs` and `romfs` are reused
+   automatically when selected inputs are absent.
+5. A fresh checkout is verified against the approved commit. Dusklight also
+   initializes source-pinned submodules. Builds use fixed recipe arguments, not
+   a user/peer-provided shell command. Source child processes receive a limited
+   OS/build environment, not arbitrary inherited credential environment variables.
+6. Play, incoming replacement and automatic sync are paused during compilation.
+   Windows jobs own build process trees so cancellation or manager termination
+   stops those helpers. This is lifecycle control, **not isolation from malicious
+   scripts**. Copies, downloads or archive verification may take time to finish
+   after a cancellation request.
+7. Built Windows x64 headers, executable hashes and preserved save hashes are
+   checked before selection. Output is kept under a distinct
+   `Games\<game>\source-<tag>-<commit>-<id>\game` folder. Profiles/settings/mods are
+   copied, not removed from the previous installation. Verified nonempty
+   source-build activation retains its existing common sync base.
+
+Only the selected game's build recipe runs. Dusklight uses its documented MSVC
+CMake preset/install target. TotK compiles hactool and the shader translator,
+then runs the source checkout's development-mode installer, which compiles the
+runtime rather than consuming the release's prebuilt runtime library. Its pinned
+MacNativeGames shader-reference history is fetched as source; normal gameplay is
+not started, although shader preparation may open a window.
+The installer runs in its Python 3.14 environment with the pinned upstream
+`requirements-installer.txt` packages; Python 3.12 remains separate for the
+development build tools.
+
+Triforce uses `python -I -B nx2/make_game.py` against a new output folder, never
+`--update` against the working install. Its game and Vulkan renderer are compiled
+locally. Official SDL compatibility/runtime SDKs and pinned Khronos/VMA source
+headers are used; the custom prebuilt `wgpu_native.dll` fallback is excluded, not
+the required Vulkan backend. `triforce_env.txt` in the new folder explicitly
+selects Vulkan; other options and the previous folder remain intact.
+Required FFmpeg AV1/audio headers/static libraries are provisioned in the CPM
+layout from `Takoroka/ffmpeg-av1` tag `9.0.2-av1-1`, with its published archive
+SHA-256 verified. This is a separate binary supplier, not FFmpeg.org or a
+source-to-binary attestation. Bounded tar/zstd extraction rejects unsafe paths,
+links and special files. Required Vulkan/SDL runtime files and game data must
+exist before activation.
+
+RenoDX HDR and shader preparation keep upstream defaults. Optional graphics
+controls can enable AMD FSR 4 or NVIDIA DLSS/frame generation and their dependency
+downloads; NVIDIA's SDK terms require explicit acceptance. HDR or shader
+preparation can be disabled deliberately, rather than silently stripping all
+optional features from every build. Shader preparation is not normal gameplay.
+
+Logs and a `twilight-source.json` receipt record source/tool provenance. No source
+failure falls back to downloading a prebuilt game. Failed workspaces, successful
+workspaces and previous installs are retained for diagnosis/rebuild support and
+are not automatically pruned. Native builds require at least 64 GiB free; the
+portable-data/mod copy is additional. Keep game-derived workspaces private.
+
+### Triforce save channel
+
+Both managers must advertise `twilightProto/3` discovery support before sending
+Triforce game envelopes. Existing game IDs and the Noise transport remain
+unchanged; older peers retain Dusklight/TotK support without Triforce traffic.
+Discovery support is an unauthenticated hint, not a replacement for pinned
+Noise identities and pairing approval.
+
+The native adapter targets the current Triforce fixed user under
+`<game>\user\save\<user id>`. It normalizes that account for transfer and maps it
+back to the game's local identity on receive. Complete `account.sav`, `option.sav`
+and slot progress/caption data travel together. The same bounded native bundle,
+stable-save rules, rollback copies and 256 MiB history engine are reused, with
+separate session/base/history state under `.twilight-sync\triforce-transfers`.
+
+Only committed saves are observed. `save-tx\<user id>\new`, `old` or `ready-*`
+requires the game to recover its own transaction first; `work` is never sent.
+Inactive accounts, game-owned backups, graphics INI files and mods are excluded.
+Unsupported active-account layouts fail closed. Triforce history uses its own
+`OOTR` stream identity, never TotK's stream.
+
+The shared native channel supplies approvals, safe common-base fast-forward,
+retained divergent branches, explicit reconciliation, history preview/restore,
+durable online play grants, release and bilateral recovery. Managed launch selects
+the actual `bin\Triforce.exe` when present, suppresses the game's own update check
+for that launch, and refuses a Setup-only folder. The managed desktop shortcut
+opens `--open-triforce` in the manager. Direct game launches remain outside
+manager control.
+
+Triforce slot/file comparisons are complete-snapshot comparisons. Its recognized
+native table schema (`0x002D80EB`, progress boundary `0x175D8`, caption boundary
+`0x2A0`) supplies hearts, rupees, play seconds and caption date/type. File lengths
+vary and are not used as a format whitelist. Missing/duplicate required fields,
+bad headers, impossible values/dates and mismatched captions fail verification
+before replacement. Unknown formats show details unavailable. No quest, map,
+stamina or inventory values are guessed. Stored game clocks, not file mtimes,
+determine displayed save dates.
 
 ## Texture packs: creator downloads, managed installs
 
@@ -674,6 +862,7 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
     identity.dpapi          Current-user-protected Noise private key
     settings.json           Router pin, public peer key, local paths, common hash, play lock
     update-settings.json    Optional automatic app-update-check preference
+    source-builds.json      Local build methods, input paths and worker preferences
     interface.json          Optional Windows/System, Light, or Dark appearance preference
     instance.lock           Per-user single-manager lock
     logs\
@@ -690,12 +879,34 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
             <content-id>\  Validated images and their manifest
         pending.json       Present only while texture recovery may be needed
     apps\
-        <tag>-<hash>\      Side-by-side official program and file-hash receipt
+        <tag>-<hash>\      Legacy Dusklight build and file-hash receipt (not moved)
+        totk\
+            <tag>-<hash>-<id>\  Verified upstream setup, build cache and updater logs
     updates\
         stage-<id>\        Verified app-update handoff; failed logs/backups are retained
+    triforce-transfers\     Triforce session, common base and separate compact history
+    build-tools\
+        archives\          Rechecked official tool ZIPs; fresh tool extractions are temporary
+    build-logs\            Captured local source-build output
+    source-builds\
+        <game>\<tag>-<commit>-<id>\  Retained source, Python environments and game-derived work
 ```
 
-Logs include the local **username, file paths, hashes, public peer keys, timestamps,
+New game installations default to `%USERPROFILE%\Games`:
+
+```text
+Games\
+    Dusklight\
+        <tag>-<hash>\      Side-by-side managed build and file-hash receipt
+    TotKRecomp\            Native TotK game, profile, settings and mods
+    Triforce\              Native OoT game, user saves and local graphics settings
+    <game>\source-<tag>-<commit>-<id>\game\  Side-by-side source-built game
+```
+
+Updater caches and application settings remain in `.twilight-sync`; they are not
+mixed into the game's installation folder.
+
+Audit logs include the local **username, file paths, hashes, public peer keys, timestamps,
 security decisions, and errors**. They do not include save payloads, private keys,
 or pairing comparison codes. A log rotates at approximately 5 MiB and keeps four
 older files. History, textures, retained program versions, and preserved original
@@ -704,6 +915,11 @@ usernames and paths; its compressed game data is not encrypted at rest.
 Do not post logs or configuration publicly without redacting personal details.
 Device name, public key, network tag, and pairing availability are visible in
 local discovery; save contents and paths are not.
+
+Source-build logs additionally capture upstream stdout/stderr. Review and redact
+them before sharing: third-party scripts can print anything they can read.
+Twilight Sync does not upload game inputs/keys/saves, but an approved source
+script has normal user permissions and can make its own network requests.
 
 Failure to persist lock/configuration safety state disables networking. Audit
 errors abort the affected action and are surfaced; if the error itself cannot
@@ -761,6 +977,11 @@ cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.iso'
 cargo run --locked -- --check-iso 'D:\My Disc Dumps\Twilight Princess.rvz'
 cargo run --locked -- --check-network
 cargo run --locked -- --check-updates
+cargo run --locked -- --check-totk-updates
+cargo run --locked -- --check-triforce-save
+cargo run --locked -- --check-source-updates dusklight
+cargo run --locked -- --check-source-updates totk
+cargo run --locked -- --check-source-updates triforce
 cargo run --locked -- --check-app-updates
 ```
 
@@ -781,6 +1002,15 @@ register startup:
 
 ```powershell
 cargo test --lib install::tests::official_release_installs_and_reuses_in_an_isolated_directory --locked -- --ignored --exact --nocapture
+```
+
+For TotK, an optional live-package check verifies a locally downloaded copy of the
+latest official Windows ZIP, extracts it into a temporary directory, and runs only
+the bundled installer's `--help`. It never builds, installs or runs the game:
+
+```powershell
+$env:TWILIGHT_TOTK_SETUP_ARCHIVE = 'D:\Downloads\TotK-Setup-<version>-windows.zip'
+cargo test --lib --locked totk_update::tests::official_setup_can_be_verified_without_installing_or_running_the_game -- --ignored --exact --nocapture
 ```
 
 Windows tests create isolated temporary data and loopback Noise sessions. They

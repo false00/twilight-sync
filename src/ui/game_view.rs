@@ -1,7 +1,7 @@
 use super::{Dashboard, Palette, semibold, symbol};
 use crate::{
     protocol::GameId,
-    runtime::{Command, Snapshot},
+    runtime::{Command, NativeCommand, Snapshot},
     save_data, totk,
 };
 use eframe::egui::{self, RichText, Stroke, Vec2};
@@ -146,6 +146,7 @@ pub(super) fn title(game: GameId) -> &'static str {
     match game {
         GameId::Dusklight => "Dusklight",
         GameId::Totk => "Tears of the Kingdom",
+        GameId::Triforce => "Ocarina of Time",
     }
 }
 
@@ -169,6 +170,10 @@ pub(super) fn incoming_command(game: GameId, approved: bool) -> Command {
     match game {
         GameId::Dusklight => Command::AcceptSave(approved),
         GameId::Totk => Command::AcceptTotk(approved),
+        GameId::Triforce => Command::Native {
+            game,
+            command: NativeCommand::Accept(approved),
+        },
     }
 }
 
@@ -334,24 +339,27 @@ pub(super) fn view(game: GameId, snapshot: &Snapshot) -> GameView {
                 connection_setup,
             }
         }
-        GameId::Totk => {
-            let state = &snapshot.totk;
+        GameId::Totk | GameId::Triforce => {
+            let state = if game == GameId::Totk {
+                &snapshot.totk
+            } else {
+                &snapshot.triforce
+            };
             GameView {
                 game,
                 title: title(game),
                 partner,
                 installed: state.installed,
-                executable: state
-                    .install_path
-                    .as_ref()
-                    .map(|path| path.join("totk.exe")),
+                executable: state.executable.clone(),
                 can_locate: !state.running
+                    && !state.updating
                     && !state.remote_running
                     && !state.busy
                     && state.lock.is_none()
                     && state.remote_lock.is_none()
                     && !snapshot.self_updates.preparing,
                 matching: snapshot.ready
+                    && !state.updating
                     && state.remote_save_ready
                     && state.verification_error.is_none()
                     && !state.running
@@ -378,11 +386,19 @@ pub(super) fn view(game: GameId, snapshot: &Snapshot) -> GameView {
                     .unwrap_or_default(),
                 headline: String::new(),
                 message: state.message.clone(),
-                play_reason: Dashboard::totk_play_blocker(snapshot).map(str::to_owned),
-                sync_reason: Dashboard::totk_sync_blocker(snapshot).map(str::to_owned),
+                play_reason: Dashboard::native_play_blocker(snapshot, state).map(str::to_owned),
+                sync_reason: if game == GameId::Triforce
+                    && snapshot.ready
+                    && !snapshot.triforce_supported
+                {
+                    Some("Update both managers for Triforce save sync; local play and the other supported games remain available.".into())
+                } else {
+                    Dashboard::native_sync_blocker(snapshot, state).map(str::to_owned)
+                },
                 verified: state.verified_at.clone(),
                 base: None,
                 can_resolve: snapshot.ready
+                    && !state.updating
                     && state.comparison_verified
                     && !state.busy
                     && !state.running
@@ -391,6 +407,7 @@ pub(super) fn view(game: GameId, snapshot: &Snapshot) -> GameView {
                     && state.remote_lock.is_none()
                     && !snapshot.self_updates.preparing,
                 can_continue: state.installed
+                    && !state.updating
                     && !state.running
                     && !state.remote_running
                     && (!state.busy || state.pending)
@@ -400,6 +417,7 @@ pub(super) fn view(game: GameId, snapshot: &Snapshot) -> GameView {
                     && state.verification_error.is_none()
                     && !snapshot.self_updates.preparing,
                 can_accept: !state.running
+                    && !state.updating
                     && !state.remote_running
                     && !snapshot.self_updates.preparing
                     && state.verification_error.is_none()
@@ -1026,7 +1044,8 @@ pub(super) fn progress(ui: &mut egui::Ui, cards: &[SaveCard]) {
 pub(super) fn history_preview(ui: &mut egui::Ui, preview: &crate::runtime::HistoryPreview) {
     let cards = match &preview.data {
         crate::runtime::HistoryPreviewData::Dusklight(summary) => dusklight_cards(summary),
-        crate::runtime::HistoryPreviewData::Totk(summary) => totk_cards(summary),
+        crate::runtime::HistoryPreviewData::Totk(summary)
+        | crate::runtime::HistoryPreviewData::Triforce(summary) => totk_cards(summary),
     };
     for card in &cards {
         ui.push_id(card.number, |ui| save_card_style(ui, card, None, false));
@@ -1086,7 +1105,7 @@ mod tests {
                         .clone()
                         .context("Synthetic Dusklight save")?,
                 ),
-                GameId::Totk => crate::runtime::HistoryPreviewData::Totk(
+                GameId::Totk | GameId::Triforce => crate::runtime::HistoryPreviewData::Totk(
                     snapshot
                         .totk
                         .local_summary

@@ -8,9 +8,9 @@ use crate::{
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
     protocol::{self, Event, Handshake, SecureWriter},
-    save_data, save_location, self_update, sync_policy,
+    save_data, save_location, self_update, source_build, sync_policy,
     textures::{self, Activation, Pack},
-    totk,
+    totk, totk_update, triforce,
 };
 use anyhow::{Context, Result, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -62,6 +62,7 @@ pub struct Snapshot {
     pub transfer: String,
     pub install_busy: bool,
     pub latest_release: Option<ReleaseInfo>,
+    pub latest_totk_release: Option<ReleaseInfo>,
     pub selected_release: Option<String>,
     pub texture_busy: bool,
     pub textures: textures::State,
@@ -69,6 +70,9 @@ pub struct Snapshot {
     pub history_preview: Option<HistoryPreview>,
     pub self_updates: self_update::State,
     pub totk: totk::Status,
+    pub triforce: totk::Status,
+    pub triforce_supported: bool,
+    pub source: source_build::State,
     pub message: String,
     pub error: Option<String>,
     pub shutdown: bool,
@@ -87,6 +91,32 @@ pub struct SaveConflict {
 pub enum HistoryPreviewData {
     Dusklight(save_data::Summary),
     Totk(totk::Summary),
+    Triforce(totk::Summary),
+}
+
+pub enum NativeCommand {
+    Refresh,
+    Send,
+    Accept(bool),
+    SetExecutable(PathBuf),
+    Launch {
+        local_only: bool,
+    },
+    Continue {
+        expected: Option<String>,
+    },
+    Resolve {
+        local_hash: String,
+        remote_hash: String,
+        use_remote: bool,
+    },
+    HistoryPage(Option<String>),
+    Restore {
+        id: String,
+        expected: Option<String>,
+    },
+    Recover,
+    AcceptRecovery(bool),
 }
 
 #[derive(Clone)]
@@ -97,6 +127,32 @@ pub struct HistoryPreview {
 }
 
 pub enum Command {
+    SetSourcePreference {
+        game: protocol::GameId,
+        preference: source_build::Preference,
+    },
+    ResetSourcePreferences,
+    CheckSource(protocol::GameId),
+    PrepareSourceTools {
+        game: protocol::GameId,
+        approved: bool,
+    },
+    InstallSourceSdk {
+        game: protocol::GameId,
+        setup: source_build::SdkSetup,
+        approved: bool,
+    },
+    BuildSource {
+        game: protocol::GameId,
+        commit: String,
+        approved: bool,
+    },
+    ActivateSourceBuild(protocol::GameId),
+    CancelSource,
+    Native {
+        game: protocol::GameId,
+        command: NativeCommand,
+    },
     DesktopError(String),
     DesktopRecovered(String),
     TrustNetwork,
@@ -148,6 +204,8 @@ pub enum Command {
     AcceptIso(Option<PathBuf>),
     Install,
     CheckRelease,
+    UpdateTotk,
+    CheckTotkRelease,
     CheckSelfUpdate,
     SetAutoUpdateChecks(bool),
     UpdateSelf,
@@ -225,7 +283,32 @@ enum Input {
         reason: String,
     },
     Installed(Result<(Installed, PathBuf)>),
-    ReleaseChecked(Result<ReleaseInfo>),
+    ReleaseChecked {
+        game: protocol::GameId,
+        result: Result<ReleaseInfo>,
+    },
+    TotkUpdated(Result<totk_update::Updated>),
+    SourceChecked {
+        game: protocol::GameId,
+        result: Result<(source_build::Plan, Vec<source_build::Prerequisite>)>,
+    },
+    SourceProgress {
+        game: protocol::GameId,
+        message: String,
+    },
+    SourceToolsReady {
+        game: protocol::GameId,
+        result: Result<()>,
+    },
+    SourceSdkReady {
+        game: protocol::GameId,
+        setup: source_build::SdkSetup,
+        result: Result<()>,
+    },
+    SourceBuilt {
+        game: protocol::GameId,
+        result: Result<source_build::Built>,
+    },
     SelfUpdateChecked(Result<self_update::Release>),
     SelfUpdatePrepared(Result<self_update::Prepared>),
     SelfUpdateCancelled(Result<()>),
@@ -273,6 +356,7 @@ struct Link {
     deadline: Instant,
     last_seen: Instant,
     game_channels: bool,
+    triforce_channels: bool,
 }
 
 #[derive(Clone)]
@@ -400,6 +484,7 @@ struct Engine {
     cancel_transfer: Arc<AtomicBool>,
     install_busy: bool,
     latest_release: Option<ReleaseInfo>,
+    latest_totk_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
     texture_busy: bool,
     texture_cancel: Arc<AtomicBool>,
@@ -417,6 +502,9 @@ struct Engine {
     first_self_update_check: Instant,
     last_self_update_cleanup: Instant,
     totk: totk::Channel,
+    triforce: totk::Channel,
+    source: source_build::State,
+    source_cancel: Arc<AtomicBool>,
     transfer: String,
     message: String,
     error: Option<String>,
@@ -525,6 +613,9 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
             if let Err(error) = engine.totk.refresh() {
                 engine.report(error);
             }
+            if let Err(error) = engine.triforce.refresh() {
+                engine.report(error);
+            }
             if desktop
                 && let Some(install) = engine.totk.status.install_path.clone()
                 && engine.totk.status.installed
@@ -532,6 +623,18 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
                     crate::desktop::install_totk_shortcut(&engine.root, &install.join("totk.exe"))
             {
                 engine.report(error);
+            }
+            if desktop && engine.triforce.status.installed {
+                let result = engine.triforce.executable().and_then(|executable| {
+                    crate::desktop::install_game_shortcut(
+                        &engine.root,
+                        &executable,
+                        protocol::GameId::Triforce,
+                    )
+                });
+                if let Err(error) = result {
+                    engine.report(error);
+                }
             }
             engine.message = "Local stores checked. Checking your private LAN...".into();
             engine.publish();
@@ -786,6 +889,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         transfer: String::new(),
         install_busy: false,
         latest_release: None,
+        latest_totk_release: None,
         selected_release: None,
         texture_busy: false,
         textures: textures::State::default(),
@@ -793,6 +897,12 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         history_preview: None,
         self_updates: self_update::State::default(),
         totk: totk::Status::default(),
+        triforce: totk::Status::default(),
+        triforce_supported: false,
+        source: source_build::State {
+            preferences_valid: true,
+            ..source_build::State::default()
+        },
         message: "Loading compact history and checking your private LAN...".into(),
         error: None,
         shutdown: false,
@@ -813,6 +923,13 @@ impl Engine {
         let past = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
         let mut totk = totk::Channel::new(root.join("totk-transfers"), totk::default_install());
         totk.identify(&identity.public, audit.username());
+        let mut triforce = totk::Channel::for_game(
+            root.join("triforce-transfers"),
+            triforce::default_install(),
+            crate::native::Game::Triforce,
+        );
+        triforce.identify(&identity.public, audit.username());
+        let source = source_build::State::load(&root);
         Self {
             maintenance: false,
             root,
@@ -866,6 +983,7 @@ impl Engine {
             cancel_transfer: Arc::new(AtomicBool::new(false)),
             install_busy: false,
             latest_release: None,
+            latest_totk_release: None,
             selected_release: None,
             texture_busy: false,
             texture_cancel: Arc::new(AtomicBool::new(false)),
@@ -883,6 +1001,9 @@ impl Engine {
             first_self_update_check: now + Duration::from_secs(15),
             last_self_update_cleanup: Instant::now(),
             totk,
+            triforce,
+            source,
+            source_cancel: Arc::new(AtomicBool::new(false)),
             transfer: String::new(),
             message: "Loading compact history and checking your private LAN...".into(),
             error: None,
@@ -1076,24 +1197,229 @@ impl Engine {
                 );
                 Ok(())
             }
-            Input::ReleaseChecked(result) => {
+            Input::ReleaseChecked { game, result } => {
                 self.install_busy = false;
                 let release = result?;
-                self.audit.record(
-                    "dusklight-release-checked",
-                    None,
-                    Some(&release.sha256),
-                    None,
-                    &release.tag,
-                )?;
-                self.selected_release =
-                    install::selected_release(&self.root, self.settings.game_exe.as_deref())?;
+                let (event, name) = match game {
+                    protocol::GameId::Dusklight => ("dusklight-release-checked", "Dusklight"),
+                    protocol::GameId::Totk => ("totk-release-checked", "TotK Recomp"),
+                    protocol::GameId::Triforce => {
+                        bail!("Triforce uses source-build release checks")
+                    }
+                };
+                self.audit
+                    .record(event, None, Some(&release.sha256), None, &release.tag)?;
                 self.message = format!(
-                    "Latest official Dusklight release: {}. Install/update when both games are stopped.",
+                    "Latest official {name} release: {}. Install/update when both games are stopped.",
                     release.tag
                 );
-                self.latest_release = Some(release);
+                match game {
+                    protocol::GameId::Dusklight => {
+                        self.selected_release = install::selected_release(
+                            &self.root,
+                            &install::default_directory(protocol::GameId::Dusklight)?,
+                            self.settings.game_exe.as_deref(),
+                        )?;
+                        self.latest_release = Some(release);
+                    }
+                    protocol::GameId::Totk => self.latest_totk_release = Some(release),
+                    protocol::GameId::Triforce => {
+                        bail!("Triforce does not use a prebuilt game release")
+                    }
+                }
                 Ok(())
+            }
+            Input::TotkUpdated(result) => {
+                self.install_busy = false;
+                self.totk.status.updating = false;
+                let refresh = self.totk.refresh();
+                let updated = result?;
+                refresh?;
+                if updated.fresh {
+                    self.totk.activate_verified_executable(
+                        &updated.executable,
+                        updated.expected_save.as_deref(),
+                    )?;
+                }
+                self.audit.record(
+                    if updated.fresh {
+                        "totk-installed"
+                    } else {
+                        "totk-updated"
+                    },
+                    Some(&updated.executable),
+                    Some(&updated.sha256),
+                    None,
+                    &format!("{}; installer log: {}", updated.tag, updated.log.display()),
+                )?;
+                if self.latest_totk_release.as_ref().is_some_and(|release| {
+                    release.tag != updated.tag || release.sha256 != updated.sha256
+                }) {
+                    self.latest_totk_release = None;
+                }
+                self.message = format!(
+                    "TotK Recomp {} {}. Committed saves were verified unchanged. Installer log: {}",
+                    updated.tag,
+                    if updated.fresh {
+                        "installed automatically and selected"
+                    } else {
+                        "updated in place"
+                    },
+                    updated.log.display()
+                );
+                self.totk.status.message = self.message.clone();
+                if updated.fresh {
+                    crate::desktop::install_totk_shortcut(&self.root, &updated.executable).context(
+                        "TotK files are ready, but the protected desktop shortcut could not be updated",
+                    )?;
+                }
+                Ok(())
+            }
+            Input::SourceChecked { game, result } => {
+                self.install_busy = false;
+                self.source.busy = false;
+                ensure!(
+                    self.source.game == Some(game),
+                    "Unexpected source-check result"
+                );
+                match result {
+                    Ok((plan, prerequisites)) => {
+                        self.audit.record(
+                            "source-revision-checked",
+                            None,
+                            None,
+                            None,
+                            &format!("{game:?} {} {}", plan.tag, plan.commit),
+                        )?;
+                        self.source.message = format!(
+                            "Source {} is ready to review. Building requires explicit approval.",
+                            plan.tag
+                        );
+                        self.source.plan = Some(plan);
+                        self.source.prerequisites = prerequisites;
+                        self.source.error = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.source.plan = None;
+                        self.source.error = Some(format!("{error:#}"));
+                        Err(error)
+                    }
+                }
+            }
+            Input::SourceProgress { game, message } => {
+                ensure!(
+                    self.source.busy && self.source.game == Some(game),
+                    "Unexpected source-build progress"
+                );
+                self.source.message = message;
+                Ok(())
+            }
+            Input::SourceToolsReady { game, result } => {
+                self.install_busy = false;
+                self.source.busy = false;
+                ensure!(
+                    self.source.game == Some(game),
+                    "Unexpected build-tool result"
+                );
+                match result {
+                    Ok(()) => {
+                        self.source.prerequisites = source_build::prerequisites(game)?;
+                        self.source.message = "Official tool archives verified and cached. Any missing manual SDK prerequisites are listed below.".into();
+                        self.source.error = None;
+                        Ok(())
+                    }
+                    Err(error) if source_build::is_cancelled(&error) => {
+                        self.source.message = source_build::Cancelled.to_string();
+                        self.source.error = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.source.error = Some(format!("{error:#}"));
+                        Err(error)
+                    }
+                }
+            }
+            Input::SourceSdkReady {
+                game,
+                setup,
+                result,
+            } => {
+                self.install_busy = false;
+                self.source.busy = false;
+                self.source.sdk_setup = false;
+                ensure!(
+                    self.source.game == Some(game),
+                    "Unexpected SDK setup result"
+                );
+                self.source.prerequisites = source_build::prerequisites(game)?;
+                let result = result.and_then(|()| {
+                        ensure!(self.source.prerequisites.iter().any(|item| item.setup == Some(setup) && item.ready),
+                            "SDK installer finished, but the required tools were not found yet. Complete any installer/reboot prompts and recheck prerequisites.");
+                        Ok(())
+                    });
+                match result {
+                    Ok(()) => {
+                        self.source.error = None;
+                        self.source.message = "SDK setup completed and prerequisites were rechecked. You can continue with the source build.".into();
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.source.error = Some(format!("{error:#}"));
+                        Err(error)
+                    }
+                }
+            }
+            Input::SourceBuilt { game, result } => {
+                self.install_busy = false;
+                self.source.busy = false;
+                self.source.building = false;
+                self.totk.status.updating = false;
+                self.triforce.status.updating = false;
+                ensure!(
+                    self.source.game == Some(game),
+                    "Unexpected source-build result"
+                );
+                match result {
+                    Ok(built) => {
+                        self.source.built = Some(built.clone());
+                        match self.activate_source(&built) {
+                            Ok(()) => {
+                                self.source.error = None;
+                                self.source.message = format!(
+                                    "{} built from commit {} and selected. Previous installations were retained; normal gameplay was not started.",
+                                    built.tag,
+                                    &built.commit[..12]
+                                );
+                                self.message = self.source.message.clone();
+                                Ok(())
+                            }
+                            Err(error) => {
+                                self.source.error = Some(format!(
+                                    "Build files are ready at {}, but activation needs attention: {error:#}",
+                                    built.directory.display()
+                                ));
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(error) if source_build::is_cancelled(&error) => {
+                        self.source.message = source_build::Cancelled.to_string();
+                        self.source.error = None;
+                        self.audit.record(
+                            "source-build-cancelled",
+                            None,
+                            None,
+                            None,
+                            &format!("{game:?}: previous installation retained"),
+                        )?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.source.error = Some(format!("{error:#}"));
+                        Err(error)
+                    }
+                }
             }
             Input::SelfUpdateChecked(result) => {
                 self.self_updates.checking = false;
@@ -1411,6 +1737,63 @@ impl Engine {
         self.ready() && self.link.as_ref().is_some_and(|link| link.game_channels)
     }
 
+    fn native_supported(&self, game: protocol::GameId) -> bool {
+        match game {
+            protocol::GameId::Totk => self.game_channels_ready(),
+            protocol::GameId::Triforce => {
+                self.ready()
+                    && self
+                        .link
+                        .as_ref()
+                        .is_some_and(|link| link.triforce_channels)
+            }
+            protocol::GameId::Dusklight => false,
+        }
+    }
+
+    fn native_channel(&mut self, game: protocol::GameId) -> Result<&mut totk::Channel> {
+        match game {
+            protocol::GameId::Totk => Ok(&mut self.totk),
+            protocol::GameId::Triforce => Ok(&mut self.triforce),
+            protocol::GameId::Dusklight => bail!("Dusklight uses its own save channel"),
+        }
+    }
+
+    fn begin_game_release_check(&mut self, game: protocol::GameId) -> Result<()> {
+        ensure!(
+            !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
+            "A management operation is already running"
+        );
+        let (event, name) = match game {
+            protocol::GameId::Dusklight => ("dusklight-update-check-requested", "Dusklight"),
+            protocol::GameId::Totk => ("totk-update-check-requested", "TotK Recomp"),
+            protocol::GameId::Triforce => bail!("Use Triforce's source-build release check"),
+        };
+        self.audit.record(
+            event,
+            None,
+            None,
+            None,
+            "Explicit official GitHub metadata request",
+        )?;
+        self.install_busy = true;
+        self.message = format!("Checking the latest official {name} release...");
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = match game {
+                protocol::GameId::Dusklight => install::latest_release(),
+                protocol::GameId::Totk => install::latest_totk_release(),
+                protocol::GameId::Triforce => Err(anyhow::anyhow!(
+                    "Triforce does not use a prebuilt game release"
+                )),
+            };
+            if sender.send(Input::ReleaseChecked { game, result }).is_err() {
+                eprintln!("Twilight Sync stopped during the release check");
+            }
+        });
+        Ok(())
+    }
+
     fn require_self_update_idle(&mut self) -> Result<()> {
         self.game_running = self.process.game_running();
         ensure!(
@@ -1422,6 +1805,7 @@ impl Engine {
             "Finish the current installation, texture operation, or app update"
         );
         self.totk.require_app_update_idle()?;
+        self.triforce.require_app_update_idle()?;
         ensure!(
             self.no_transfer()
                 && self.child.is_none()
@@ -1569,11 +1953,439 @@ impl Engine {
         Ok(())
     }
 
+    fn source_paths(&self, game: protocol::GameId) -> (Option<PathBuf>, Option<PathBuf>) {
+        match game {
+            protocol::GameId::Dusklight => (
+                self.settings
+                    .game_exe
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(Path::to_path_buf),
+                self.settings.game_exe.clone(),
+            ),
+            protocol::GameId::Totk => (
+                self.totk.status.install_path.clone(),
+                self.totk.status.executable.clone(),
+            ),
+            protocol::GameId::Triforce => (
+                self.triforce.status.install_path.clone(),
+                self.triforce.status.executable.clone(),
+            ),
+        }
+    }
+
+    fn require_source_idle(&mut self) -> Result<()> {
+        self.game_running = self.process.game_running();
+        self.require_idle()?;
+        ensure!(
+            self.no_transfer()
+                && self.launch_pending.is_none()
+                && self.child.is_none()
+                && self.pending_recovery.is_none()
+                && self.requested_recovery.is_none(),
+            "Finish pending transfers, play sessions and recovery before building"
+        );
+        for game in [protocol::GameId::Totk, protocol::GameId::Triforce] {
+            let channel = self.native_channel(game)?;
+            channel.require_update_idle()?;
+            channel.require_app_update_idle()?;
+            ensure!(
+                channel.status.remote_lock.is_none() && !channel.status.pending,
+                "Finish the paired device's {game:?} reservation or pending save first"
+            );
+        }
+        Ok(())
+    }
+
+    fn begin_source_operation(&mut self, game: protocol::GameId, building: bool) -> Result<()> {
+        ensure!(
+            self.source.preferences_valid,
+            "Reset invalid source-build preferences before continuing"
+        );
+        ensure!(
+            !self.install_busy
+                && !self.texture_busy
+                && !self.self_updates.preparing
+                && !self.source.busy,
+            "Finish the current management operation before continuing"
+        );
+        if building {
+            self.require_source_idle()?;
+        }
+        self.audit.record(
+            "source-operation-approved",
+            None,
+            None,
+            None,
+            &format!(
+                "{game:?}: {}",
+                if building {
+                    "explicit source/build-script execution approval"
+                } else {
+                    "explicit source metadata/official-tool download approval"
+                }
+            ),
+        )?;
+        self.source_cancel = Arc::new(AtomicBool::new(false));
+        self.source.game = Some(game);
+        self.source.busy = true;
+        self.source.building = building;
+        self.source.sdk_setup = false;
+        self.source.error = None;
+        self.install_busy = true;
+        if building {
+            self.totk.status.updating = true;
+            self.triforce.status.updating = true;
+        }
+        Ok(())
+    }
+
+    fn activate_source(&mut self, built: &source_build::Built) -> Result<()> {
+        self.require_source_idle()?;
+        let (previous, executable) = self.source_paths(built.game);
+        source_build::verify_activation(built, previous.as_deref(), executable.as_deref())?;
+        self.audit.record(
+            "source-build-verified",
+            Some(&built.executable),
+            Some(&built.sha256),
+            None,
+            &format!(
+                "{} {}; source {}; log {}",
+                built.tag,
+                built.commit,
+                built.source.display(),
+                built.log.display()
+            ),
+        )?;
+        match built.game {
+            protocol::GameId::Dusklight => {
+                let base = if built.expected_save.is_some() {
+                    self.settings.sync_base.clone()
+                } else {
+                    None
+                };
+                self.store(|settings| settings.game_exe = Some(built.executable.clone()))?;
+                self.refresh_default_save()?;
+                self.store(|settings| settings.sync_base = base)?;
+                self.selected_release =
+                    Some(format!("{} (source {})", built.tag, &built.commit[..12]));
+            }
+            game => self
+                .native_channel(game)?
+                .activate_verified_executable(&built.executable, built.expected_save.as_deref())?,
+        }
+        crate::desktop::install_game_shortcut(&self.root, &built.executable, built.game)
+            .context("Source-built game was selected, but its protected desktop shortcut could not be updated")?;
+        if self.ready() {
+            self.send_state()?;
+        }
+        Ok(())
+    }
+
+    fn native_command(&mut self, game: protocol::GameId, command: NativeCommand) -> Result<()> {
+        let name = match game {
+            protocol::GameId::Totk => "TotK",
+            protocol::GameId::Triforce => "Triforce",
+            protocol::GameId::Dusklight => bail!("Dusklight uses its own save commands"),
+        };
+        ensure!(
+            (!self.self_updates.preparing && !self.source.building)
+                || matches!(
+                    &command,
+                    NativeCommand::Refresh | NativeCommand::HistoryPage(_)
+                ),
+            "Wait for the current app update or source build"
+        );
+        let connected = self.native_supported(game);
+        let frames = match command {
+            NativeCommand::Refresh => {
+                self.native_channel(game)?.refresh()?;
+                if connected {
+                    vec![Event::TotkRequest]
+                } else {
+                    if self.ready() {
+                        self.native_channel(game)?.status.message = format!(
+                            "Update both managers for {name} sync; other supported game channels remain available."
+                        );
+                    }
+                    Vec::new()
+                }
+            }
+            NativeCommand::Send => {
+                ensure!(
+                    connected,
+                    "Connect an updated paired manager before sending {name} saves"
+                );
+                self.native_channel(game)?.offer()?
+            }
+            NativeCommand::Accept(approved) => {
+                ensure!(connected, "Reconnect the updated paired manager first");
+                self.audit.record(
+                    &format!("{}-save-consent", name.to_ascii_lowercase()),
+                    None,
+                    None,
+                    Some(&self.peer_key()?),
+                    if approved {
+                        "Receiver approved a complete native save replacement with a rollback copy"
+                    } else {
+                        "Receiver kept local progress"
+                    },
+                )?;
+                self.native_channel(game)?.accept(approved)?
+            }
+            NativeCommand::SetExecutable(path) => {
+                self.native_channel(game)?.set_executable(&path)?;
+                let executable = self.native_channel(game)?.executable()?;
+                crate::desktop::install_game_shortcut(&self.root, &executable, game)?;
+                Vec::new()
+            }
+            NativeCommand::Launch { local_only } => {
+                self.native_channel(game)?.launch(connected, local_only)?
+            }
+            NativeCommand::Continue { expected } => self
+                .native_channel(game)?
+                .continue_local(connected, expected.as_deref())?,
+            NativeCommand::Resolve {
+                local_hash,
+                remote_hash,
+                use_remote,
+            } => {
+                ensure!(
+                    connected,
+                    "Reconnect the updated paired manager before resolving {name} branches"
+                );
+                self.native_channel(game)?
+                    .resolve(&local_hash, &remote_hash, use_remote)?
+            }
+            NativeCommand::HistoryPage(before) => {
+                self.native_channel(game)?.history_page(before.as_deref())?;
+                Vec::new()
+            }
+            NativeCommand::Restore { id, expected } => {
+                self.native_channel(game)?
+                    .restore(&id, expected.as_deref())?;
+                Vec::new()
+            }
+            NativeCommand::Recover => {
+                if connected {
+                    self.native_channel(game)?.recover()?
+                } else {
+                    self.native_channel(game)?.recover_offline()?;
+                    Vec::new()
+                }
+            }
+            NativeCommand::AcceptRecovery(approved) => {
+                ensure!(
+                    connected,
+                    "Reconnect both updated managers for {name} session recovery"
+                );
+                self.native_channel(game)?.approve_recovery(approved)?
+            }
+        };
+        self.send_native_frames(game, frames)
+    }
+
     fn command(&mut self, command: Command) -> Result<()> {
         if !matches!(command, Command::DesktopRecovered(_)) {
             self.error = None;
         }
         match command {
+            Command::SetSourcePreference { game, preference } => {
+                ensure!(
+                    self.source.preferences_valid && !self.source.busy,
+                    "Finish the source operation or reset invalid preferences first"
+                );
+                let mut preferences = self.source.preferences.clone();
+                preferences.set(game, preference)?;
+                preferences.persist(&self.root)?;
+                self.source.preferences = preferences;
+                self.source.error = None;
+            }
+            Command::ResetSourcePreferences => {
+                ensure!(
+                    !self.source.busy,
+                    "Finish or cancel the source operation before resetting preferences"
+                );
+                let preferences = source_build::Preferences::default();
+                preferences.persist(&self.root)?;
+                self.source.preferences = preferences;
+                self.source.preferences_valid = true;
+                self.source.error = None;
+            }
+            Command::CheckSource(game) => {
+                self.begin_source_operation(game, false)?;
+                self.source.plan = None;
+                self.source.prerequisites.clear();
+                self.source.log = None;
+                self.source.message = "Checking the stable source tag and full commit identity; no project code is being run...".into();
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    if sender
+                        .send(Input::SourceChecked {
+                            game,
+                            result: source_build::check(game),
+                        })
+                        .is_err()
+                    {
+                        eprintln!("Twilight Sync stopped before the source check completed");
+                    }
+                });
+            }
+            Command::PrepareSourceTools { game, approved } => {
+                ensure!(approved, "Approve the official build-tool downloads first");
+                let log = source_build::new_log(&self.root, game)?;
+                self.begin_source_operation(game, false)?;
+                self.source.log = Some(log.clone());
+                self.source.message = "Downloading and verifying official build-tool archives; no project build scripts are being run...".into();
+                let root = self.root.clone();
+                let sender = self.sender.clone();
+                let cancel = self.source_cancel.clone();
+                thread::spawn(move || {
+                    let result =
+                        source_build::prepare_tools(&root, game, &log, &cancel, &mut |message| {
+                            sender
+                                .send(Input::SourceProgress { game, message })
+                                .context("Source progress receiver stopped")
+                        });
+                    if sender
+                        .send(Input::SourceToolsReady { game, result })
+                        .is_err()
+                    {
+                        eprintln!("Twilight Sync stopped before build-tool preparation completed");
+                    }
+                });
+            }
+            Command::InstallSourceSdk {
+                game,
+                setup,
+                approved,
+            } => {
+                ensure!(
+                    approved,
+                    "Approve the SDK installation and package-manager prompts first"
+                );
+                ensure!(
+                    game == protocol::GameId::Totk,
+                    "This SDK setup is for TotK source builds"
+                );
+                let prerequisites = source_build::prerequisites(game)?;
+                ensure!(
+                    prerequisites
+                        .iter()
+                        .any(|item| item.setup == Some(setup) && !item.ready),
+                    "This SDK is already available or is not needed; recheck prerequisites"
+                );
+                let log = source_build::new_log(&self.root, game)?;
+                self.begin_source_operation(game, false)?;
+                self.source.sdk_setup = true;
+                self.source.log = Some(log.clone());
+                self.source.message = "Preparing the selected SDK. Complete any Windows Package Manager/installer prompts; no game build runs.".into();
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let result = setup.run(&log, &mut |message| {
+                        sender
+                            .send(Input::SourceProgress { game, message })
+                            .context("SDK setup progress receiver stopped")
+                    });
+                    if sender
+                        .send(Input::SourceSdkReady {
+                            game,
+                            setup,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        eprintln!(
+                            "Twilight Sync stopped before SDK setup finished; Windows installers may still be running"
+                        );
+                    }
+                });
+            }
+            Command::BuildSource {
+                game,
+                commit,
+                approved,
+            } => {
+                ensure!(
+                    approved,
+                    "Review the selected source commit and accept the build warning first"
+                );
+                let plan = self
+                    .source
+                    .plan
+                    .clone()
+                    .filter(|plan| plan.game == game && plan.commit == commit)
+                    .context("Check and review the current source commit before building")?;
+                let preference = self.source.preferences.get(game).clone();
+                ensure!(
+                    preference.method == source_build::Method::Source,
+                    "Select Build from source first"
+                );
+                let (previous_install, previous_executable) = self.source_paths(game);
+                source_build::validate_inputs(game, &preference, previous_install.as_deref())?;
+                let log = source_build::new_log(&self.root, game)?;
+                self.begin_source_operation(game, true)?;
+                self.source.log = Some(log.clone());
+                self.source.message = "Preparing an approved source build. Play and save sync are paused until it finishes or is cancelled.".into();
+                let root = self.root.clone();
+                let sender = self.sender.clone();
+                let cancel = self.source_cancel.clone();
+                thread::spawn(move || {
+                    let result = source_build::build(
+                        &root,
+                        source_build::Request {
+                            plan,
+                            preference,
+                            previous_install,
+                            previous_executable,
+                            approved,
+                            log,
+                        },
+                        &cancel,
+                        &mut |message| {
+                            sender
+                                .send(Input::SourceProgress { game, message })
+                                .context("Source progress receiver stopped")
+                        },
+                    );
+                    if sender.send(Input::SourceBuilt { game, result }).is_err() {
+                        eprintln!("Twilight Sync stopped before the source build completed");
+                    }
+                });
+                if self.ready() {
+                    self.send_state()?;
+                    for native in [protocol::GameId::Totk, protocol::GameId::Triforce] {
+                        if self.native_supported(native) {
+                            let channel = self.native_channel(native)?;
+                            let state = channel.state_event()?;
+                            let shared = channel.shared_state();
+                            self.send_native_frames(native, vec![shared, state])?;
+                        }
+                    }
+                }
+            }
+            Command::ActivateSourceBuild(game) => {
+                let built = self
+                    .source
+                    .built
+                    .clone()
+                    .filter(|built| built.game == game)
+                    .context("There is no completed source build for this game")?;
+                self.activate_source(&built)?;
+                self.source.error = None;
+                self.source.message =
+                    "The completed source build is now selected; progress was verified unchanged."
+                        .into();
+            }
+            Command::CancelSource => {
+                ensure!(
+                    self.source.busy && self.source.log.is_some() && !self.source.sdk_setup,
+                    "There is no cancellable source build or tool download"
+                );
+                self.source_cancel.store(true, Ordering::Release);
+                self.source.message = "Cancellation requested. The current download, copy or verification may need to finish before cleanup; owned build processes will be stopped.".into();
+            }
+            Command::Native { game, command } => self.native_command(game, command)?,
             Command::DesktopError(detail) => bail!("{detail}"),
             Command::DesktopRecovered(detail) => clear_desktop_error(&mut self.error, &detail),
             Command::RefreshSave => {
@@ -1581,95 +2393,49 @@ impl Engine {
                 self.refresh_history()?;
             }
             Command::RefreshTotk => {
-                self.totk.refresh()?;
-                if self.game_channels_ready() {
-                    self.send_totk_frames(vec![Event::TotkRequest])?;
-                } else if self.ready() {
-                    self.totk.status.message = "Update both managers for TotK sync; the legacy Dusklight channel remains available.".into();
-                }
+                self.native_command(protocol::GameId::Totk, NativeCommand::Refresh)?
             }
             Command::SendTotk => {
-                ensure!(
-                    self.game_channels_ready(),
-                    "Connect an updated paired manager before sending TotK saves"
-                );
-                let frames = self.totk.offer()?;
-                self.send_totk_frames(frames)?;
+                self.native_command(protocol::GameId::Totk, NativeCommand::Send)?
             }
             Command::AcceptTotk(approved) => {
-                ensure!(self.ready(), "The paired device is no longer connected");
-                self.audit.record(
-                    "totk-save-consent",
-                    None,
-                    None,
-                    Some(&self.peer_key()?),
-                    if approved {
-                        "Receiver approved a complete TotK save replacement with a rollback copy"
-                    } else {
-                        "Receiver kept local TotK progress"
-                    },
-                )?;
-                let frames = self.totk.accept(approved)?;
-                self.send_totk_frames(frames)?;
+                self.native_command(protocol::GameId::Totk, NativeCommand::Accept(approved))?
             }
             Command::SetTotkExecutable(path) => {
-                self.totk.set_executable(&path)?;
-                crate::desktop::install_totk_shortcut(&self.root, &path)?;
+                self.native_command(protocol::GameId::Totk, NativeCommand::SetExecutable(path))?
             }
             Command::LaunchTotk { local_only } => {
-                ensure!(
-                    !self.self_updates.preparing,
-                    "Wait for the current app update"
-                );
-                let frames = self.totk.launch(self.game_channels_ready(), local_only)?;
-                self.send_totk_frames(frames)?;
+                self.native_command(protocol::GameId::Totk, NativeCommand::Launch { local_only })?
             }
             Command::ContinueTotk { expected } => {
-                ensure!(
-                    !self.self_updates.preparing,
-                    "Wait for the current app update"
-                );
-                let frames = self
-                    .totk
-                    .continue_local(self.game_channels_ready(), expected.as_deref())?;
-                self.send_totk_frames(frames)?;
+                self.native_command(protocol::GameId::Totk, NativeCommand::Continue { expected })?
             }
             Command::ResolveTotk {
                 local_hash,
                 remote_hash,
                 use_remote,
-            } => {
-                ensure!(
-                    self.game_channels_ready(),
-                    "Reconnect the updated paired manager before resolving TotK branches"
-                );
-                let frames = self.totk.resolve(&local_hash, &remote_hash, use_remote)?;
-                self.send_totk_frames(frames)?;
+            } => self.native_command(
+                protocol::GameId::Totk,
+                NativeCommand::Resolve {
+                    local_hash,
+                    remote_hash,
+                    use_remote,
+                },
+            )?,
+            Command::TotkHistoryPage(before) => {
+                self.native_command(protocol::GameId::Totk, NativeCommand::HistoryPage(before))?
             }
-            Command::TotkHistoryPage(before) => self.totk.history_page(before.as_deref())?,
-            Command::RestoreTotk { id, expected } => {
-                ensure!(
-                    !self.self_updates.preparing,
-                    "Wait for the current app update"
-                );
-                self.totk.restore(&id, expected.as_deref())?;
-            }
+            Command::RestoreTotk { id, expected } => self.native_command(
+                protocol::GameId::Totk,
+                NativeCommand::Restore { id, expected },
+            )?,
             Command::RecoverTotk => {
-                if self.game_channels_ready() {
-                    let frames = self.totk.recover()?;
-                    self.send_totk_frames(frames)?;
-                } else {
-                    self.totk.recover_offline()?;
-                }
+                self.native_command(protocol::GameId::Totk, NativeCommand::Recover)?
             }
-            Command::AcceptTotkRecovery(approved) => {
-                ensure!(
-                    self.game_channels_ready(),
-                    "Reconnect both managers for TotK session recovery"
-                );
-                let frames = self.totk.approve_recovery(approved)?;
-                self.send_totk_frames(frames)?;
-            }
+            Command::AcceptTotkRecovery(approved) => self.native_command(
+                protocol::GameId::Totk,
+                NativeCommand::AcceptRecovery(approved),
+            )?,
             Command::TrustNetwork => {
                 self.require_idle()?;
                 let network = self
@@ -1769,8 +2535,11 @@ impl Engine {
                 );
                 self.store(|s| s.game_exe = Some(path))?;
                 self.refresh_default_save()?;
-                self.selected_release =
-                    install::selected_release(&self.root, self.settings.game_exe.as_deref())?;
+                self.selected_release = install::selected_release(
+                    &self.root,
+                    &install::default_directory(protocol::GameId::Dusklight)?,
+                    self.settings.game_exe.as_deref(),
+                )?;
             }
             Command::SetIso(path) => {
                 self.require_idle()?;
@@ -1952,30 +2721,8 @@ impl Engine {
                 });
             }
             Command::AcceptIso(destination) => self.accept_iso(destination)?,
-            Command::CheckRelease => {
-                ensure!(
-                    !self.install_busy && !self.texture_busy && !self.self_updates.preparing,
-                    "A management operation is already running"
-                );
-                self.audit.record(
-                    "dusklight-update-check-requested",
-                    None,
-                    None,
-                    None,
-                    "Explicit official GitHub metadata request",
-                )?;
-                self.install_busy = true;
-                self.message = "Checking the latest official Dusklight release...".into();
-                let sender = self.sender.clone();
-                thread::spawn(move || {
-                    if sender
-                        .send(Input::ReleaseChecked(install::latest_release()))
-                        .is_err()
-                    {
-                        eprintln!("Twilight Sync stopped during the release check");
-                    }
-                });
-            }
+            Command::CheckRelease => self.begin_game_release_check(protocol::GameId::Dusklight)?,
+            Command::CheckTotkRelease => self.begin_game_release_check(protocol::GameId::Totk)?,
             Command::CheckSelfUpdate => self.begin_self_update_check()?,
             Command::SetAutoUpdateChecks(enabled) => {
                 self_update::set_enabled(&self.root, enabled)?;
@@ -2154,6 +2901,9 @@ impl Engine {
                     protocol::GameId::Totk => {
                         HistoryPreviewData::Totk(self.totk.preview_history(&id)?)
                     }
+                    protocol::GameId::Triforce => {
+                        HistoryPreviewData::Triforce(self.triforce.preview_history(&id)?)
+                    }
                 };
                 self.history_preview = Some(HistoryPreview { game, id, data });
             }
@@ -2226,7 +2976,8 @@ impl Engine {
                 let sender = self.sender.clone();
                 thread::spawn(move || {
                     let result = (|| {
-                        let installed = install::install_official(&root)?;
+                        let directory = install::default_directory(protocol::GameId::Dusklight)?;
+                        let installed = install::install_official(&directory)?;
                         let shortcut =
                             crate::desktop::install_dusklight_shortcut(&root, &installed.executable)
                                 .context("Dusklight files were installed/verified, but its desktop shortcut could not be created")?;
@@ -2237,9 +2988,57 @@ impl Engine {
                     }
                 });
             }
+            Command::UpdateTotk => {
+                self.game_running = self.process.game_running();
+                self.require_idle()?;
+                ensure!(
+                    self.no_transfer(),
+                    "Finish pending transfers before updating TotK"
+                );
+                self.totk.require_update_idle()?;
+                self.totk.require_app_update_idle()?;
+                ensure!(
+                    self.totk.status.remote_lock.is_none(),
+                    "Finish or recover the partner's TotK play session before updating"
+                );
+                let destination = self
+                    .totk
+                    .status
+                    .install_path
+                    .clone()
+                    .context("Locate the native TotK installation first")?;
+                let inputs = totk_update::SetupInputs::from(
+                    self.source.preferences.get(protocol::GameId::Totk),
+                );
+                totk_update::validate_setup_inputs(&destination, &inputs)?;
+                self.audit.record(
+                    "totk-update-requested",
+                    Some(&destination),
+                    None,
+                    None,
+                    "Explicit Internet and execution exception: verified official setup, automatic install/update using the user's own game files",
+                )?;
+                self.install_busy = true;
+                self.totk.status.updating = true;
+                self.message = "Downloading, verifying, and installing/updating TotK Recomp. This can take several minutes; play and save sync are paused.".into();
+                self.totk.status.message = self.message.clone();
+                let root = self.root.clone();
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let result = totk_update::install_or_update(&root, &destination, &inputs);
+                    if sender.send(Input::TotkUpdated(result)).is_err() {
+                        eprintln!("Twilight Sync stopped before the TotK update completed");
+                    }
+                });
+                if self.game_channels_ready() {
+                    let state = self.totk.state_event()?;
+                    self.send_totk_frames(vec![self.totk.shared_state(), state])?;
+                }
+            }
             Command::Unpair => {
                 self.require_idle()?;
                 self.totk.require_update_idle()?;
+                self.triforce.require_update_idle()?;
                 ensure!(
                     self.no_transfer(),
                     "Finish pending transfers before unpairing"
@@ -2258,6 +3057,13 @@ impl Engine {
                 })?;
             }
             Command::Shutdown => {
+                ensure!(
+                    !self.triforce.game_running()
+                        && !self.triforce.status.busy
+                        && !self.triforce.status.launch_pending
+                        && !self.triforce.status.updating,
+                    "Stop Triforce and finish its transfers or build before quitting; the window can remain in the tray"
+                );
                 ensure!(
                     !self.totk.game_running()
                         && !self.totk.status.busy
@@ -2343,6 +3149,7 @@ impl Engine {
         }
         self.remote = None;
         self.totk.reset();
+        self.triforce.reset();
         self.remote_preview = None;
         self.preview_requested = None;
         self.pending_save = None;
@@ -2464,6 +3271,11 @@ impl Engine {
             .get(&session.remote_key)
             .and_then(|device| device.game_channels_seen)
             .is_some_and(|seen| seen.elapsed() < Duration::from_secs(8));
+        let triforce_channels = self
+            .devices
+            .get(&session.remote_key)
+            .and_then(|device| device.triforce_seen)
+            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(8));
         self.link = Some(Link {
             id,
             key: session.remote_key,
@@ -2477,6 +3289,7 @@ impl Engine {
             deadline: Instant::now() + Duration::from_secs(120),
             last_seen: Instant::now(),
             game_channels,
+            triforce_channels,
         });
         self.remote = None;
         self.send(&Event::Hello {
@@ -2681,12 +3494,20 @@ impl Engine {
                 );
                 match game {
                     protocol::GameId::Dusklight => self.authenticated_event(event)?,
-                    protocol::GameId::Totk => {
-                        self.totk
-                            .identify(&self.identity.public, self.audit.username());
-                        self.totk.bind_peer(&peer)?;
-                        let frames = self.totk.handle(event)?;
-                        self.send_totk_frames(frames)?;
+                    protocol::GameId::Totk | protocol::GameId::Triforce => {
+                        ensure!(
+                            game != protocol::GameId::Triforce || self.native_supported(game),
+                            "Triforce support was not negotiated with this peer"
+                        );
+                        let identity = self.identity.public.clone();
+                        let username = self.audit.username().to_owned();
+                        let channel = self.native_channel(game)?;
+                        channel.identify(&identity, &username);
+                        channel.bind_peer(&peer)?;
+                        let frames = channel
+                            .handle(event)
+                            .with_context(|| format!("{game:?} save channel"))?;
+                        self.send_native_frames(game, frames)?;
                     }
                 }
             }
@@ -3744,12 +4565,23 @@ impl Engine {
     }
 
     fn send_totk_frames(&mut self, frames: Vec<Event>) -> Result<()> {
+        self.send_native_frames(protocol::GameId::Totk, frames)
+    }
+
+    fn send_native_frames(&mut self, game: protocol::GameId, frames: Vec<Event>) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            game != protocol::GameId::Triforce || self.native_supported(game),
+            "Update both managers before exchanging Triforce saves or play reservations"
+        );
         let scoped = self.link.as_ref().is_some_and(|link| link.game_channels);
         let frames: Vec<_> = frames
             .into_iter()
             .map(|event| {
                 if scoped {
-                    protocol::game_packet(protocol::GameId::Totk, &event)
+                    protocol::game_packet(game, &event)
                 } else {
                     Ok(event)
                 }
@@ -3764,18 +4596,18 @@ impl Engine {
         let link = self
             .link
             .as_ref()
-            .context("No paired TotK transfer channel")?;
+            .context("No paired native-game transfer channel")?;
         let writer = link.writer.clone();
         let id = link.id;
         let sender = self.sender.clone();
         thread::Builder::new()
-            .name("totk-save-send".into())
+            .name(format!("{game:?}-save-send"))
             .spawn(move || {
                 let result = (|| -> Result<()> {
                     for frame in frames {
                         writer
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("TotK channel lock poisoned"))?
+                            .map_err(|_| anyhow::anyhow!("Native-game channel lock poisoned"))?
                             .send(&frame)?;
                     }
                     Ok(())
@@ -3784,7 +4616,7 @@ impl Engine {
                     && sender
                         .send(Input::Disconnected {
                             id,
-                            reason: format!("TotK transfer failed: {error:#}"),
+                            reason: format!("{game:?} transfer failed: {error:#}"),
                         })
                         .is_err()
                 {
@@ -3799,13 +4631,13 @@ impl Engine {
     fn send_state(&mut self) -> Result<()> {
         if self.ready() {
             self.send(&Event::State {
-                hash: if self.save_valid && !self.maintenance {
+                hash: if self.save_valid && !self.maintenance && !self.source.building {
                     self.local_hash.clone()
                 } else {
                     None
                 },
-                save_ready: self.save_valid && !self.maintenance,
-                game: self.game_running,
+                save_ready: self.save_valid && !self.maintenance && !self.source.building,
+                game: self.game_running || self.source.building,
                 lock: self.settings.play_lock.clone(),
             })?;
         }
@@ -4274,15 +5106,19 @@ impl Engine {
             }
             self.snapshot_tick()?;
             self.sync_tick()?;
-            let supported = self.game_channels_ready();
-            if supported {
-                self.totk.bind_peer(&self.peer_key()?)?;
-            }
-            match self.totk.tick(supported) {
-                Ok(frames) if !frames.is_empty() => self.send_totk_frames(frames)?,
-                Ok(_) => {}
-                Err(error) => {
-                    self.totk.status.message = format!("TotK sync needs attention: {error:#}")
+            for game in [protocol::GameId::Totk, protocol::GameId::Triforce] {
+                let supported = self.native_supported(game);
+                if supported {
+                    let peer = self.peer_key()?;
+                    self.native_channel(game)?.bind_peer(&peer)?;
+                }
+                match self.native_channel(game)?.tick(supported) {
+                    Ok(frames) if !frames.is_empty() => self.send_native_frames(game, frames)?,
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.native_channel(game)?.status.message =
+                            format!("{game:?} sync needs attention: {error:#}");
+                    }
                 }
             }
         }
@@ -4295,7 +5131,7 @@ impl Engine {
             .retain(|_, d| d.seen.elapsed() < Duration::from_secs(8));
         if self.last_discovery.elapsed() >= Duration::from_secs(2) {
             self.last_discovery = Instant::now();
-            for magic in ["twilightProto/1", "twilightProto/2"] {
+            for magic in ["twilightProto/1", "twilightProto/2", "twilightProto/3"] {
                 let bytes = serde_json::to_vec(&Advertisement {
                     magic: magic.into(),
                     network: network.fingerprint.clone(),
@@ -4326,12 +5162,20 @@ impl Engine {
                                     .and_then(|previous| previous.game_channels_seen)
                                     .filter(|seen| seen.elapsed() < Duration::from_secs(8));
                             }
+                            if device.triforce_seen.is_none() {
+                                device.triforce_seen = self
+                                    .devices
+                                    .get(&device.key)
+                                    .and_then(|previous| previous.triforce_seen)
+                                    .filter(|seen| seen.elapsed() < Duration::from_secs(8));
+                            }
                             if self.devices.contains_key(&device.key) || self.devices.len() < 32 {
                                 if let Some(link) = &mut self.link
                                     && link.key == device.key
                                     && device.game_channels_seen.is_some()
                                 {
                                     link.game_channels = true;
+                                    link.triforce_channels |= device.triforce_seen.is_some();
                                 }
                                 self.devices.insert(device.key.clone(), device);
                             }
@@ -4796,6 +5640,7 @@ impl Engine {
 
     fn publish(&mut self) {
         self.totk.expire();
+        self.triforce.expire();
         let link = self.link.as_ref();
         let snapshot = Snapshot {
             settings: self.settings.clone(),
@@ -4826,6 +5671,7 @@ impl Engine {
             transfer: self.transfer.clone(),
             install_busy: self.install_busy,
             latest_release: self.latest_release.clone(),
+            latest_totk_release: self.latest_totk_release.clone(),
             selected_release: self.selected_release.clone(),
             texture_busy: self.texture_busy,
             textures: self.texture_state.clone(),
@@ -4833,6 +5679,9 @@ impl Engine {
             history_preview: self.history_preview.clone(),
             self_updates: self.self_updates.clone(),
             totk: self.totk.status.clone(),
+            triforce: self.triforce.status.clone(),
+            triforce_supported: self.native_supported(protocol::GameId::Triforce),
+            source: self.source.clone(),
             message: self.message.clone(),
             error: self.error.clone(),
             shutdown: self.shutdown,
@@ -5274,6 +6123,14 @@ mod tests {
                     engine.root.join("totk-transfers"),
                     Ok(engine.root.join("TotKRecomp")),
                 );
+                engine.triforce = totk::Channel::for_game(
+                    engine.root.join("triforce-transfers"),
+                    Ok(engine.root.join("Triforce")),
+                    crate::native::Game::Triforce,
+                );
+                engine
+                    .triforce
+                    .identify(&engine.identity.public, engine.audit.username());
                 engine
                     .totk
                     .identify(&engine.identity.public, engine.audit.username());
@@ -5413,6 +6270,85 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_triforce_sync_requires_peer_support_and_consent_and_keeps_other_games_separate()
+    -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        harness.pair()?;
+        let left_install = harness.left.root.join("Triforce");
+        let right_install = harness.right.root.join("Triforce");
+        for install in [&left_install, &right_install] {
+            fs::create_dir_all(install.join("user"))?;
+            fs::write(install.join("Triforce.exe"), b"fixture, never executed")?;
+            fs::write(install.join("image.bin"), b"synthetic game marker")?;
+            fs::create_dir(install.join("romfs"))?;
+        }
+        triforce::tests::seed(&left_install.join("user"), 7)?;
+        let left_save = harness.left.current_hash()?;
+        let right_save = harness.right.current_hash()?;
+        assert!(
+            harness
+                .left
+                .command(Command::Native {
+                    game: protocol::GameId::Triforce,
+                    command: NativeCommand::Send,
+                })
+                .is_err()
+        );
+        assert!(triforce::snapshot(&right_install.join("user"))?.is_none());
+        harness
+            .left
+            .link
+            .as_mut()
+            .context("Missing left link")?
+            .triforce_channels = true;
+        harness
+            .right
+            .link
+            .as_mut()
+            .context("Missing right link")?
+            .triforce_channels = true;
+        harness.left.command(Command::Native {
+            game: protocol::GameId::Triforce,
+            command: NativeCommand::Refresh,
+        })?;
+        harness.pump_until(|h| h.left.triforce.status.peer_checked)?;
+        harness.left.command(Command::Native {
+            game: protocol::GameId::Triforce,
+            command: NativeCommand::Send,
+        })?;
+        harness.pump_until(|h| h.right.triforce.status.pending)?;
+        assert!(triforce::snapshot(&right_install.join("user"))?.is_none());
+        harness.right.command(Command::Native {
+            game: protocol::GameId::Triforce,
+            command: NativeCommand::Accept(true),
+        })?;
+        harness.pump_until(|h| !h.left.triforce.status.busy && !h.right.triforce.status.busy)?;
+        assert_eq!(
+            triforce::snapshot(&left_install.join("user"))?.map(|save| save.hash),
+            triforce::snapshot(&right_install.join("user"))?.map(|save| save.hash),
+        );
+        assert_eq!(harness.left.current_hash()?, left_save);
+        assert_eq!(harness.right.current_hash()?, right_save);
+        assert!(
+            !harness
+                .left
+                .root
+                .join("totk-transfers")
+                .join("session.json")
+                .try_exists()?
+        );
+        assert!(
+            !harness
+                .right
+                .root
+                .join("totk-transfers")
+                .join("session.json")
+                .try_exists()?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn encrypted_totk_transfer_requires_consent_and_leaves_dusklight_unchanged() -> Result<()> {
         let mut harness = Harness::new(Some(variant(1)), Some(variant(1)))?;
         harness.pair()?;
@@ -5519,6 +6455,145 @@ mod tests {
             "App update metadata failures must not fail LAN syncing"
         );
         assert!(!h.left.self_updates.available());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn totk_release_checks_and_failed_updates_leave_dusklight_unchanged() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let settings = fs::read(harness.left.root.join("settings.json"))?;
+        let save = harness.left.current_hash()?;
+        harness.left.totk = totk::Channel::new(
+            harness.left.root.join("totk-test"),
+            Ok(harness.left.root.join("game-test")),
+        );
+        harness.left.install_busy = true;
+        harness.left.input(Input::ReleaseChecked {
+            game: protocol::GameId::Totk,
+            result: install::tests::totk_release_fixture(),
+        })?;
+        assert!(harness.left.latest_totk_release.is_some());
+        assert!(harness.left.latest_release.is_none());
+        assert!(!harness.left.install_busy);
+        harness.left.install_busy = true;
+        harness.left.totk.status.updating = true;
+        let error = harness
+            .left
+            .input(Input::TotkUpdated(Err(anyhow::anyhow!(
+                "simulated setup failure"
+            ))))
+            .err()
+            .context("A failed update was reported as successful")?;
+        assert!(format!("{error:#}").contains("simulated setup failure"));
+        assert!(!harness.left.install_busy);
+        assert!(!harness.left.totk.status.updating);
+        assert_eq!(fs::read(harness.left.root.join("settings.json"))?, settings);
+        assert_eq!(harness.left.current_hash()?, save);
+        Ok(())
+    }
+
+    #[test]
+    fn source_build_approval_and_idle_guards_run_before_tool_or_source_execution() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let before = harness.left.current_hash()?;
+        for setup in [
+            source_build::SdkSetup::DotNet10,
+            source_build::SdkSetup::Msys2Ucrt64,
+        ] {
+            let error = harness
+                .left
+                .command(Command::InstallSourceSdk {
+                    game: protocol::GameId::Totk,
+                    setup,
+                    approved: false,
+                })
+                .err()
+                .context("Unapproved SDK setup was accepted")?;
+            assert!(error.to_string().contains("Approve the SDK installation"));
+        }
+        assert!(!harness.left.root.join("build-logs").try_exists()?);
+        harness.left.source.preferences.set(
+            protocol::GameId::Dusklight,
+            source_build::Preference {
+                method: source_build::Method::Source,
+                ..source_build::Preference::default()
+            },
+        )?;
+        harness.left.source.plan = Some(source_build::Plan {
+            game: protocol::GameId::Dusklight,
+            tag: "v2.0.3".into(),
+            commit: "a".repeat(40),
+            review_url: format!(
+                "https://github.com/TwilitRealm/dusklight/commit/{}",
+                "a".repeat(40)
+            ),
+        });
+        assert!(
+            harness
+                .left
+                .command(Command::BuildSource {
+                    game: protocol::GameId::Dusklight,
+                    commit: "a".repeat(40),
+                    approved: false,
+                })
+                .is_err()
+        );
+        harness.left.settings.play_lock = Some(PlayLock {
+            owner: harness.left.identity.public.clone(),
+            token: "b".repeat(64),
+        });
+        assert!(
+            harness
+                .left
+                .command(Command::BuildSource {
+                    game: protocol::GameId::Dusklight,
+                    commit: "a".repeat(40),
+                    approved: true,
+                })
+                .is_err()
+        );
+        assert!(!harness.left.source.busy && !harness.left.install_busy);
+        assert!(harness.left.settings.play_lock.is_some());
+        assert_eq!(harness.left.current_hash()?, before);
+        assert!(!harness.left.root.join("build-tools").try_exists()?);
+        assert!(!harness.left.root.join("source-builds").try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_and_cancelled_source_builds_unpause_games_without_selecting_or_changing_saves()
+    -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let before = harness.left.current_hash()?;
+        let settings = fs::read(harness.left.root.join("settings.json"))?;
+        for cancelled in [false, true] {
+            harness.left.source.game = Some(protocol::GameId::Triforce);
+            harness.left.source.busy = true;
+            harness.left.source.building = true;
+            harness.left.install_busy = true;
+            harness.left.totk.status.updating = true;
+            harness.left.triforce.status.updating = true;
+            let error = if cancelled {
+                anyhow::Error::new(source_build::Cancelled)
+            } else {
+                anyhow::anyhow!("Synthetic compiler failure")
+            };
+            let result = harness.left.input(Input::SourceBuilt {
+                game: protocol::GameId::Triforce,
+                result: Err(error),
+            });
+            assert_eq!(result.is_ok(), cancelled);
+            assert!(
+                !harness.left.source.busy
+                    && !harness.left.source.building
+                    && !harness.left.install_busy
+            );
+            assert!(!harness.left.totk.status.updating && !harness.left.triforce.status.updating);
+            assert!(harness.left.source.built.is_none());
+            assert_eq!(harness.left.current_hash()?, before);
+            assert_eq!(fs::read(harness.left.root.join("settings.json"))?, settings);
+        }
         Ok(())
     }
 

@@ -6,16 +6,23 @@ pub mod files;
 pub mod history;
 pub mod install;
 pub mod lan;
+pub(crate) mod native;
 pub mod play;
+#[cfg(windows)]
+pub(crate) mod process_job;
 pub mod protocol;
 pub mod raw_card;
 pub mod runtime;
 pub mod save_data;
 pub mod save_location;
 pub mod self_update;
+pub mod source_build;
 pub mod sync_policy;
 pub mod textures;
 pub mod totk;
 pub mod totk_save;
+pub mod totk_update;
+pub mod triforce;
+pub mod triforce_save;
 #[cfg(windows)]
 pub mod ui;

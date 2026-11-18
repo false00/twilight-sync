@@ -1,5 +1,5 @@
 use crate::protocol::GameId;
-use crate::runtime::{Backend, Command, Snapshot};
+use crate::runtime::{Backend, Command, NativeCommand, Snapshot};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -10,6 +10,7 @@ use tray_icon::{
 };
 
 const WINDOW_TITLE: &str = "Twilight Sync";
+const TOTK_SETUP_LABEL: &str = "Download official TotK Recomp setup";
 
 mod background;
 mod design;
@@ -25,6 +26,7 @@ enum Page {
     Devices,
     Library,
     Totk,
+    Triforce,
     Textures,
     History,
     Security,
@@ -46,6 +48,7 @@ impl Page {
             Self::Devices => "Devices",
             Self::Library => "Games",
             Self::Totk => "Tears of the Kingdom",
+            Self::Triforce => "Ocarina of Time",
             Self::Textures => "Texture packs",
             Self::History => "Save history",
             Self::Security => "Settings",
@@ -58,6 +61,7 @@ impl Page {
             Self::Devices => "Approve your network and pair one trusted device.",
             Self::Library => "",
             Self::Totk => "",
+            Self::Triforce => "",
             Self::Textures => "Import authorized texture packs and choose the active version.",
             Self::History => "Save branches, progress changes, and recovery.",
             Self::Security => "Appearance, startup, application updates, and privacy.",
@@ -70,6 +74,7 @@ impl Page {
             Self::Devices => "\u{e772}",
             Self::Library => "\u{e7fc}",
             Self::Totk => "\u{e7fc}",
+            Self::Triforce => "\u{e7fc}",
             Self::Textures => "\u{e91b}",
             Self::History => "\u{e81c}",
             Self::Security => "\u{e713}",
@@ -118,6 +123,8 @@ struct Dashboard {
     shown_fork: Option<(String, String, bool)>,
     fork_dialog_open: bool,
     fork_choice: Option<bool>,
+    source_approved: bool,
+    source_reviewed: Option<(GameId, String)>,
 }
 
 fn make_tray(startup: bool, automatic_updates: bool) -> Result<Tray> {
@@ -198,6 +205,22 @@ pub fn run_totk(backend: Backend) -> Result<()> {
     run_page(backend, false, Page::Totk, WINDOW_TITLE, appearance, 1.0)
 }
 
+pub fn open_triforce_controls() -> Result<bool> {
+    background::open_selected_game(WINDOW_TITLE, GameId::Triforce)
+}
+
+pub fn run_triforce(backend: Backend) -> Result<()> {
+    let appearance = AppearanceStore::load(&crate::config::root_directory()?)?;
+    run_page(
+        backend,
+        false,
+        Page::Triforce,
+        WINDOW_TITLE,
+        appearance,
+        1.0,
+    )
+}
+
 #[cfg(debug_assertions)]
 pub fn run_smoke(
     backend: Backend,
@@ -211,6 +234,7 @@ pub fn run_smoke(
         "devices" => Page::Devices,
         "library" => Page::Library,
         "totk" => Page::Totk,
+        "triforce" => Page::Triforce,
         "textures" => Page::Textures,
         "history" => Page::History,
         "security" => Page::Security,
@@ -243,7 +267,9 @@ fn run_page(
     } else {
         None
     };
-    let initial_game = if initial_page == Page::Totk {
+    let initial_game = if initial_page == Page::Triforce {
+        GameId::Triforce
+    } else if initial_page == Page::Totk {
         GameId::Totk
     } else {
         game_view_path
@@ -305,7 +331,7 @@ fn run_page(
             Ok(Box::new(Dashboard {
                 backend,
                 tray,
-                page: if initial_page == Page::Totk {
+                page: if matches!(initial_page, Page::Totk | Page::Triforce) {
                     Page::Overview
                 } else {
                     initial_page
@@ -324,6 +350,8 @@ fn run_page(
                 shown_fork: None,
                 fork_dialog_open: false,
                 fork_choice: None,
+                source_approved: false,
+                source_reviewed: None,
             }))
         }),
     )
@@ -344,16 +372,20 @@ impl Dashboard {
             if event.id == self.tray.show {
                 self.background.reveal();
             } else if event.id == self.tray.sync {
-                self.dispatch(if self.game == GameId::Totk {
-                    Command::SendTotk
-                } else {
-                    Command::SendSave
+                self.dispatch(match self.game {
+                    GameId::Dusklight => Command::SendSave,
+                    game => Command::Native {
+                        game,
+                        command: NativeCommand::Send,
+                    },
                 });
             } else if event.id == self.tray.launch {
-                self.dispatch(if self.game == GameId::Totk {
-                    Command::LaunchTotk { local_only: false }
-                } else {
-                    Command::Launch
+                self.dispatch(match self.game {
+                    GameId::Dusklight => Command::Launch,
+                    game => Command::Native {
+                        game,
+                        command: NativeCommand::Launch { local_only: false },
+                    },
                 });
             } else if event.id == *self.tray.startup.id() {
                 self.dispatch(Command::SetStartup(self.tray.startup.is_checked()));
@@ -517,6 +549,16 @@ impl Dashboard {
     }
 
     fn notice(ui: &mut egui::Ui, tone: Tone, title: &str, body: &str) {
+        Self::notice_with_link(ui, tone, title, body, None);
+    }
+
+    fn notice_with_link(
+        ui: &mut egui::Ui,
+        tone: Tone,
+        title: &str,
+        body: &str,
+        link: Option<(&str, &str)>,
+    ) {
         let p = Palette::of(ui);
         let (foreground, background, glyph) = match tone {
             Tone::Info => (p.accent, p.info_background, "\u{e946}"),
@@ -536,9 +578,25 @@ impl Dashboard {
                         if !body.is_empty() {
                             ui.label(RichText::new(body).color(p.text));
                         }
+                        if let Some((label, url)) = link {
+                            ui.hyperlink_to(label, url);
+                        }
                     });
                 });
             });
+    }
+
+    fn action_needed(ui: &mut egui::Ui, game: GameId, snapshot: &Snapshot, error: &str) -> bool {
+        Self::notice(ui, Tone::Error, "Action needed", error);
+        if game == GameId::Totk && !snapshot.totk.installed {
+            Self::secondary(
+                ui,
+                "Select your local base game, update and keys in Games; Twilight Sync handles the official installation.",
+            );
+            ui.button("Set up TotK automatically").clicked()
+        } else {
+            false
+        }
     }
 
     fn primary(ui: &mut egui::Ui, enabled: bool, title: &str) -> egui::Response {
@@ -712,11 +770,25 @@ impl Dashboard {
                     remote_hash: remote_hash.clone(),
                     use_remote,
                 },
+                (GameId::Triforce, game_view::CompareAction::Use(use_remote)) => Command::Native {
+                    game: GameId::Triforce,
+                    command: NativeCommand::Resolve {
+                        local_hash: local_hash.clone(),
+                        remote_hash: remote_hash.clone(),
+                        use_remote,
+                    },
+                },
                 (GameId::Dusklight, game_view::CompareAction::Continue) => Command::ContinueLocal {
                     expected: Some(local_hash.clone()),
                 },
                 (GameId::Totk, game_view::CompareAction::Continue) => Command::ContinueTotk {
                     expected: Some(local_hash.clone()),
+                },
+                (GameId::Triforce, game_view::CompareAction::Continue) => Command::Native {
+                    game: GameId::Triforce,
+                    command: NativeCommand::Continue {
+                        expected: Some(local_hash.clone()),
+                    },
                 },
             };
             self.dispatch(command);
@@ -758,6 +830,7 @@ impl Dashboard {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(game, GameId::Dusklight, "Dusklight");
             ui.selectable_value(game, GameId::Totk, "Tears of the Kingdom");
+            ui.selectable_value(game, GameId::Triforce, "Ocarina of Time");
         });
         *game != before
     }
@@ -767,10 +840,18 @@ impl Dashboard {
             game_view::Action::Play => match game {
                 GameId::Dusklight => self.start_play(snapshot),
                 GameId::Totk => self.dispatch(Command::LaunchTotk { local_only: false }),
+                GameId::Triforce => self.dispatch(Command::Native {
+                    game,
+                    command: NativeCommand::Launch { local_only: false },
+                }),
             },
             game_view::Action::Sync => self.dispatch(match game {
                 GameId::Dusklight => Command::SendSave,
                 GameId::Totk => Command::SendTotk,
+                GameId::Triforce => Command::Native {
+                    game,
+                    command: NativeCommand::Send,
+                },
             }),
             game_view::Action::Compare => {
                 self.fork_choice = None;
@@ -781,11 +862,19 @@ impl Dashboard {
                 self.dispatch(match game {
                     GameId::Dusklight => Command::HistoryPage(None),
                     GameId::Totk => Command::TotkHistoryPage(None),
+                    GameId::Triforce => Command::Native {
+                        game,
+                        command: NativeCommand::HistoryPage(None),
+                    },
                 });
             }
             game_view::Action::Refresh => self.dispatch(match game {
                 GameId::Dusklight => Command::RefreshSave,
                 GameId::Totk => Command::RefreshTotk,
+                GameId::Triforce => Command::Native {
+                    game,
+                    command: NativeCommand::Refresh,
+                },
             }),
             game_view::Action::Setup => self.page = Page::Library,
             game_view::Action::Devices => self.page = Page::Devices,
@@ -800,6 +889,10 @@ impl Dashboard {
             game_view::Action::Recovery(approved) => self.dispatch(match game {
                 GameId::Dusklight => Command::AcceptRecovery(approved),
                 GameId::Totk => Command::AcceptTotkRecovery(approved),
+                GameId::Triforce => Command::Native {
+                    game,
+                    command: NativeCommand::AcceptRecovery(approved),
+                },
             }),
             game_view::Action::Home => self.page = Page::Overview,
             game_view::Action::Locate => {
@@ -811,6 +904,10 @@ impl Dashboard {
                     self.dispatch(match game {
                         GameId::Dusklight => Command::SetExecutable(path),
                         GameId::Totk => Command::SetTotkExecutable(path),
+                        GameId::Triforce => Command::Native {
+                            game,
+                            command: NativeCommand::SetExecutable(path),
+                        },
                     });
                 }
             }
@@ -825,6 +922,10 @@ impl Dashboard {
                     self.dispatch(match game {
                         GameId::Dusklight => Command::Recover,
                         GameId::Totk => Command::RecoverTotk,
+                        GameId::Triforce => Command::Native {
+                            game,
+                            command: NativeCommand::Recover,
+                        },
                     });
                 }
             }
@@ -843,30 +944,25 @@ impl Dashboard {
         if let Some(action) = game_view::installation(ui, &model) {
             self.game_action(snapshot, model.game, action);
         }
-        if self.game == GameId::Dusklight {
-            self.library(ui, snapshot);
-        } else {
-            ui.add_space(16.0);
-            Self::section_title(ui, "Game tools");
-            Self::secondary(
-                ui,
-                "Native installation managed separately. Save sync, protected play, comparison and history are available in Save controls.",
-            );
-        }
+        self.library(ui, snapshot);
     }
 
-    fn totk_session_blocker(snapshot: &Snapshot) -> Option<&str> {
-        let state = &snapshot.totk;
-        if let Some(error) = &state.verification_error {
+    fn native_session_blocker<'a>(
+        snapshot: &Snapshot,
+        state: &'a crate::totk::Status,
+    ) -> Option<&'a str> {
+        if state.updating {
+            Some("Game files are being updated or rebuilt. Play and save sync are paused.")
+        } else if let Some(error) = &state.verification_error {
             Some(error.as_str())
         } else if !state.checked {
             Some("The game installation and save are still being checked.")
         } else if !state.installed {
-            Some("The native TotK installation was not found.")
+            Some("The native game installation was not found.")
         } else if state.running {
-            Some("TotK is running on this PC. Save replacement is paused.")
+            Some("The game is running on this PC. Save replacement is paused.")
         } else if state.remote_running {
-            Some("The paired PC is playing TotK. Save replacement is paused.")
+            Some("The paired PC is playing. Save replacement is paused.")
         } else if state.launch_pending {
             Some("Waiting for the paired PC to reserve the play session.")
         } else if state.release_pending && snapshot.ready {
@@ -874,7 +970,7 @@ impl Dashboard {
         } else if state.pending {
             Some("An incoming save is waiting for your Accept or Keep decision.")
         } else if state.busy {
-            Some("A TotK save transfer or comparison is in progress.")
+            Some("A save transfer or comparison is in progress.")
         } else if state.recovery_pending {
             Some("A completed-session recovery is waiting for your decision.")
         } else if state.lock.is_some() || state.remote_lock.is_some() {
@@ -888,7 +984,7 @@ impl Dashboard {
                     "The stored reservation belongs to the paired PC. Reconnect it for completed-session recovery.",
                 )
             } else {
-                Some("A stored TotK play reservation needs completed-session recovery.")
+                Some("A stored play reservation needs completed-session recovery.")
             }
         } else if snapshot.self_updates.preparing {
             Some("Twilight Sync is preparing an app update.")
@@ -897,29 +993,34 @@ impl Dashboard {
         }
     }
 
-    fn totk_play_blocker(snapshot: &Snapshot) -> Option<&str> {
-        Self::totk_session_blocker(snapshot).or_else(|| {
-            if snapshot.ready && snapshot.totk.peer_checked && snapshot.totk.remote_installed && !snapshot.totk.remote_save_ready {
+    fn native_play_blocker<'a>(
+        snapshot: &Snapshot,
+        state: &'a crate::totk::Status,
+    ) -> Option<&'a str> {
+        Self::native_session_blocker(snapshot, state).or_else(|| {
+            if snapshot.ready && state.peer_checked && state.remote_installed && !state.remote_save_ready {
                 Some("The paired PC's save is not verified yet. Protected play is waiting for its valid state.")
-            } else { snapshot.totk.conflict.then_some(
+            } else { state.conflict.then_some(
                 "Both PCs have different progress. A branch choice or Keep both is required before play."
             ) }
         })
     }
 
-    fn totk_sync_blocker(snapshot: &Snapshot) -> Option<&str> {
-        Self::totk_session_blocker(snapshot).or_else(|| {
-            let state = &snapshot.totk;
+    fn native_sync_blocker<'a>(
+        snapshot: &Snapshot,
+        state: &'a crate::totk::Status,
+    ) -> Option<&'a str> {
+        Self::native_session_blocker(snapshot, state).or_else(|| {
             if !snapshot.ready {
                 Some("The paired PC is offline. This PC's progress is retained locally.")
             } else if !state.peer_checked {
-                Some("Waiting for the paired PC's TotK save status.")
+                Some("Waiting for the paired PC's game save status.")
             } else if !state.remote_installed {
-                Some("The paired PC has no available native TotK installation.")
+                Some("The paired PC has no available native installation.")
             } else if !state.remote_save_ready {
                 Some("The paired PC's committed save is not verified and ready yet.")
             } else if state.local_hash.is_none() {
-                Some("This PC has no committed TotK save to send.")
+                Some("This PC has no committed save to send.")
             } else if state.local_hash == state.remote_hash {
                 Some("Both save snapshots already match. There is nothing to send.")
             } else {
@@ -1159,12 +1260,482 @@ impl Dashboard {
     }
 
     fn library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let p = Palette::of(ui);
-        let available = Self::management_available(snapshot);
+        let game = self.game;
+        let mut preference = snapshot.source.preferences.get(game).clone();
+        let original = preference.clone();
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "Installation method");
+            ui.add_enabled_ui(
+                snapshot.source.preferences_valid
+                    && !snapshot.source.busy
+                    && !snapshot.install_busy,
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if game != GameId::Triforce {
+                            ui.radio_value(
+                                &mut preference.method,
+                                crate::source_build::Method::Official,
+                                "Official release / setup",
+                            );
+                        }
+                        ui.radio_value(
+                            &mut preference.method,
+                            crate::source_build::Method::Source,
+                            "Build from source",
+                        );
+                    });
+                },
+            );
+            if game == GameId::Triforce {
+                Self::secondary(
+                    ui,
+                    "Twilight Sync builds Triforce locally instead of running its publisher's Setup or downloading a prebuilt game.",
+                );
+            }
+            if !snapshot.source.preferences_valid {
+                Self::notice(
+                    ui,
+                    Tone::Error,
+                    "Source-build preferences need attention",
+                    snapshot
+                        .source
+                        .error
+                        .as_deref()
+                        .unwrap_or("Reset source-build preferences before using source builds."),
+                );
+                if ui
+                    .add_enabled(
+                        !snapshot.source.busy,
+                        egui::Button::new("Reset source-build preferences"),
+                    )
+                    .clicked()
+                {
+                    self.dispatch(Command::ResetSourcePreferences);
+                }
+            }
+        });
+        if preference.method == crate::source_build::Method::Source {
+            self.source_tools(ui, snapshot, &mut preference, &original);
+            if game == GameId::Dusklight {
+                self.disc_tools(ui, snapshot);
+            }
+        } else {
+            self.official_library(ui, snapshot, &mut preference);
+        }
+        if preference != original {
+            self.source_approved = false;
+            self.dispatch(Command::SetSourcePreference { game, preference });
+        }
+    }
+
+    fn source_input(
+        ui: &mut egui::Ui,
+        label: &str,
+        path: &mut Option<PathBuf>,
+        extensions: &[&str],
+        folder: bool,
+    ) {
+        ui.label(RichText::new(label).strong());
+        if let Some(selected) = path.as_deref() {
+            Self::path(ui, selected);
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(if folder {
+                    "Choose folder..."
+                } else {
+                    "Choose file..."
+                })
+                .clicked()
+            {
+                let dialog = rfd::FileDialog::new().set_title(label);
+                let selected = if folder {
+                    dialog.pick_folder()
+                } else {
+                    dialog.add_filter(label, extensions).pick_file()
+                };
+                if let Some(selected) = selected {
+                    *path = Some(selected);
+                }
+            }
+            if path.is_some() && ui.button("Clear").clicked() {
+                *path = None;
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    fn source_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        preference: &mut crate::source_build::Preference,
+        original: &crate::source_build::Preference,
+    ) {
+        let game = self.game;
+        let state = &snapshot.source;
+        let plan = state.plan.as_ref().filter(|plan| plan.game == game);
+        let reviewed = plan.map(|plan| (game, plan.commit.clone()));
+        if self.source_reviewed != reviewed {
+            self.source_approved = false;
+            self.source_reviewed = reviewed;
+        }
+        let previous = match game {
+            GameId::Dusklight => snapshot
+                .settings
+                .game_exe
+                .as_ref()
+                .and_then(|path| path.parent()),
+            GameId::Totk => snapshot.totk.install_path.as_deref(),
+            GameId::Triforce => snapshot.triforce.install_path.as_deref(),
+        };
+        ui.add_space(12.0);
+        Self::notice(
+            ui,
+            Tone::Warning,
+            "Source builds: slower, not a safety guarantee",
+            crate::source_build::WARNING,
+        );
+        ui.hyperlink_to("Using a separate Windows Sandbox / VM", "https://learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/");
         ui.add_space(12.0);
         Self::card(ui, |ui| {
-            Self::section_title(ui, "Dusklight updates");
-            if let Some(release) = &snapshot.latest_release {
+            Self::section_title(ui, "1. Source and build tools");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!snapshot.install_busy && !snapshot.texture_busy && !snapshot.self_updates.preparing && state.preferences_valid,
+                    egui::Button::new("Check source version / prerequisites")).clicked() {
+                    self.source_approved = false;
+                    self.dispatch(Command::CheckSource(game));
+                }
+                if ui.add_enabled(!snapshot.install_busy && !snapshot.texture_busy && !snapshot.self_updates.preparing && state.preferences_valid,
+                    egui::Button::new("Prepare / verify official tools...")).clicked() {
+                    let approved = rfd::MessageDialog::new().set_title("Download official build tools")
+                        .set_description("Download and checksum-verify portable Git, uv/Python tooling, and this game's compiler/SDK archives from their official publisher repositories? This can use several GiB. Tools are kept per-user. Missing system SDKs are listed separately, with approved .NET/MSYS2 setup buttons where available. No game project scripts run during this preparation step.")
+                        .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                    if approved { self.dispatch(Command::PrepareSourceTools { game, approved }); }
+                }
+            });
+            if let Some(plan) = plan {
+                Self::status(ui, "Stable source tag", &plan.tag, Palette::of(ui).text);
+                ui.add(
+                    egui::Label::new(RichText::new(format!("Commit: {}", plan.commit)).monospace())
+                        .wrap(),
+                );
+                ui.hyperlink_to("Review this exact source commit", &plan.review_url);
+            } else {
+                ui.hyperlink_to(
+                    "Upstream source repository",
+                    crate::source_build::source_url(game),
+                );
+                Self::secondary(
+                    ui,
+                    "Check the stable source tag first. No project code runs during the metadata check.",
+                );
+            }
+            if state.game == Some(game) {
+                for prerequisite in &state.prerequisites {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(if prerequisite.ready {
+                                "Found"
+                            } else {
+                                "Needs setup"
+                            })
+                            .color(if prerequisite.ready {
+                                Palette::of(ui).success
+                            } else {
+                                Palette::of(ui).warning
+                            }),
+                        );
+                        ui.label(prerequisite.name);
+                        if !prerequisite.ready {
+                            ui.hyperlink_to("Official setup instructions", prerequisite.url);
+                        }
+                    });
+                    if let Some(detail) = &prerequisite.detail {
+                        Self::secondary(ui, detail);
+                    }
+                    if !prerequisite.ready
+                        && let Some(setup) = prerequisite.setup
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Copy setup commands").clicked() {
+                                ui.ctx().copy_text(setup.script());
+                            }
+                            if ui
+                                .add_enabled(
+                                    !snapshot.install_busy
+                                        && !snapshot.texture_busy
+                                        && !snapshot.self_updates.preparing,
+                                    egui::Button::new(setup.label()),
+                                )
+                                .clicked()
+                            {
+                                let approved = rfd::MessageDialog::new()
+                                    .set_title("Set up source-build SDK")
+                                    .set_description(setup.notice())
+                                    .set_buttons(rfd::MessageButtons::YesNo)
+                                    .show()
+                                    == rfd::MessageDialogResult::Yes;
+                                if approved {
+                                    self.source_approved = false;
+                                    self.dispatch(Command::InstallSourceSdk {
+                                        game,
+                                        setup,
+                                        approved,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                if state
+                    .prerequisites
+                    .iter()
+                    .any(|item| !item.ready && item.setup.is_some())
+                {
+                    Self::secondary(
+                        ui,
+                        "After running copied setup commands, click Check source version / prerequisites above to refresh these results. The automatic setup button rechecks them for you.",
+                    );
+                }
+            }
+            Self::secondary(
+                ui,
+                "Official archive checksums verify download integrity, not the safety of a publisher or source code. Some SDKs are installed separately; Python/project dependencies are set up during an approved build.",
+            );
+        });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "2. Your local game files");
+            ui.add_enabled_ui(!state.busy && state.preferences_valid, |ui| {
+                match game {
+                    GameId::Dusklight => Self::secondary(ui, "Compiling Dusklight does not require game assets. Configure it with your own legally obtained disc dump after installation, as with an official release."),
+                    GameId::Totk => {
+                        Self::source_input(ui, "Your TotK base game", &mut preference.game_input, &["nsp","xci","nsz","xcz"], false);
+                        Self::source_input(ui, "Your supported TotK update", &mut preference.update, &["nsp","nsz"], false);
+                        Self::source_input(ui, "Your console's prod.keys", &mut preference.keys, &["keys"], false);
+                        ui.collapsing("Optional system fonts", |ui| {
+                            Self::source_input(ui, "Firmware folder (Chinese/Korean fonts)", &mut preference.firmware, &[], true);
+                        });
+                        Self::secondary(ui, "Keys and game files stay local in Twilight Sync's workflow. The approved source scripts still have your user permissions. TotK's source installer may open a shader-preparation window; normal gameplay does not start.");
+                    }
+                    GameId::Triforce => {
+                        Self::source_input(ui, "Your Triforce .nup", &mut preference.game_input, &["nup"], false);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Choose existing game / extracted folder...").clicked()
+                                && let Some(path) = rfd::FileDialog::new().set_title("Folder with romfs and exefs/.triforce_exefs").pick_folder()
+                            { preference.game_input = Some(path); }
+                        });
+                        if preference.game_input.is_none() {
+                            Self::secondary(ui, "When available, the current Triforce installation's retained game files are used automatically.");
+                        }
+                        Self::secondary(ui, "The game and its required Vulkan renderer are built locally. SDL and AV1/audio codec dependencies are included and checked; the separate WebGPU fallback is not required for Vulkan. Codec packages come from Takoroka/ffmpeg-av1, not FFmpeg.org; archive checksums do not prove source-to-binary safety.");
+                        Self::secondary(ui, "The new build selects Vulkan even if the previous folder used WebGPU; the previous folder and its renderer settings are retained.");
+                        ui.hyperlink_to("Codec supplier and source", "https://github.com/Takoroka/ffmpeg-av1");
+                        ui.collapsing("Optional graphics features", |ui| {
+                            ui.checkbox(&mut preference.renodx_hdr, "RenoDX HDR (upstream default; downloads its pinned shader/compiler dependencies)");
+                            ui.checkbox(&mut preference.amd_fsr4, "AMD FSR 4 (optional; downloads AMD's runtime)");
+                            ui.checkbox(&mut preference.nvidia_dlss, "NVIDIA DLSS / frame generation: I accept NVIDIA's SDK license and downloads");
+                            ui.hyperlink_to("Review NVIDIA SDK terms", "https://developer.nvidia.com/rtx/sdk-license");
+                            ui.checkbox(&mut preference.prepare_shaders, "Prepare shaders after compiling (runs the game's shader preparation, not normal gameplay)");
+                        });
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Compiler workers");
+                    ui.add(egui::DragValue::new(&mut preference.jobs).range(1..=16));
+                });
+                ui.checkbox(&mut preference.managed_tools, "Download missing official tool archives after approval (Python/project packages are set up separately)");
+            });
+            Self::secondary(
+                ui,
+                "New builds are installed side-by-side under your Games folder. Existing installs, saves and mods are preserved. Native builds need at least 64 GiB free; build workspaces can use tens of GiB and are retained.",
+            );
+        });
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(ui, "3. Review and build");
+            let session_blocker = Self::source_build_blocker(snapshot);
+            let input_problem =
+                crate::source_build::validate_inputs(game, preference, previous).err();
+            let manual_ready = plan.is_some()
+                && state.game == Some(game)
+                && state.prerequisites.iter().all(|item| item.ready);
+            ui.add_enabled_ui(!state.busy && state.preferences_valid && plan.is_some(), |ui| {
+                ui.checkbox(&mut self.source_approved, "I own the required game files, reviewed the selected commit, and accept running its source/build scripts and dependencies.");
+            });
+            if let Some(error) = &input_problem {
+                Self::secondary(ui, format!("{error:#}"));
+            }
+            if !manual_ready {
+                Self::secondary(
+                    ui,
+                    "Check the source version and finish any missing SDK prerequisites above before building.",
+                );
+            }
+            if let Some(reason) = session_blocker {
+                Self::secondary(ui, reason);
+            }
+            let enabled = self.source_approved
+                && manual_ready
+                && input_problem.is_none()
+                && !snapshot.install_busy
+                && !snapshot.texture_busy
+                && !snapshot.self_updates.preparing
+                && session_blocker.is_none()
+                && preference == original;
+            ui.horizontal_wrapped(|ui| {
+                if Self::primary(ui, enabled, "Build / update from source").clicked()
+                    && let Some(plan) = plan
+                {
+                    self.source_approved = false;
+                    self.dispatch(Command::BuildSource {
+                        game,
+                        commit: plan.commit.clone(),
+                        approved: true,
+                    });
+                }
+                if state.busy
+                    && !state.sdk_setup
+                    && state.game == Some(game)
+                    && state.log.is_some()
+                    && ui.button("Cancel build / download").clicked()
+                {
+                    self.dispatch(Command::CancelSource);
+                }
+            });
+            if state.game == Some(game) {
+                if state.busy {
+                    ui.spinner();
+                }
+                if !state.message.is_empty() {
+                    Self::secondary(ui, &state.message);
+                }
+                if let Some(error) = &state.error {
+                    Self::notice(ui, Tone::Error, "Source operation needs attention", error);
+                }
+                if let Some(log) = &state.log {
+                    Self::path(ui, log);
+                    if log.is_file()
+                        && ui.button("Open build log").clicked()
+                        && let Err(error) = open_build_log(log)
+                    {
+                        self.local_error = Some(format!("{error:#}"));
+                    }
+                }
+            }
+            if let Some(built) = state.built.as_ref().filter(|built| built.game == game) {
+                ui.collapsing("Last completed build", |ui| {
+                    Self::path(ui, &built.executable);
+                    Self::path(ui, &built.source);
+                    if ui
+                        .add_enabled(
+                            !snapshot.install_busy && !state.busy,
+                            egui::Button::new("Use completed build (verify progress first)"),
+                        )
+                        .clicked()
+                    {
+                        self.dispatch(Command::ActivateSourceBuild(game));
+                    }
+                });
+            }
+        });
+    }
+
+    fn source_build_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+        let native = [&snapshot.totk, &snapshot.triforce];
+        if snapshot.game_running
+            || snapshot.remote_game
+            || native
+                .iter()
+                .any(|game| game.running || game.remote_running)
+        {
+            Some(
+                "Close all games on both PCs before building. Source review and tool downloads remain available.",
+            )
+        } else if snapshot.settings.play_lock.is_some()
+            || native.iter().any(|game| {
+                game.lock.is_some()
+                    || game.remote_lock.is_some()
+                    || game.launch_pending
+                    || game.release_pending
+            })
+        {
+            Some("Finish or recover stored play reservations before building.")
+        } else if snapshot.pending_save
+            || snapshot.pending_iso
+            || snapshot.pending_recovery
+            || !snapshot.transfer.is_empty()
+            || native
+                .iter()
+                .any(|game| game.pending || game.busy || game.recovery_pending)
+        {
+            Some("Finish pending transfers, save choices and recovery before building.")
+        } else if snapshot.install_busy || snapshot.texture_busy || snapshot.self_updates.preparing
+        {
+            Some("Wait for the current installation, tool setup or update to finish.")
+        } else {
+            None
+        }
+    }
+
+    fn official_library(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        preference: &mut crate::source_build::Preference,
+    ) {
+        if self.game == GameId::Triforce {
+            Self::secondary(
+                ui,
+                "Triforce is built from source using your own game files. Saves, branch choices, protected play and history are separate from the other games.",
+            );
+            ui.hyperlink_to(
+                "Triforce source and build instructions",
+                "https://git.triforceproject.com/triforce/source",
+            );
+            return;
+        }
+        let p = Palette::of(ui);
+        let available = Self::management_available(snapshot);
+        let totk = self.game == GameId::Totk;
+        let setup_required = if totk {
+            match snapshot.totk.install_path.as_deref() {
+                Some(directory) => crate::totk_update::needs_setup(directory),
+                None => Ok(!snapshot.totk.installed),
+            }
+        } else {
+            Ok(false)
+        };
+        let fresh = matches!(&setup_required, Ok(true));
+        let input_problem = if fresh {
+            snapshot.totk.install_path.as_ref().and_then(|directory| {
+                crate::totk_update::validate_setup_inputs(
+                    directory,
+                    &crate::totk_update::SetupInputs::from(&*preference),
+                )
+                .err()
+            })
+        } else {
+            None
+        };
+        let update_reason = totk.then(|| Self::totk_update_blocker(snapshot)).flatten();
+        let release = if totk {
+            &snapshot.latest_totk_release
+        } else {
+            &snapshot.latest_release
+        };
+        ui.add_space(12.0);
+        Self::card(ui, |ui| {
+            Self::section_title(
+                ui,
+                if totk {
+                    "TotK Recomp installation and updates"
+                } else {
+                    "Dusklight updates"
+                },
+            );
+            if let Some(release) = release {
                 Self::status(ui, "Latest official release", &release.tag, p.text);
                 Self::secondary(
                     ui,
@@ -1179,30 +1750,147 @@ impl Dashboard {
             } else {
                 Self::secondary(ui, "Check GitHub for the latest official game release.");
             }
+            if fresh {
+                Self::secondary(
+                    ui,
+                    "First install: select your own game files once. Twilight Sync downloads and verifies the official tools, then installs automatically; no .NET/MSYS2 source-build SDK setup is needed.",
+                );
+                ui.add_enabled_ui(
+                    !snapshot.install_busy && snapshot.source.preferences_valid,
+                    |ui| {
+                        Self::source_input(
+                            ui,
+                            "Your TotK base NSP / XCI",
+                            &mut preference.game_input,
+                            &["nsp", "xci", "nsz", "xcz"],
+                            false,
+                        );
+                        Self::source_input(
+                            ui,
+                            "Your supported TotK update",
+                            &mut preference.update,
+                            &["nsp", "nsz"],
+                            false,
+                        );
+                        Self::source_input(
+                            ui,
+                            "Your console's prod.keys",
+                            &mut preference.keys,
+                            &["keys"],
+                            false,
+                        );
+                        ui.collapsing("Optional system fonts", |ui| {
+                            Self::source_input(
+                                ui,
+                                "Firmware folder",
+                                &mut preference.firmware,
+                                &[],
+                                true,
+                            );
+                        });
+                    },
+                );
+                if let Some(error) = &input_problem {
+                    Self::secondary(ui, format!("{error:#}"));
+                }
+            }
+            if let Err(error) = &setup_required {
+                Self::notice(
+                    ui,
+                    Tone::Error,
+                    "Cannot check TotK installation",
+                    &format!("{error:#}"),
+                );
+            }
             ui.horizontal_wrapped(|ui| {
                 if snapshot.install_busy {
                     ui.spinner();
-                    ui.label("Checking, downloading, or verifying...");
+                    ui.label(if snapshot.totk.updating {
+                        "Installing/updating and preparing game files; this can take several minutes..."
+                    } else {
+                        "Checking, downloading, or verifying..."
+                    });
                 }
-                if Self::primary(ui, available, "Install / update Dusklight").clicked() {
-                    self.dispatch(Command::Install);
+                if Self::primary(
+                    ui,
+                    available
+                        && update_reason.is_none()
+                        && input_problem.is_none()
+                        && setup_required.is_ok()
+                        && (!totk || &*preference == snapshot.source.preferences.get(GameId::Totk)),
+                    if totk {
+                        "Install / update TotK Recomp"
+                    } else {
+                        "Install / update Dusklight"
+                    },
+                )
+                .clicked()
+                {
+                    self.dispatch(if totk {
+                        Command::UpdateTotk
+                    } else {
+                        Command::Install
+                    });
                 }
                 if ui
                     .add_enabled(available, egui::Button::new("Check latest release"))
                     .clicked()
                 {
-                    self.dispatch(Command::CheckRelease);
+                    self.dispatch(if totk {
+                        Command::CheckTotkRelease
+                    } else {
+                        Command::CheckRelease
+                    });
                 }
             });
+            if let Some(reason) = update_reason {
+                Self::secondary(ui, reason);
+            }
             Self::secondary(
                 ui,
-                "Installs side-by-side, verifies existing managed files, and preserves your profile, saves, and textures. Nothing launches automatically.",
+                if totk {
+                    "Downloads and verifies the official setup, then automatically installs or updates the game using your local inputs. Existing saves, settings and mods are preserved. Play and save sync pause until it finishes."
+                } else {
+                    "Installs side-by-side, verifies existing managed files, and preserves your profile, saves, and textures. Nothing launches automatically."
+                },
             );
             Self::secondary(
                 ui,
-                "A Dusklight desktop shortcut opens this manager's protected Play controls.",
+                if totk {
+                    "First installs and updates use your own legally obtained game files. No game assets or console keys are downloaded. The setup download link below is an optional manual alternative, not a required step."
+                } else {
+                    "A Dusklight desktop shortcut opens this manager's protected Play controls."
+                },
             );
+            Self::secondary(
+                ui,
+                if totk {
+                    "Managed install location (fresh installs use a versioned subfolder):"
+                } else {
+                    "New managed installations use:"
+                },
+            );
+            match crate::install::default_directory(self.game) {
+                Ok(directory) => Self::path(ui, &directory),
+                Err(error) => Self::notice(
+                    ui,
+                    Tone::Error,
+                    "Cannot locate your Games folder",
+                    &format!("{error:#}"),
+                ),
+            }
+            if totk {
+                ui.hyperlink_to(TOTK_SETUP_LABEL, crate::totk_update::SETUP_DOWNLOAD_URL);
+            }
         });
+        if totk {
+            return;
+        }
+        self.disc_tools(ui, snapshot);
+    }
+
+    fn disc_tools(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        let available = Self::management_available(snapshot);
         ui.add_space(12.0);
         Self::card(ui, |ui| {
             Self::section_title(ui, "Disc image (optional)");
@@ -1252,6 +1940,36 @@ impl Dashboard {
                 "RVZ stays compressed during transfer. Both managers need v0.5.0 or later; verification runs separately without blocking sync heartbeats.",
             );
         });
+    }
+
+    fn totk_update_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+        let state = &snapshot.totk;
+        if state.updating {
+            Some("Wait for the current TotK update to finish.")
+        } else if !state.checked {
+            Some("Checking your TotK installation folder...")
+        } else if state.install_path.is_none() {
+            Some(
+                "The TotK installation folder could not be resolved. Check the folder error or locate a custom installation.",
+            )
+        } else if state.running || state.remote_running {
+            Some("Close TotK on both PCs before updating.")
+        } else if state.busy
+            || state.pending
+            || state.launch_pending
+            || state.release_pending
+            || state.recovery_pending
+            || snapshot.pending_save
+            || snapshot.pending_iso
+        {
+            Some("Finish pending transfers, play-session releases, or recovery before updating.")
+        } else if state.lock.is_some() || state.remote_lock.is_some() {
+            Some("Finish or recover the TotK play reservation before updating.")
+        } else if !Self::management_available(snapshot) {
+            Some("Finish the current game or management operation before updating.")
+        } else {
+            None
+        }
     }
 
     fn preserve_texture_files(snapshot: &Snapshot) -> bool {
@@ -1506,14 +2224,18 @@ impl Dashboard {
     }
 
     fn history(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let totk = self.game == GameId::Totk;
-        let history = if totk {
-            &snapshot.totk.history
+        let native = match self.game {
+            GameId::Dusklight => None,
+            GameId::Totk => Some(&snapshot.totk),
+            GameId::Triforce => Some(&snapshot.triforce),
+        };
+        let history = if let Some(state) = native {
+            &state.history
         } else {
             &snapshot.history
         };
-        let current_hash = if totk {
-            &snapshot.totk.local_hash
+        let current_hash = if let Some(state) = native {
+            &state.local_hash
         } else {
             &snapshot.local_hash
         };
@@ -1562,8 +2284,11 @@ impl Dashboard {
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Refresh / latest").clicked() {
-                    self.dispatch(if totk {
-                        Command::TotkHistoryPage(None)
+                    self.dispatch(if native.is_some() {
+                        Command::Native {
+                            game: self.game,
+                            command: NativeCommand::HistoryPage(None),
+                        }
                     } else {
                         Command::HistoryPage(None)
                     });
@@ -1572,8 +2297,11 @@ impl Dashboard {
                     .add_enabled(history.next.is_some(), egui::Button::new("Older snapshots"))
                     .clicked()
                 {
-                    self.dispatch(if totk {
-                        Command::TotkHistoryPage(history.next.clone())
+                    self.dispatch(if native.is_some() {
+                        Command::Native {
+                            game: self.game,
+                            command: NativeCommand::HistoryPage(history.next.clone()),
+                        }
                     } else {
                         Command::HistoryPage(history.next.clone())
                     });
@@ -1585,14 +2313,15 @@ impl Dashboard {
             });
         });
         ui.add_space(12.0);
-        let can_restore = if totk {
-            snapshot.totk.installed
-                && !snapshot.totk.running
-                && !snapshot.totk.remote_running
-                && !snapshot.totk.busy
-                && !snapshot.totk.launch_pending
-                && snapshot.totk.lock.is_none()
-                && snapshot.totk.remote_lock.is_none()
+        let can_restore = if let Some(state) = native {
+            state.installed
+                && !state.updating
+                && !state.running
+                && !state.remote_running
+                && !state.busy
+                && !state.launch_pending
+                && state.lock.is_none()
+                && state.remote_lock.is_none()
                 && !snapshot.self_updates.preparing
         } else {
             snapshot.settings.save_file.is_some()
@@ -1605,8 +2334,8 @@ impl Dashboard {
                 ui,
                 Tone::Info,
                 "No snapshots yet",
-                if totk {
-                    "No committed TotK snapshots yet."
+                if native.is_some() {
+                    "No committed snapshots for this game yet."
                 } else {
                     "Valid saves are recorded automatically from Dusklight's detected profile. Play and save in Dusklight, or receive your partner's save - no location setup is needed."
                 },
@@ -1631,11 +2360,11 @@ impl Dashboard {
                         if current {
                             ui.label(RichText::new("Current save").color(p.success));
                         } else if ui.add_enabled(can_restore, egui::Button::new("Restore...")).clicked() {
-                            if totk {
-                                let approved = rfd::MessageDialog::new().set_title("Restore TotK snapshot")
+                            if native.is_some() {
+                                let approved = rfd::MessageDialog::new().set_title(format!("Restore {} snapshot", game_view::title(self.game)))
                                     .set_description(format!("Restore snapshot #{} from {}? The current active-account save is retained in history and rollback storage. Other local accounts and graphics settings are not changed.", entry.sequence, entry.timestamp))
                                     .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
-                                if approved { self.dispatch(Command::RestoreTotk { id: entry.id.clone(), expected: current_hash.clone() }); }
+                                if approved { self.dispatch(Command::Native { game: self.game, command: NativeCommand::Restore { id: entry.id.clone(), expected: current_hash.clone() } }); }
                                 return;
                             }
                             let Some(profile) = snapshot.save_profile.as_deref() else {
@@ -1781,7 +2510,7 @@ impl Dashboard {
 
     fn approvals(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let p = Palette::of(ui);
-        for game in [GameId::Dusklight, GameId::Totk] {
+        for game in [GameId::Dusklight, GameId::Totk, GameId::Triforce] {
             let model = game_view::view(game, snapshot);
             if let Some(action) = game_view::approval(ui, &model) {
                 if action == game_view::Action::Compare {
@@ -1915,8 +2644,11 @@ impl eframe::App for Dashboard {
             self.start_hidden = false;
             self.page = Page::Overview;
             self.game = game;
-            if game == GameId::Totk {
-                self.dispatch(Command::RefreshTotk);
+            if game != GameId::Dusklight {
+                self.dispatch(Command::Native {
+                    game,
+                    command: NativeCommand::Refresh,
+                });
             }
         }
         self.tray_events();
@@ -2026,16 +2758,11 @@ impl eframe::App for Dashboard {
             });
         self.tray
             .launch_item
-            .set_text(if self.game == GameId::Totk {
-                "Play Tears of the Kingdom"
-            } else {
-                "Play Dusklight"
-            });
-        self.tray.sync_item.set_text(if self.game == GameId::Totk {
-            "Send TotK save to partner"
-        } else {
-            "Send Dusklight save to partner"
-        });
+            .set_text(format!("Play {}", game_view::title(self.game)));
+        self.tray.sync_item.set_text(format!(
+            "Send {} save to partner",
+            game_view::title(self.game)
+        ));
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2058,7 +2785,11 @@ impl eframe::App for Dashboard {
                         }
                         if matches!(
                             self.page,
-                            Page::Overview | Page::Library | Page::History | Page::Totk
+                            Page::Overview
+                                | Page::Library
+                                | Page::History
+                                | Page::Totk
+                                | Page::Triforce
                         ) {
                             if Self::game_picker(ui, &mut self.game) {
                                 self.shown_fork = None;
@@ -2077,9 +2808,15 @@ impl eframe::App for Dashboard {
                                         }
                                     }
                                 }
-                                if self.game == GameId::Totk {
-                                    self.dispatch(Command::RefreshTotk);
-                                    self.dispatch(Command::TotkHistoryPage(None));
+                                if self.game != GameId::Dusklight {
+                                    self.dispatch(Command::Native {
+                                        game: self.game,
+                                        command: NativeCommand::Refresh,
+                                    });
+                                    self.dispatch(Command::Native {
+                                        game: self.game,
+                                        command: NativeCommand::HistoryPage(None),
+                                    });
                                 } else if self.page == Page::History {
                                     self.dispatch(Command::HistoryPage(None));
                                 }
@@ -2094,7 +2831,10 @@ impl eframe::App for Dashboard {
                             .or(snapshot.error.as_ref())
                             .cloned();
                         if !confirming_device && let Some(error) = &error {
-                            Self::notice(ui, Tone::Error, "Action needed", error);
+                            if Self::action_needed(ui, self.game, &snapshot, error) {
+                                self.page = Page::Library;
+                                self.local_error = None;
+                            }
                             ui.add_space(12.0);
                         }
                         if !snapshot.transfer.is_empty() {
@@ -2110,6 +2850,7 @@ impl eframe::App for Dashboard {
                         match self.page {
                             Page::Overview => self.game_home(ui, &snapshot),
                             Page::Totk => self.game_home(ui, &snapshot),
+                            Page::Triforce => self.game_home(ui, &snapshot),
                             Page::Devices => self.devices(ui, &snapshot),
                             Page::Library => self.game_library(ui, &snapshot),
                             Page::Textures => self.textures(ui, &snapshot),
@@ -2134,6 +2875,17 @@ impl eframe::App for Dashboard {
         self.reconcile_prompt(context, &snapshot);
         context.request_repaint_after(Duration::from_millis(200));
     }
+}
+
+fn open_build_log(path: &std::path::Path) -> Result<()> {
+    crate::files::ensure_safe_path(path)?;
+    anyhow::ensure!(path.is_file(), "The build log is not available yet");
+    let windows = std::env::var_os("SystemRoot").context("SystemRoot is not available")?;
+    std::process::Command::new(PathBuf::from(windows).join("System32").join("notepad.exe"))
+        .arg(path)
+        .spawn()
+        .context("Opening the local build log")?;
+    Ok(())
 }
 
 fn open_data_directory() -> Result<()> {
@@ -2168,16 +2920,16 @@ mod tests {
         snapshot.totk.remote_save_ready = true;
         snapshot.totk.local_hash = Some("a".repeat(64));
         snapshot.totk.remote_hash = Some("a".repeat(64));
-        assert!(Dashboard::totk_play_blocker(&snapshot).is_none());
+        assert!(Dashboard::native_play_blocker(&snapshot, &snapshot.totk).is_none());
         assert!(
-            Dashboard::totk_sync_blocker(&snapshot)
+            Dashboard::native_sync_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("already match"))
         );
         snapshot.totk.remote_hash = Some("b".repeat(64));
-        assert!(Dashboard::totk_sync_blocker(&snapshot).is_none());
+        assert!(Dashboard::native_sync_blocker(&snapshot, &snapshot.totk).is_none());
         snapshot.totk.pending = true;
         assert!(
-            Dashboard::totk_play_blocker(&snapshot)
+            Dashboard::native_play_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("decision"))
         );
         snapshot.totk.pending = false;
@@ -2186,25 +2938,25 @@ mod tests {
             token: "c".repeat(64),
         });
         assert!(
-            Dashboard::totk_sync_blocker(&snapshot)
+            Dashboard::native_sync_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("recovery"))
         );
         snapshot.totk.lock = None;
         snapshot.totk.running = true;
         assert!(
-            Dashboard::totk_play_blocker(&snapshot)
+            Dashboard::native_play_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("running on this PC"))
         );
         snapshot.totk.running = false;
         snapshot.totk.release_pending = true;
         assert!(
-            Dashboard::totk_play_blocker(&snapshot)
+            Dashboard::native_play_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("acknowledgement"))
         );
         snapshot.ready = false;
-        assert!(Dashboard::totk_play_blocker(&snapshot).is_none());
+        assert!(Dashboard::native_play_blocker(&snapshot, &snapshot.totk).is_none());
         assert!(
-            Dashboard::totk_sync_blocker(&snapshot)
+            Dashboard::native_sync_blocker(&snapshot, &snapshot.totk)
                 .is_some_and(|reason| reason.contains("offline"))
         );
         Ok(())
@@ -2281,6 +3033,254 @@ mod tests {
                 assert_eq!(game, GameId::Totk);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_decoded_details_reach_progress_cards_in_latest_save_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        crate::triforce::tests::seed(temp.path(), 1)?;
+        let account = temp
+            .path()
+            .join("save")
+            .join(format!("{:032x}", crate::triforce::ACCOUNT));
+        for number in [0, 1] {
+            let (progress, mut caption) = crate::triforce_save::tests::fixture(number * 336);
+            caption[0x4c..0x50].copy_from_slice(&(19 + number as u32).to_le_bytes());
+            let slot = account.join(format!("slot_{number:02}"));
+            std::fs::create_dir_all(&slot)?;
+            std::fs::write(slot.join("progress.sav"), progress)?;
+            std::fs::write(slot.join("caption.sav"), caption)?;
+        }
+        let save = crate::triforce::snapshot(temp.path())?.context("Missing fixture save")?;
+        let summary = crate::triforce::summary(&save.bytes)?;
+        let cards = game_view::totk_cards(&summary);
+        assert_eq!(cards[0].number, 2);
+        assert_eq!(cards[0].kind, "Manual save");
+        assert_eq!(cards[0].hearts, Some(12.0));
+        assert_eq!(cards[0].rupees, Some(888));
+        assert_eq!(cards[0].played, Some(146_558));
+        assert_eq!(
+            cards[0].saved.as_deref(),
+            Some("2026-11-17 01:20 (game clock)")
+        );
+        assert!(cards.iter().all(|card| card.warning.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_totk_installation_error_offers_automatic_setup_not_an_external_download()
+    -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        for (game, installed, expected_link) in [
+            (GameId::Dusklight, false, false),
+            (GameId::Totk, true, false),
+            (GameId::Totk, false, true),
+        ] {
+            snapshot.totk.installed = installed;
+            let context = egui::Context::default();
+            design::install(&context)?;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 360.0));
+            let selected = std::cell::Cell::new(false);
+            let render = |context: &egui::Context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    selected.set(Dashboard::action_needed(
+                        ui,
+                        game,
+                        &snapshot,
+                        "Choose your TotK base game before the automatic first installation.",
+                    ));
+                });
+            };
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                render,
+            );
+            let link = output.shapes.iter().find_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.job.text == "Set up TotK automatically"
+                {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(link.is_some(), expected_link);
+            if let Some(position) = link {
+                let clicked = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    render,
+                );
+                assert!(
+                    selected.get(),
+                    "The setup action must navigate to managed installation"
+                );
+                assert!(
+                    !clicked
+                        .platform_output
+                        .commands
+                        .iter()
+                        .any(|command| { matches!(command, egui::OutputCommand::OpenUrl(_)) }),
+                    "Automatic setup must not redirect to a manual installer download"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn totk_updates_block_game_actions_and_explain_when_updates_are_unsafe() -> Result<()> {
+        let mut ready = ready_snapshot()?;
+        ready.totk = crate::totk::Status {
+            checked: true,
+            installed: true,
+            install_path: Some(PathBuf::from(r"C:\Games\TotKRecomp")),
+            ..crate::totk::Status::default()
+        };
+        assert!(Dashboard::totk_update_blocker(&ready).is_none());
+        ready.totk.installed = false;
+        assert!(Dashboard::totk_update_blocker(&ready).is_none());
+        ready.totk.installed = true;
+        let available = game_view::view(GameId::Totk, &ready);
+        assert!(available.can_locate && available.can_continue && available.can_accept);
+        for condition in [
+            "running",
+            "remote-running",
+            "updating",
+            "transfer",
+            "lock",
+            "launch",
+            "release",
+            "recovery",
+        ] {
+            let mut snapshot = ready.clone();
+            match condition {
+                "running" => snapshot.totk.running = true,
+                "remote-running" => snapshot.totk.remote_running = true,
+                "updating" => snapshot.totk.updating = true,
+                "transfer" => snapshot.totk.busy = true,
+                "lock" => {
+                    snapshot.totk.lock = Some(crate::config::PlayLock {
+                        owner: snapshot.public_key.clone(),
+                        token: "a".repeat(64),
+                    })
+                }
+                "launch" => snapshot.totk.launch_pending = true,
+                "release" => snapshot.totk.release_pending = true,
+                "recovery" => snapshot.totk.recovery_pending = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                Dashboard::totk_update_blocker(&snapshot).is_some(),
+                "{condition}"
+            );
+        }
+        ready.totk.updating = true;
+        let updating = game_view::view(GameId::Totk, &ready);
+        assert!(!updating.can_locate && !updating.can_continue && !updating.can_accept);
+        assert!(
+            updating
+                .play_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("updated"))
+        );
+        assert!(
+            updating
+                .sync_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("updated"))
+        );
+        ready.totk.updating = false;
+        ready.totk.verification_error = Some("An incomplete update needs retrying".into());
+        assert!(Dashboard::totk_update_blocker(&ready).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_view_and_consent_do_not_follow_another_games_state() -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        snapshot.totk.installed = true;
+        snapshot.triforce = crate::totk::Status::default();
+        assert!(!game_view::view(GameId::Triforce, &snapshot).installed);
+        snapshot.triforce = crate::totk::Status {
+            checked: true,
+            installed: true,
+            local_hash: Some("a".repeat(64)),
+            remote_hash: Some("b".repeat(64)),
+            peer_checked: true,
+            remote_installed: true,
+            remote_save_ready: true,
+            conflict: true,
+            comparison_verified: true,
+            ..crate::totk::Status::default()
+        };
+        snapshot.triforce_supported = true;
+        let model = game_view::view(GameId::Triforce, &snapshot);
+        assert!(model.conflict && model.can_resolve);
+        assert!(matches!(
+            game_view::incoming_command(GameId::Triforce, false),
+            Command::Native {
+                game: GameId::Triforce,
+                command: NativeCommand::Accept(false)
+            }
+        ));
+        snapshot.triforce.updating = true;
+        let paused = game_view::view(GameId::Triforce, &snapshot);
+        assert!(!paused.can_continue && !paused.can_accept && !paused.can_resolve);
+        assert!(
+            paused
+                .play_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("rebuilt"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_build_controls_explain_activity_and_reservations_in_every_game() -> Result<()> {
+        let mut snapshot = ready_snapshot()?;
+        assert!(Dashboard::source_build_blocker(&snapshot).is_none());
+        snapshot.triforce.running = true;
+        assert!(
+            Dashboard::source_build_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("Close all games"))
+        );
+        snapshot.triforce.running = false;
+        snapshot.totk.lock = Some(crate::config::PlayLock {
+            owner: snapshot.public_key.clone(),
+            token: "a".repeat(64),
+        });
+        assert!(
+            Dashboard::source_build_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("reservations"))
+        );
+        snapshot.totk.lock = None;
+        snapshot.triforce.busy = true;
+        assert!(
+            Dashboard::source_build_blocker(&snapshot)
+                .is_some_and(|reason| reason.contains("transfers"))
+        );
         Ok(())
     }
 

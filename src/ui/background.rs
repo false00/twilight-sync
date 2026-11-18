@@ -85,10 +85,10 @@ pub(super) fn open_selected_game(title: &str, game: crate::protocol::GameId) -> 
                 } else {
                     register_message("TwilightSync.OpenGameControls.v2")?
                 },
-                if game == crate::protocol::GameId::Totk {
-                    1
-                } else {
-                    0
+                match game {
+                    crate::protocol::GameId::Dusklight => 0,
+                    crate::protocol::GameId::Totk => 1,
+                    crate::protocol::GameId::Triforce => 2,
                 },
                 0,
                 SMTO_ABORTIFHUNG | SMTO_BLOCK,
@@ -191,10 +191,12 @@ unsafe extern "system" fn window_message(
 ) -> LRESULT {
     let pump = PUMP.with(|cell| cell.borrow().clone());
     if let Some(pump) = pump
-        && (message == pump.open_message || (message == pump.game_message && wparam <= 1))
+        && (message == pump.open_message || (message == pump.game_message && wparam <= 2))
     {
         pump.open_game_controls
-            .set(Some(if message == pump.game_message && wparam == 1 {
+            .set(Some(if message == pump.game_message && wparam == 2 {
+                crate::protocol::GameId::Triforce
+            } else if message == pump.game_message && wparam == 1 {
                 crate::protocol::GameId::Totk
             } else {
                 crate::protocol::GameId::Dusklight
@@ -215,6 +217,15 @@ impl Pump {
         let snapshot = self.backend.snapshot()?;
         let status = if snapshot.error.is_some() || snapshot.textures.recovery_needed {
             "Action needed - open dashboard"
+        } else if snapshot.triforce.pending
+            || snapshot.triforce.recovery_pending
+            || snapshot.triforce.conflict
+        {
+            "Triforce progress needs your choice - open dashboard"
+        } else if snapshot.triforce.running {
+            "Playing Triforce here - save writes paused"
+        } else if snapshot.triforce.remote_running {
+            "Partner playing Triforce - save writes paused"
         } else if snapshot.totk.pending || snapshot.totk.recovery_pending || snapshot.totk.conflict
         {
             "TotK progress needs your choice - open dashboard"
@@ -231,7 +242,7 @@ impl Pump {
         } else if snapshot.texture_busy {
             "Installing / switching texture data"
         } else if snapshot.install_busy {
-            "Checking / updating official Dusklight"
+            "Installing, updating or building a game"
         } else if snapshot.self_updates.available() {
             "Twilight Sync update available - open tray"
         } else if snapshot.connecting {
@@ -280,6 +291,9 @@ impl Pump {
             *self.last_status.borrow_mut() = status.into();
         }
         let attention = snapshot.pending_save
+            || snapshot.triforce.pending
+            || snapshot.triforce.recovery_pending
+            || snapshot.triforce.conflict
             || snapshot.totk.pending
             || snapshot.totk.recovery_pending
             || snapshot.totk.conflict

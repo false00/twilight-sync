@@ -8,6 +8,7 @@ use std::{
 
 pub const OPEN_ARGUMENT: &str = "--open-dusklight";
 pub const OPEN_TOTK_ARGUMENT: &str = "--open-totk";
+pub const OPEN_TRIFORCE_ARGUMENT: &str = "--open-triforce";
 const SHORTCUT_NAME: &str = "Dusklight (Twilight Sync).lnk";
 const RECEIPT_NAME: &str = "dusklight-desktop-shortcut.json";
 
@@ -39,18 +40,20 @@ pub fn install_dusklight_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
 }
 
 pub fn install_totk_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
+    install_game_shortcut(root, game, crate::protocol::GameId::Totk)
+}
+
+pub fn install_game_shortcut(
+    root: &Path,
+    game: &Path,
+    selected: crate::protocol::GameId,
+) -> Result<PathBuf> {
     ensure!(cfg!(windows), "Desktop shortcuts require Windows");
     let user = directories::UserDirs::new().context("Cannot locate the current user's folders")?;
     let desktop = user
         .desktop_dir()
         .context("Windows did not return a desktop folder")?;
-    create_game(
-        root,
-        desktop,
-        &std::env::current_exe()?,
-        game,
-        crate::protocol::GameId::Totk,
-    )
+    create_game(root, desktop, &std::env::current_exe()?, game, selected)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -108,6 +111,11 @@ fn create_game(
             "Tears of the Kingdom (Twilight Sync).lnk",
             "totk-desktop-shortcut.json",
             OPEN_TOTK_ARGUMENT,
+        ),
+        crate::protocol::GameId::Triforce => (
+            "Ocarina of Time (Twilight Sync).lnk",
+            "triforce-desktop-shortcut.json",
+            OPEN_TRIFORCE_ARGUMENT,
         ),
     };
     let destination = desktop.join(shortcut_name);

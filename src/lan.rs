@@ -110,6 +110,7 @@ pub struct Discovered {
     pub pairing: bool,
     pub seen: Instant,
     pub game_channels_seen: Option<Instant>,
+    pub triforce_seen: Option<Instant>,
 }
 
 pub fn decode_advertisement(
@@ -128,8 +129,10 @@ pub fn decode_advertisement(
     );
     let ad: Advertisement = serde_json::from_slice(bytes)?;
     ensure!(
-        matches!(ad.magic.as_str(), "twilightProto/1" | "twilightProto/2")
-            && ad.network == network.fingerprint,
+        matches!(
+            ad.magic.as_str(),
+            "twilightProto/1" | "twilightProto/2" | "twilightProto/3"
+        ) && ad.network == network.fingerprint,
         "Discovery network mismatch"
     );
     ensure!(
@@ -142,7 +145,9 @@ pub fn decode_advertisement(
         address: SocketAddr::from((*source.ip(), PORT)),
         pairing: ad.pairing,
         seen: Instant::now(),
-        game_channels_seen: (ad.magic == "twilightProto/2").then(Instant::now),
+        game_channels_seen: matches!(ad.magic.as_str(), "twilightProto/2" | "twilightProto/3")
+            .then(Instant::now),
+        triforce_seen: (ad.magic == "twilightProto/3").then(Instant::now),
     })
 }
 
@@ -302,6 +307,18 @@ mod tests {
         let bytes = serde_json::to_vec(&advertisement)?;
         let device = decode_advertisement(&bytes, valid_source, &network, &own)?;
         assert_eq!(device.address.port(), PORT);
+        assert!(device.game_channels_seen.is_none() && device.triforce_seen.is_none());
+        for (magic, triforce) in [("twilightProto/2", false), ("twilightProto/3", true)] {
+            advertisement.magic = magic.into();
+            let decoded = decode_advertisement(
+                &serde_json::to_vec(&advertisement)?,
+                valid_source,
+                &network,
+                &own,
+            )?;
+            assert!(decoded.game_channels_seen.is_some());
+            assert_eq!(decoded.triforce_seen.is_some(), triforce);
+        }
         for source in ["8.8.8.8:42816", "192.168.2.3:42816", "192.168.1.2:42816"] {
             assert!(decode_advertisement(&bytes, source.parse()?, &network, &own).is_err());
         }

@@ -23,6 +23,55 @@ only into a dedicated temporary test directory.
 The optional live updater test and debug-only native UI smoke commands are
 documented in the [technical guide](guide.md#diagnostics-and-tests).
 
+### TotK program updates
+
+```powershell
+cargo test --lib --locked -- install::tests totk_update::tests totk::tests runtime::tests ui::tests
+```
+
+Updater tests use synthetic setup archives and receipts without executing those
+fixtures. They cover official asset selection, the larger bundled-tool inventory,
+first-install inputs, stable empty/resumable targets, installer arguments,
+completion/version checks, save preservation and play/sync interlocks.
+They also verify the new `Games\Dusklight` layout without changing legacy
+installations and exercise the managed first-install action without opening a
+browser. The optional official-package test runs only the bundled setup's
+`--help` in an isolated directory; it never installs or launches the game.
+
+### Source builds and Triforce parity
+
+```powershell
+cargo test --lib --locked -- source_build:: triforce totk::tests runtime::tests ui:: protocol::game_channel_tests lan::tests
+```
+
+Fixtures verify source-commit/approval gating, refusal to run without game inputs,
+publisher URL/digest checks, side-by-side command arguments, unchanged-save
+activation, common-base preservation, failed/cancelled build recovery, and
+Triforce's complete saves, nested transactions, encrypted two-device transfer,
+history restore and durable play locks. Triforce metadata tests use synthetic
+variable-length tables, exercise progress cards, and reject malformed recognized
+metadata before save replacement. SDK commands/approval guards, graphics options,
+Vulkan-setting preservation and codec-archive bounds/path checks are covered
+without running SDK installers or game builds. Synthetic game files are never executed.
+Process monitors default to explicit simulation in unit tests so unrelated games
+on a shared test host do not affect temporary fixtures; production monitoring is
+unchanged.
+
+Optional live checks execute no upstream code:
+
+```powershell
+cargo test --lib --locked source_build::tests::live_source_metadata_identifies_pinned_commits_for_all_three_games -- --ignored --exact --nocapture
+cargo test --lib --locked source_build::tools::tests::official_sdl_sdk_layout_matches_the_source_recipe -- --ignored --exact --nocapture
+cargo test --lib --locked source_build::tools::tests::verified_codec_archive_contains_the_required_headers_and_static_libraries -- --ignored --exact --nocapture
+```
+
+These read public source metadata or download/extract SDL and the disclosed
+codec supplier's SDK data into temporary directories without running binaries.
+Real game builds
+need local licensed inputs, explicit source/tool consent, ample disk and a
+graphics session where shader preparation needs one. Do not execute an unreviewed
+upstream checkout merely to validate manager changes.
+
 ### Automatic save setup
 
 ```powershell

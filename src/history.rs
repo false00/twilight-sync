@@ -194,32 +194,39 @@ pub struct History {
 enum SaveFormat {
     Dusklight,
     Totk,
+    Triforce,
 }
 
 impl SaveFormat {
-    fn identity(self, bytes: &[u8]) -> Result<files::SaveIdentity> {
+    fn native_code(self) -> Option<&'static str> {
         match self {
-            Self::Dusklight => files::validate_save(bytes),
-            Self::Totk => {
-                let entries = totk::decode(bytes)?;
-                ensure!(
-                    entries
-                        .keys()
-                        .all(|name| name.starts_with("00000000000000000000000000000001/")),
-                    "TotK history requires a canonical active-account bundle"
-                );
-                Ok(files::SaveIdentity {
-                    game: "TOTK".into(),
-                    name: "active-account".into(),
-                })
-            }
+            Self::Dusklight => None,
+            Self::Totk => Some("TOTK"),
+            Self::Triforce => Some("OOTR"),
         }
+    }
+
+    fn identity(self, bytes: &[u8]) -> Result<files::SaveIdentity> {
+        let Some(game) = self.native_code() else {
+            return files::validate_save(bytes);
+        };
+        let entries = totk::decode(bytes)?;
+        ensure!(
+            entries
+                .keys()
+                .all(|name| name.starts_with("00000000000000000000000000000001/")),
+            "Native save history requires a canonical active-account bundle"
+        );
+        Ok(files::SaveIdentity {
+            game: game.into(),
+            name: "active-account".into(),
+        })
     }
 
     fn size_limit(self) -> usize {
         match self {
             Self::Dusklight => SAVE_SIZE,
-            Self::Totk => totk::MAX_BUNDLE_SIZE,
+            Self::Totk | Self::Triforce => totk::MAX_BUNDLE_SIZE,
         }
     }
 }
@@ -274,6 +281,10 @@ impl History {
         Self::open_format(application_root, username, device, SaveFormat::Totk)
     }
 
+    pub fn open_triforce(application_root: &Path, username: &str, device: &str) -> Result<Self> {
+        Self::open_format(application_root, username, device, SaveFormat::Triforce)
+    }
+
     fn open_format(
         application_root: &Path,
         username: &str,
@@ -310,7 +321,7 @@ impl History {
             username: username.into(),
             device: device.into(),
             index,
-            budget: if matches!(format, SaveFormat::Totk) {
+            budget: if matches!(format, SaveFormat::Totk | SaveFormat::Triforce) {
                 256 * 1024 * 1024
             } else {
                 BUDGET
@@ -381,7 +392,8 @@ impl History {
             ensure!(length == SAVE_SIZE, "Invalid Dusklight snapshot size");
         } else {
             ensure!(
-                commit.game == "TOTK" && commit.name == "active-account",
+                Some(commit.game.as_str()) == self.format.native_code()
+                    && commit.name == "active-account",
                 "Snapshot belongs to another game"
             );
         }

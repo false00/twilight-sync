@@ -1,14 +1,12 @@
 use super::{Format, RESULT_PREFIX, VERIFY_TIMEOUT, Verified};
 use crate::files::{ensure_safe_path, valid_hash};
+use crate::process_job::Job;
 use anyhow::{Context, Result, ensure};
 use std::{
     io::{Read, Write},
-    os::windows::{
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::CommandExt,
-    },
+    os::windows::process::CommandExt,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,58 +15,14 @@ use std::{
 };
 use windows_sys::Win32::System::{
     JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
     },
     Threading::GetCurrentProcess,
 };
 
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
-
-struct Job(OwnedHandle);
-
-impl Job {
-    fn new() -> Result<Self> {
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        ensure!(
-            !handle.is_null(),
-            "Cannot create the resource-limited RVZ verification job"
-        );
-        let job = Self(unsafe { OwnedHandle::from_raw_handle(handle) });
-        // This Win32 limits structure contains only numeric POD fields; zero disables unused limits.
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 1;
-        limits.ProcessMemoryLimit = MEMORY_LIMIT;
-        let result = unsafe {
-            SetInformationJobObject(
-                job.0.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                std::ptr::addr_of!(limits).cast(),
-                u32::try_from(std::mem::size_of_val(&limits))?,
-            )
-        };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Applying RVZ verification resource limits");
-        }
-        Ok(job)
-    }
-
-    fn assign(&self, child: &Child) -> Result<()> {
-        let result =
-            unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), child.as_raw_handle()) };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Assigning the RVZ verifier to its bounded job");
-        }
-        Ok(())
-    }
-}
 
 pub(super) fn await_gate() -> Result<()> {
     let mut gate = [0_u8; 1];
@@ -115,7 +69,7 @@ pub(super) fn verify(path: &Path, cancel: Arc<AtomicBool>) -> Result<Verified> {
     ensure_safe_path(path)?;
     let size = path.metadata()?.len();
     Format::Rvz.validate_size(size)?;
-    let job = Job::new()?;
+    let job = Job::new(Some(MEMORY_LIMIT), Some(1))?;
     let mut command = Command::new(std::env::current_exe()?);
     #[cfg(not(test))]
     command.arg("--verify-rvz-worker").arg(path);

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 
-const MAX_LIFE: u32 = 0xfbe0_1da1;
-const RUPEES: u32 = 0xa779_21d7;
+pub(crate) const MAX_LIFE: u32 = 0xfbe0_1da1;
+pub(crate) const RUPEES: u32 = 0xa779_21d7;
 const MAX_STAMINA: u32 = 0xf921_2c74;
-const PLAY_SECONDS: u32 = 0xe573_f564;
+pub(crate) const PLAY_SECONDS: u32 = 0xe573_f564;
 const POSITION: u32 = 0xc884_818d;
 const MAP: u32 = 0x1d61_89da;
 const YEAR: u32 = 0x9811_a3f7;
@@ -27,13 +27,13 @@ pub struct Details {
     pub autosave: Option<bool>,
 }
 
-struct Table<'a> {
+pub(crate) struct Table<'a> {
     bytes: &'a [u8],
     end: usize,
     fields: BTreeMap<u32, usize>,
 }
 
-fn word(bytes: &[u8], offset: usize) -> Result<u32> {
+pub(crate) fn word(bytes: &[u8], offset: usize) -> Result<u32> {
     let end = offset.checked_add(4).context("Save offset overflow")?;
     let value: [u8; 4] = bytes
         .get(offset..end)
@@ -44,17 +44,17 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32> {
 }
 
 impl<'a> Table<'a> {
-    fn new(bytes: &'a [u8], wanted: &[u32]) -> Result<Self> {
+    pub(crate) fn new(bytes: &'a [u8], wanted: &[u32]) -> Result<Self> {
         ensure!(
             bytes.len() >= 0x28 && word(bytes, 0)? == 0x0102_0304,
-            "Unrecognized TotK save header"
+            "Unrecognized native save header"
         );
         let end = word(bytes, 8)? as usize;
         ensure!(
             (0x28..=4 * 1024 * 1024).contains(&end)
                 && end <= bytes.len()
                 && (end - 0x28).is_multiple_of(8),
-            "Invalid TotK save table bounds"
+            "Invalid native save table bounds"
         );
         let mut fields = BTreeMap::new();
         for offset in (0x28..end).step_by(8) {
@@ -62,14 +62,14 @@ impl<'a> Table<'a> {
             if wanted.contains(&hash) {
                 ensure!(
                     fields.insert(hash, offset + 4).is_none(),
-                    "Duplicate TotK metadata field"
+                    "Duplicate native metadata field"
                 );
             }
         }
         Ok(Self { bytes, end, fields })
     }
 
-    fn unsigned(&self, hash: u32) -> Result<Option<u32>> {
+    pub(crate) fn unsigned(&self, hash: u32) -> Result<Option<u32>> {
         self.fields
             .get(&hash)
             .map(|offset| word(self.bytes, *offset))
@@ -206,46 +206,51 @@ pub fn inspect(progress: &[u8], caption: Option<&[u8]>) -> Result<Details> {
         ..Details::default()
     };
     if let Some(caption) = caption {
-        ensure!(
-            word(caption, 4)? == word(progress, 4)?,
-            "TotK progress and caption formats differ"
-        );
-        let table = Table::new(caption, &[YEAR, MONTH, DAY, HOUR, MINUTE, AUTOSAVE])?;
-        if let Some(autosave) = table.unsigned(AUTOSAVE)? {
-            ensure!(autosave <= 1, "Invalid TotK save kind");
-            details.autosave = Some(autosave == 1);
-        }
-        if let (Some(year), Some(month), Some(day), Some(hour), Some(minute)) = (
-            table.unsigned(YEAR)?,
-            table.unsigned(MONTH)?,
-            table.unsigned(DAY)?,
-            table.unsigned(HOUR)?,
-            table.unsigned(MINUTE)?,
-        ) {
-            if [year, month, day, hour, minute]
-                .iter()
-                .all(|value| *value == 0)
-            {
-                details.autosave = None;
-                return Ok(details);
-            }
-            let year = i32::try_from(year).context("Invalid TotK save year")?;
-            let month =
-                time::Month::try_from(u8::try_from(month).context("Invalid TotK save month")?)?;
-            let date = time::Date::from_calendar_date(
-                year,
-                month,
-                u8::try_from(day).context("Invalid TotK save day")?,
-            )?;
-            let time = time::Time::from_hms(
-                u8::try_from(hour).context("Invalid TotK save hour")?,
-                u8::try_from(minute).context("Invalid TotK save minute")?,
-                0,
-            )?;
-            details.saved_at = Some(format!("{date} {:02}:{:02}", time.hour(), time.minute()));
-        }
+        caption_details(word(progress, 4)?, caption, &mut details)?;
     }
     Ok(details)
+}
+
+pub(crate) fn caption_details(version: u32, caption: &[u8], details: &mut Details) -> Result<()> {
+    ensure!(
+        word(caption, 4)? == version,
+        "Native progress and caption formats differ"
+    );
+    let table = Table::new(caption, &[YEAR, MONTH, DAY, HOUR, MINUTE, AUTOSAVE])?;
+    if let Some(autosave) = table.unsigned(AUTOSAVE)? {
+        ensure!(autosave <= 1, "Invalid native save kind");
+        details.autosave = Some(autosave == 1);
+    }
+    if let (Some(year), Some(month), Some(day), Some(hour), Some(minute)) = (
+        table.unsigned(YEAR)?,
+        table.unsigned(MONTH)?,
+        table.unsigned(DAY)?,
+        table.unsigned(HOUR)?,
+        table.unsigned(MINUTE)?,
+    ) {
+        if [year, month, day, hour, minute]
+            .iter()
+            .all(|value| *value == 0)
+        {
+            details.autosave = None;
+            return Ok(());
+        }
+        let year = i32::try_from(year).context("Invalid native save year")?;
+        let month =
+            time::Month::try_from(u8::try_from(month).context("Invalid native save month")?)?;
+        let date = time::Date::from_calendar_date(
+            year,
+            month,
+            u8::try_from(day).context("Invalid native save day")?,
+        )?;
+        let time = time::Time::from_hms(
+            u8::try_from(hour).context("Invalid native save hour")?,
+            u8::try_from(minute).context("Invalid native save minute")?,
+            0,
+        )?;
+        details.saved_at = Some(format!("{date} {:02}:{:02}", time.hour(), time.minute()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

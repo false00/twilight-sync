@@ -20,7 +20,8 @@ impl Default for ProcessMonitor {
         Self {
             system: System::new(),
             #[cfg(test)]
-            fake_running: None,
+            // Synthetic fixtures must not depend on unrelated games running on the host.
+            fake_running: Some(false),
         }
     }
 }
@@ -59,10 +60,12 @@ pub fn launch_game(path: &Path, game: crate::protocol::GameId) -> Result<Child> 
     let executable = match game {
         crate::protocol::GameId::Dusklight => "dusklight.exe",
         crate::protocol::GameId::Totk => "totk.exe",
+        crate::protocol::GameId::Triforce => "Triforce.exe",
     };
     let context = match game {
         crate::protocol::GameId::Dusklight => "Launching Dusklight",
         crate::protocol::GameId::Totk => "Launching Tears of the Kingdom",
+        crate::protocol::GameId::Triforce => "Launching Triforce",
     };
     ensure_safe_path(path)?;
     ensure!(
@@ -71,10 +74,12 @@ pub fn launch_game(path: &Path, game: crate::protocol::GameId) -> Result<Child> 
         "Select the matching game executable"
     );
     ensure!(path.is_file(), "Game executable was not found");
-    Command::new(path)
-        .current_dir(path.parent().context("Executable has no directory")?)
-        .spawn()
-        .context(context)
+    let mut command = Command::new(path);
+    command.current_dir(path.parent().context("Executable has no directory")?);
+    if game == crate::protocol::GameId::Triforce {
+        command.env("HOOKSHOT_NO_UPDATE_CHECK", "1");
+    }
+    command.spawn().context(context)
 }
 
 pub fn acquire(

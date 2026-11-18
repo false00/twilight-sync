@@ -32,10 +32,7 @@ pub struct Snapshot {
 }
 
 pub fn default_install() -> Result<PathBuf> {
-    let home = directories::UserDirs::new().context("Cannot find the TotK user directory")?;
-    let path = home.home_dir().join("Games").join("TotKRecomp");
-    ensure_safe_path(&path)?;
-    Ok(path)
+    crate::install::default_directory(crate::protocol::GameId::Totk)
 }
 
 pub fn committed_save(profile: &Path) -> Result<PathBuf> {
@@ -143,7 +140,7 @@ fn collect(
     Ok(())
 }
 
-fn read_account(profile: &Path) -> Result<Option<[u8; 16]>> {
+pub(crate) fn read_account(profile: &Path) -> Result<Option<[u8; 16]>> {
     let path = profile.join("account.uid");
     ensure_safe_path(&path)?;
     let file = match File::open(&path) {
@@ -179,13 +176,17 @@ pub fn snapshot(profile: &Path) -> Result<Option<Snapshot>> {
         );
         return Ok(None);
     };
-    let active = root.join(account_name(&account));
+    snapshot_account(&root, &account)
+}
+
+pub(crate) fn snapshot_account(root: &Path, account: &[u8; 16]) -> Result<Option<Snapshot>> {
+    let active = root.join(account_name(account));
     ensure_safe_path(&active)?;
     if !active.try_exists()? {
         return Ok(None);
     }
     let mut files = BTreeMap::new();
-    collect(&active, &root, &mut files, &mut 0)?;
+    collect(&active, root, &mut files, &mut 0)?;
     if files.is_empty() {
         return Ok(None);
     }
@@ -267,26 +268,40 @@ pub fn ensure_stopped() -> Result<()> {
 }
 
 pub fn apply(profile: &Path, bytes: &[u8], expected: Option<&str>) -> Result<Option<PathBuf>> {
-    ensure_stopped()?;
+    apply_native(profile, bytes, expected, crate::native::Game::Totk)
+}
+
+pub(crate) fn apply_native(
+    profile: &Path,
+    bytes: &[u8],
+    expected: Option<&str>,
+    game: crate::native::Game,
+) -> Result<Option<PathBuf>> {
+    game.ensure_stopped()?;
     let files = decode(bytes)?;
-    summary(bytes)
-        .context("Incoming TotK save metadata verification failed; no progress was replaced")?;
+    game.summary(bytes)
+        .context("Incoming save metadata verification failed; no progress was replaced")?;
     ensure_safe_path(profile)?;
     fs::create_dir_all(profile)?;
     ensure!(
-        snapshot(profile)?.as_ref().map(|save| save.hash.as_str()) == expected,
-        "TotK progress changed; no save was replaced"
+        game.snapshot(profile)?
+            .as_ref()
+            .map(|save| save.hash.as_str())
+            == expected,
+        "Game progress changed; no save was replaced"
     );
-    let original_account = read_account(profile)?;
+    let original_account = game.account(profile)?;
     let mut account = original_account.unwrap_or_else(rand::random::<[u8; 16]>);
     while account.iter().all(|byte| *byte == 0) {
         account = rand::random();
     }
     let account_directory = account_name(&account);
     let stage = tempfile::Builder::new()
-        .prefix(".totk-sync-")
+        .prefix(".native-sync-")
         .tempdir_in(profile)?;
-    fs::write(stage.path().join("account.uid"), account)?;
+    if game == crate::native::Game::Totk {
+        fs::write(stage.path().join("account.uid"), account)?;
+    }
     let prepared = stage.path().join("save").join(&account_directory);
     fs::create_dir_all(&prepared)?;
     for (name, content) in files {
@@ -302,21 +317,26 @@ pub fn apply(profile: &Path, bytes: &[u8], expected: Option<&str>) -> Result<Opt
         file.write_all(&content)?;
         file.sync_all()?;
     }
-    let staged = snapshot(stage.path())?.context("Prepared TotK save is empty")?;
+    let staged = game
+        .snapshot(stage.path())?
+        .context("Prepared native save is empty")?;
     ensure!(
         staged.hash == sha256(bytes),
         "TotK bundle is not canonical or changed while staging"
     );
-    ensure_stopped()?;
+    game.ensure_stopped()?;
     ensure!(
-        snapshot(profile)?.as_ref().map(|save| save.hash.as_str()) == expected,
-        "TotK progress changed during staging; no save was replaced"
+        game.snapshot(profile)?
+            .as_ref()
+            .map(|save| save.hash.as_str())
+            == expected,
+        "Game progress changed during staging; no save was replaced"
     );
     ensure!(
-        read_account(profile)? == original_account,
-        "TotK's local account changed during staging"
+        game.account(profile)? == original_account,
+        "The local account changed during staging"
     );
-    let save_root = committed_save(profile)?;
+    let save_root = game.committed_save(profile)?;
     fs::create_dir_all(&save_root)?;
     if original_account.is_none() {
         crate::files::atomic_write(&profile.join("account.uid"), &account)?;
@@ -346,8 +366,9 @@ pub fn apply(profile: &Path, bytes: &[u8], expected: Option<&str>) -> Result<Opt
         return Err(error).context("Committing the received TotK save");
     }
     ensure!(
-        snapshot(profile)?.is_some_and(|save| save.hash == staged.hash),
-        "Received TotK save verification failed; rollback copy was retained"
+        game.snapshot(profile)?
+            .is_some_and(|save| save.hash == staged.hash),
+        "Received save verification failed; rollback copy was retained"
     );
     Ok(backup)
 }
@@ -360,7 +381,9 @@ pub struct Status {
     pub verified_at: Option<String>,
     pub remote_save_ready: bool,
     pub install_path: Option<PathBuf>,
+    pub executable: Option<PathBuf>,
     pub running: bool,
+    pub updating: bool,
     pub local_hash: Option<String>,
     pub local_files: usize,
     pub local_size: u64,
@@ -409,6 +432,10 @@ pub struct Summary {
 }
 
 pub fn summary(bytes: &[u8]) -> Result<Summary> {
+    summary_with_details(bytes, crate::native::Game::Totk)
+}
+
+pub(crate) fn summary_with_details(bytes: &[u8], game: crate::native::Game) -> Result<Summary> {
     let files = decode(bytes)?;
     let mut slots: BTreeMap<u8, (usize, u64, Vec<u8>)> = BTreeMap::new();
     let mut album_files = 0;
@@ -424,7 +451,7 @@ pub fn summary(bytes: &[u8]) -> Result<Summary> {
             .next()
             .and_then(|part| part.strip_prefix("slot_"))
         {
-            let number: u8 = slot.parse().context("Invalid TotK slot number")?;
+            let number: u8 = slot.parse().context("Invalid native slot number")?;
             let entry = slots.entry(number).or_default();
             entry.0 += 1;
             entry.1 += content.len() as u64;
@@ -443,12 +470,20 @@ pub fn summary(bytes: &[u8]) -> Result<Summary> {
                 let mut details = None;
                 let mut details_error = None;
                 if let Some(progress) = files.get(&(prefix.clone() + "progress.sav")) {
-                    match crate::totk_save::inspect(
-                        progress,
-                        files.get(&(prefix + "caption.sav")).map(Vec::as_slice),
-                    ) {
+                    let caption = files.get(&(prefix + "caption.sav")).map(Vec::as_slice);
+                    let (known, decoded) = match game {
+                        crate::native::Game::Totk => (
+                            crate::totk_save::known_layout(progress),
+                            crate::totk_save::inspect(progress, caption),
+                        ),
+                        crate::native::Game::Triforce => (
+                            crate::triforce_save::known_layout(progress),
+                            crate::triforce_save::inspect(progress, caption),
+                        ),
+                    };
+                    match decoded {
                         Ok(decoded) => details = Some(decoded),
-                        Err(error) if crate::totk_save::known_layout(progress) => {
+                        Err(error) if known => {
                             return Err(error).with_context(|| {
                                 format!("Slot {} metadata verification failed", number + 1)
                             });
@@ -554,6 +589,7 @@ struct Incoming {
 }
 
 pub struct Channel {
+    game: crate::native::Game,
     root: PathBuf,
     install: Result<PathBuf>,
     pub status: Status,
@@ -590,6 +626,14 @@ pub struct Channel {
 
 impl Channel {
     pub fn new(root: PathBuf, install: Result<PathBuf>) -> Self {
+        Self::for_game(root, install, crate::native::Game::Totk)
+    }
+
+    pub(crate) fn for_game(
+        root: PathBuf,
+        install: Result<PathBuf>,
+        game: crate::native::Game,
+    ) -> Self {
         let (session, state_error) = match Session::load(&root) {
             Ok(session) => (session, None),
             Err(error) => (Session::default(), Some(format!("{error:#}"))),
@@ -602,6 +646,7 @@ impl Channel {
         };
         let install = session.install.clone().map(Ok).unwrap_or(install);
         Self {
+            game,
             root,
             install,
             status,
@@ -644,12 +689,20 @@ impl Channel {
         self.username = username.into();
     }
 
+    pub fn executable(&self) -> Result<PathBuf> {
+        let install = self
+            .install
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        self.game.executable(install)
+    }
+
     pub fn bind_peer(&mut self, peer: &str) -> Result<()> {
-        ensure!(valid_hash(peer), "Invalid TotK peer identity");
+        ensure!(valid_hash(peer), "Invalid game peer identity");
         if self.session.peer.as_deref() != Some(peer) {
             ensure!(
                 self.session.lock.is_none() && !self.status.busy,
-                "Recover the existing TotK session before changing its partner"
+                "Recover the existing game session before changing its partner"
             );
             self.session.base = None;
             self.session.peer = Some(peer.into());
@@ -662,7 +715,7 @@ impl Channel {
     fn persist(&mut self) -> Result<()> {
         ensure!(
             self.state_error.is_none(),
-            "TotK safety metadata needs attention before syncing"
+            "game safety metadata needs attention before syncing"
         );
         ensure_safe_path(&self.root)?;
         fs::create_dir_all(&self.root)?;
@@ -681,13 +734,12 @@ impl Channel {
 
     fn history(&mut self) -> Result<&mut History> {
         if self.history.is_none() {
-            self.history = Some(History::open_totk(
-                &self.root,
-                &self.username,
-                &self.device,
-            )?);
+            self.history = Some(
+                self.game
+                    .history(&self.root, &self.username, &self.device)?,
+            );
         }
-        self.history.as_mut().context("TotK history is unavailable")
+        self.history.as_mut().context("game history is unavailable")
     }
 
     fn capture(&mut self, save: &Snapshot, reason: history::Reason) -> Result<()> {
@@ -706,7 +758,7 @@ impl Channel {
     }
 
     pub fn preview_history(&mut self, id: &str) -> Result<Summary> {
-        summary(&self.history()?.read(id)?)
+        self.game.summary(&self.history()?.read(id)?)
     }
 
     pub fn resolve(
@@ -722,21 +774,21 @@ impl Channel {
                 && self.status.remote_hash.as_deref() == Some(remote_hash)
                 && !self.status.remote_running
                 && self.status.remote_lock.is_none(),
-            "TotK progress or session changed; compare again"
+            "game progress or session changed; compare again"
         );
         let profile = self.profile()?;
-        let peer = self.peer.clone().context("No bound TotK partner")?;
+        let peer = self.peer.clone().context("No bound game partner")?;
         if use_remote {
             if let Some(id) = self.status.peer_branch.clone() {
                 let bytes = self.history()?.read(&id)?;
                 ensure!(
                     sha256(&bytes) == remote_hash,
-                    "Retained TotK branch is stale"
+                    "Retained game branch is stale"
                 );
-                if let Some(current) = snapshot(&profile)? {
+                if let Some(current) = self.game.snapshot(&profile)? {
                     self.capture(&current, history::Reason::BeforeReceive)?;
                 }
-                apply(&profile, &bytes, Some(local_hash))?;
+                self.game.apply(&profile, &bytes, Some(local_hash))?;
                 self.history()?
                     .record_local_resolution(&bytes, &profile, &peer, remote_hash)?;
                 self.session.base = Some(remote_hash.into());
@@ -753,7 +805,10 @@ impl Channel {
                 preview: false,
             }]);
         }
-        let save = snapshot(&profile)?.context("No local TotK branch")?;
+        let save = self
+            .game
+            .snapshot(&profile)?
+            .context("No local game branch")?;
         self.history()?
             .record_local_resolution(&save.bytes, &profile, &peer, remote_hash)?;
         self.status.history = self.history()?.page(None)?;
@@ -767,11 +822,12 @@ impl Channel {
     ) -> Result<Vec<Event>> {
         self.idle()?;
         ensure!(
-            snapshot(&self.profile()?)?
+            self.game
+                .snapshot(&self.profile()?)?
                 .as_ref()
                 .map(|save| save.hash.as_str())
                 == expected,
-            "Local TotK progress changed before the branch choice"
+            "Local game progress changed before the branch choice"
         );
         let mut frames = if self.pending.is_some() && self.incoming.is_none() {
             self.accept(false)?
@@ -783,26 +839,49 @@ impl Channel {
     }
 
     pub fn set_executable(&mut self, executable: &Path) -> Result<()> {
+        self.select_executable(executable, false)
+    }
+
+    pub fn activate_verified_executable(
+        &mut self,
+        executable: &Path,
+        expected: Option<&str>,
+    ) -> Result<()> {
+        self.require_update_idle()?;
+        let current = self
+            .install
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let next = self.game.installation(executable)?;
+        ensure!(
+            self.game
+                .snapshot(&current.join(self.game.profile_name()))?
+                .as_ref()
+                .map(|save| save.hash.as_str())
+                == expected
+                && self
+                    .game
+                    .snapshot(&next.join(self.game.profile_name()))?
+                    .as_ref()
+                    .map(|save| save.hash.as_str())
+                    == expected,
+            "Progress changed before installation activation; the existing installation remains selected"
+        );
+        self.select_executable(executable, expected.is_some())
+    }
+
+    fn select_executable(&mut self, executable: &Path, preserve_base: bool) -> Result<()> {
         self.require_update_idle()?;
         ensure!(
             self.session.lock.is_none() && self.session.release.is_none(),
-            "Finish or recover the TotK play session before changing installations"
+            "Finish or recover the game play session before changing installations"
         );
-        ensure_safe_path(executable)?;
-        ensure!(
-            executable.is_file()
-                && executable
-                    .file_name()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("totk.exe")),
-            "Select totk.exe from the native portable installation"
-        );
-        let install = executable
-            .parent()
-            .context("Game executable has no directory")?
-            .to_path_buf();
+        let install = self.game.installation(executable)?;
         self.install = Ok(install.clone());
         self.session.install = Some(install);
-        self.session.base = None;
+        if !preserve_base {
+            self.session.base = None;
+        }
         self.history_hash = None;
         self.persist()?;
         self.refresh()
@@ -814,26 +893,26 @@ impl Channel {
             self.session.lock.is_none()
                 && self.status.remote_lock.is_none()
                 && !self.status.remote_running,
-            "Stop both games and finish the TotK play session before restoring"
+            "Stop both games and finish the game play session before restoring"
         );
         let profile = self.profile()?;
-        let current = snapshot(&profile)?;
+        let current = self.game.snapshot(&profile)?;
         ensure!(
             current.as_ref().map(|save| save.hash.as_str()) == expected,
-            "TotK progress changed before restore"
+            "game progress changed before restore"
         );
         let bytes = self.history()?.read(id)?;
         if let Some(current) = &current {
             self.capture(current, history::Reason::BeforeRestore)?;
         }
-        apply(&profile, &bytes, expected)?;
+        self.game.apply(&profile, &bytes, expected)?;
         self.history()?.capture_restored(&bytes, &profile, id)?;
         self.session.base = None;
         self.persist()?;
         self.refresh()?;
         self.status.history = self.history()?.page(None)?;
         self.status.message =
-            "Selected TotK snapshot restored; the previous branch remains in history.".into();
+            "Selected game snapshot restored; the previous branch remains in history.".into();
         Ok(())
     }
 
@@ -843,14 +922,25 @@ impl Channel {
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         ensure_safe_path(install)?;
+        if self.game == crate::native::Game::Totk {
+            crate::totk_update::ensure_complete_at(
+                self.root
+                    .parent()
+                    .context("Native store has no manager root")?,
+                install,
+            )?;
+        }
         ensure!(
-            install.join("totk.exe").is_file(),
-            "The portable TotK installation was not found"
+            self.game.executable(install)?.is_file(),
+            "The native installation was not found"
         );
-        Ok(install.join("profile"))
+        Ok(install.join(self.game.profile_name()))
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        if self.status.updating {
+            return Ok(());
+        }
         let result = self.refresh_verified();
         if let Err(error) = &result {
             self.status.verification_error = Some(format!("{error:#}"));
@@ -878,7 +968,7 @@ impl Channel {
     fn refresh_verified(&mut self) -> Result<()> {
         ensure!(
             self.state_error.is_none(),
-            "TotK safety metadata needs attention"
+            "game safety metadata needs attention"
         );
         let install = self
             .install
@@ -887,10 +977,20 @@ impl Channel {
         ensure_safe_path(install)?;
         self.status.checked = true;
         self.status.install_path = Some(install.clone());
-        self.status.installed = install.join("totk.exe").is_file();
-        self.status.running = self.monitor.named_game_running("totk.exe");
+        let executable = self.game.executable(install)?;
+        self.status.installed = executable.is_file();
+        self.status.executable = Some(executable);
+        if self.game == crate::native::Game::Totk {
+            crate::totk_update::ensure_complete_at(
+                self.root
+                    .parent()
+                    .context("Native store has no manager root")?,
+                install,
+            )?;
+        }
+        self.status.running = self.game.running(&mut self.monitor);
         let save = if self.status.installed {
-            match snapshot(&install.join("profile")) {
+            match self.game.snapshot(&install.join(self.game.profile_name())) {
                 Ok(save) => save,
                 Err(_) if self.status.running => return Ok(()),
                 Err(error) => return Err(error),
@@ -905,8 +1005,10 @@ impl Channel {
         if self.seen_hash != hash {
             self.seen_hash = hash;
             self.stable_since = Instant::now();
-            self.status.local_summary =
-                save.as_ref().map(|save| summary(&save.bytes)).transpose()?;
+            self.status.local_summary = save
+                .as_ref()
+                .map(|save| self.game.summary(&save.bytes))
+                .transpose()?;
         } else if self.stable_since.elapsed() >= Duration::from_secs(2)
             && let Some(save) = &save
             && self.history_hash.as_ref() != Some(&save.hash)
@@ -924,8 +1026,8 @@ impl Channel {
     fn cached_state_event(&self) -> Event {
         Event::TotkState {
             installed: self.status.installed,
-            running: self.status.running,
-            hash: if self.status.running {
+            running: self.status.running || self.status.updating,
+            hash: if self.status.running || self.status.updating {
                 None
             } else {
                 self.status.local_hash.clone()
@@ -936,13 +1038,15 @@ impl Channel {
     }
 
     fn idle(&mut self) -> Result<()> {
+        ensure!(!self.status.updating, "Wait for the current game update");
         ensure!(
             self.state_error.is_none(),
-            "TotK safety metadata needs attention"
+            "game safety metadata needs attention"
         );
         ensure!(
-            !self.monitor.named_game_running("totk.exe"),
-            "Close Tears of the Kingdom before syncing its saves"
+            !self.game.running(&mut self.monitor),
+            "Close {} before syncing its saves",
+            self.game.name()
         );
         Ok(())
     }
@@ -955,15 +1059,17 @@ impl Channel {
                 && self.child.is_none()
                 && self.session.lock.is_none()
                 && self.session.release.is_none(),
-            "Finish or recover the TotK play session and pending transfers first"
+            "Finish or recover the game play session and pending transfers first"
         );
         Ok(())
     }
 
     pub fn require_app_update_idle(&mut self) -> Result<()> {
+        ensure!(!self.status.updating, "Wait for the current game update");
         ensure!(
-            !self.monitor.named_game_running("totk.exe") && !self.status.remote_running,
-            "Stop TotK on both devices before updating Twilight Sync"
+            !self.game.running(&mut self.monitor) && !self.status.remote_running,
+            "Stop {} on both devices before updating Twilight Sync",
+            self.game.name()
         );
         ensure!(
             !self.status.busy
@@ -971,13 +1077,14 @@ impl Channel {
                 && self.child.is_none()
                 && self.recovery_request.is_none()
                 && self.recovery_pending.is_none(),
-            "Finish the current TotK launch, transfer, or recovery before updating Twilight Sync"
+            "Finish the current {} launch, transfer, or recovery before updating Twilight Sync",
+            self.game.name()
         );
         Ok(())
     }
 
     pub fn game_running(&mut self) -> bool {
-        self.monitor.named_game_running("totk.exe")
+        self.game.running(&mut self.monitor)
     }
 
     pub fn launch(&mut self, connected: bool, local_only: bool) -> Result<Vec<Event>> {
@@ -985,21 +1092,21 @@ impl Channel {
         self.idle()?;
         ensure!(
             self.child.is_none() && self.launch_request.is_none(),
-            "TotK launch is already pending"
+            "game launch is already pending"
         );
         ensure!(
             !self.status.busy && !self.status.remote_running,
-            "Finish the current TotK transfer or partner session first"
+            "Finish the current game transfer or partner session first"
         );
         ensure!(
             self.session.lock.is_none()
                 && (self.session.release.is_none() || !connected || local_only)
                 && self.status.remote_lock.is_none(),
-            "A TotK play lock is held; recover the completed session first"
+            "A game play lock is held; recover the completed session first"
         );
         if !connected || local_only {
             self.start_game(None)?;
-            self.status.message = "Playing this PC's TotK branch. Offline progress is preserved for later reconciliation.".into();
+            self.status.message = "Playing this PC's game branch. Offline progress is preserved for later reconciliation.".into();
             return Ok(if connected {
                 vec![self.shared_state()]
             } else {
@@ -1008,7 +1115,7 @@ impl Channel {
         }
         ensure!(
             self.status.peer_checked && self.status.remote_installed,
-            "Wait for the partner's TotK state before protected play"
+            "Wait for the partner's game state before protected play"
         );
         ensure!(
             self.status.remote_save_ready,
@@ -1022,7 +1129,7 @@ impl Channel {
             );
             ensure!(
                 decision != Decision::Conflict,
-                "Compare the two TotK branches or explicitly continue this PC's progress"
+                "Compare the two game branches or explicitly continue this PC's progress"
             );
             self.launch_after_sync = true;
             self.status.launch_pending = true;
@@ -1041,7 +1148,7 @@ impl Channel {
             Instant::now(),
         ));
         self.status.launch_pending = true;
-        self.status.message = "Waiting for the paired PC to reserve TotK play.".into();
+        self.status.message = "Waiting for the paired PC to reserve game play.".into();
         Ok(vec![Event::LeaseRequest {
             token,
             hash: self.status.local_hash.clone(),
@@ -1050,7 +1157,7 @@ impl Channel {
 
     fn start_game(&mut self, token: Option<String>) -> Result<()> {
         self.idle()?;
-        if let Some(save) = snapshot(&self.profile()?)? {
+        if let Some(save) = self.game.snapshot(&self.profile()?)? {
             self.capture(&save, history::Reason::Observed)?;
         }
         #[cfg(test)]
@@ -1060,15 +1167,12 @@ impl Channel {
             self.managed_token = token;
             return Ok(());
         }
-        let executable = self
+        let install = self
             .install
             .as_ref()
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?
-            .join("totk.exe");
-        self.child = Some(play::launch_game(
-            &executable,
-            crate::protocol::GameId::Totk,
-        )?);
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let executable = self.game.executable(install)?;
+        self.child = Some(play::launch_game(&executable, self.game.id())?);
         self.managed_token = token;
         self.status.running = true;
         Ok(())
@@ -1078,7 +1182,7 @@ impl Channel {
         self.idle()?;
         ensure!(
             !self.status.busy && !self.status.remote_running,
-            "Stop both TotK games and finish transfers before recovery"
+            "Stop the game on both PCs and finish transfers before recovery"
         );
         let token = self
             .session
@@ -1086,7 +1190,7 @@ impl Channel {
             .as_ref()
             .map(|lock| lock.token.clone())
             .or_else(|| self.session.release.clone())
-            .context("No TotK session needs recovery")?;
+            .context("No game session needs recovery")?;
         self.recovery_request = Some(token.clone());
         Ok(vec![Event::Recover { token }])
     }
@@ -1095,23 +1199,23 @@ impl Channel {
         self.idle()?;
         ensure!(
             !self.status.busy && !self.status.remote_running,
-            "Stop TotK and finish transfers before recovery"
+            "Stop game and finish transfers before recovery"
         );
         let lock = self
             .session
             .lock
             .as_ref()
-            .context("No local TotK reservation needs recovery")?;
+            .context("No local game reservation needs recovery")?;
         ensure!(
             lock.owner == self.device,
-            "Only this PC's completed TotK reservation can be recovered offline"
+            "Only this PC's completed game reservation can be recovered offline"
         );
         self.session.release = Some(lock.token.clone());
         self.session.lock = None;
         self.launch_request = None;
         self.status.launch_pending = false;
         self.persist()?;
-        self.status.message = "This PC's completed TotK session was recovered. The partner's reservation is retained until reconnection.".into();
+        self.status.message = "This PC's completed game session was recovered. The partner's reservation is retained until reconnection.".into();
         Ok(())
     }
 
@@ -1119,12 +1223,12 @@ impl Channel {
         self.idle()?;
         ensure!(
             !self.status.busy && !self.status.remote_running,
-            "Stop both TotK games before recovery"
+            "Stop the game on both PCs before recovery"
         );
         let token = self
             .recovery_pending
             .take()
-            .context("No TotK recovery request")?;
+            .context("No game recovery request")?;
         self.status.recovery_pending = false;
         if !approved {
             return Ok(Vec::new());
@@ -1138,7 +1242,8 @@ impl Channel {
     pub fn shared_state(&self) -> Event {
         let ready = self.status.installed
             && self.status.verification_error.is_none()
-            && !self.status.running;
+            && !self.status.running
+            && !self.status.updating;
         Event::State {
             hash: if ready {
                 self.status.local_hash.clone()
@@ -1146,7 +1251,7 @@ impl Channel {
                 None
             },
             save_ready: ready,
-            game: self.status.running,
+            game: self.status.running || self.status.updating,
             lock: self.session.lock.clone(),
         }
     }
@@ -1156,6 +1261,13 @@ impl Channel {
             return Ok(Vec::new());
         }
         self.last_poll = Instant::now();
+        if self.status.updating {
+            return Ok(if connected {
+                vec![self.shared_state(), self.cached_state_event()]
+            } else {
+                Vec::new()
+            });
+        }
         self.expire();
         if let Err(error) = self.refresh() {
             self.status.message = format!("Save verification failed: {error:#}");
@@ -1173,14 +1285,14 @@ impl Channel {
             let (token, _, _) = self
                 .launch_request
                 .take()
-                .context("Missing expired TotK launch")?;
+                .context("Missing expired game launch")?;
             if play::matches(self.session.lock.as_ref(), &self.device, &token) {
                 self.session.lock = None;
                 self.session.release = Some(token);
                 self.persist()?;
             }
             self.status.launch_pending = false;
-            self.status.message = "TotK play approval expired. No game was launched.".into();
+            self.status.message = "game play approval expired. No game was launched.".into();
         }
         if let Some(child) = &mut self.child
             && child.try_wait()?.is_some()
@@ -1194,7 +1306,7 @@ impl Channel {
         {
             ensure!(
                 play::matches(self.session.lock.as_ref(), &self.device, &token),
-                "TotK session ownership changed"
+                "game session ownership changed"
             );
             self.session.lock = None;
             self.session.release = Some(token);
@@ -1239,7 +1351,7 @@ impl Channel {
             }
             Decision::Conflict => {
                 self.status.conflict = true;
-                self.status.message = "Both PCs have different TotK progress. Choose a complete save or keep playing this PC's branch.".into();
+                self.status.message = "Both PCs have different game progress. Choose a complete save or keep playing this PC's branch.".into();
                 if self.preview_requested != self.status.remote_hash {
                     if let Some(hash) = &self.status.remote_hash {
                         frames.push(Event::SavePreviewRequest { hash: hash.clone() });
@@ -1291,10 +1403,10 @@ impl Channel {
         expected: Option<String>,
     ) -> Result<Vec<Event>> {
         self.idle()?;
-        ensure!(!self.status.busy, "A TotK save transfer is already pending");
+        ensure!(!self.status.busy, "A game save transfer is already pending");
         ensure!(
             self.status.peer_checked && self.status.remote_installed,
-            "Check TotK saves on the paired device first; both PCs need TotK support"
+            "Check game saves on the paired device first; both PCs need game support"
         );
         ensure!(
             self.status.remote_save_ready,
@@ -1302,14 +1414,18 @@ impl Channel {
         );
         ensure!(
             !self.status.remote_running,
-            "Your partner is playing Tears of the Kingdom"
+            "Your partner is playing {}",
+            self.game.name()
         );
-        let save =
-            snapshot(&self.profile()?)?.context("This PC has no committed TotK save to send")?;
-        summary(&save.bytes)
-            .context("Local TotK metadata verification failed; no save was sent")?;
+        let save = self
+            .game
+            .snapshot(&self.profile()?)?
+            .context("This PC has no committed game save to send")?;
+        self.game
+            .summary(&save.bytes)
+            .context("Local game metadata verification failed; no save was sent")?;
         if self.status.remote_hash.as_ref() == Some(&save.hash) {
-            self.status.message = "TotK saves already match.".into();
+            self.status.message = "game saves already match.".into();
             return Ok(Vec::new());
         }
         let event = Event::SaveOffer {
@@ -1325,7 +1441,7 @@ impl Channel {
         self.outgoing_preview = preview;
         self.outgoing = Some((save, Instant::now()));
         self.status.busy = true;
-        self.status.message = "Waiting for your partner to approve the TotK save.".into();
+        self.status.message = "Waiting for your partner to approve the game save.".into();
         Ok(vec![event])
     }
 
@@ -1335,22 +1451,25 @@ impl Channel {
             let offer = self
                 .pending
                 .as_ref()
-                .context("No incoming TotK save offer")?;
+                .context("No incoming game save offer")?;
             ensure!(
                 offer.updated.elapsed() < Duration::from_secs(120),
-                "TotK save offer expired"
+                "game save offer expired"
             );
             ensure!(
-                snapshot(&self.profile()?)?.as_ref().map(|save| &save.hash)
+                self.game
+                    .snapshot(&self.profile()?)?
+                    .as_ref()
+                    .map(|save| &save.hash)
                     == offer.expected.as_ref(),
-                "Local TotK progress changed since the offer"
+                "Local game progress changed since the offer"
             );
         }
-        let offer = self.pending.take().context("No incoming TotK save offer")?;
+        let offer = self.pending.take().context("No incoming game save offer")?;
         self.status.pending = false;
         if !approved {
             self.status.busy = false;
-            self.status.message = "Incoming TotK save declined; local progress was kept.".into();
+            self.status.message = "Incoming game save declined; local progress was kept.".into();
             return Ok(vec![Event::TotkDeclined { hash: offer.hash }]);
         }
         ensure_safe_path(&self.root)?;
@@ -1361,11 +1480,22 @@ impl Channel {
             temporary: tempfile::NamedTempFile::new_in(&self.root)?,
             received: 0,
         });
-        self.status.message = "Receiving approved TotK save...".into();
+        self.status.message = "Receiving approved game save...".into();
         Ok(vec![Event::TotkAccept { hash }])
     }
 
     pub fn handle(&mut self, event: Event) -> Result<Vec<Event>> {
+        ensure!(
+            !self.status.updating
+                || matches!(
+                    &event,
+                    Event::State { .. }
+                        | Event::TotkState { .. }
+                        | Event::TotkRequest
+                        | Event::LeaseRequest { .. }
+                ),
+            "Wait for the current game update before syncing or changing play sessions"
+        );
         match event {
             Event::SavePull {
                 hash,
@@ -1378,8 +1508,10 @@ impl Channel {
                     "Invalid game-scoped snapshot request"
                 );
                 ensure!(
-                    snapshot(&self.profile()?)?.is_some_and(|save| save.hash == hash),
-                    "Requested TotK branch changed"
+                    self.game
+                        .snapshot(&self.profile()?)?
+                        .is_some_and(|save| save.hash == hash),
+                    "Requested game branch changed"
                 );
                 return self.prepare_offer(true, preview, expected);
             }
@@ -1392,8 +1524,9 @@ impl Channel {
                 let peer = self
                     .peer
                     .clone()
-                    .context("TotK peer identity is not bound")?;
-                if self.status.running
+                    .context("game peer identity is not bound")?;
+                if self.status.updating
+                    || self.status.running
                     || self.status.busy
                     || self.session.lock.is_some()
                     || self.session.release.is_some()
@@ -1401,7 +1534,7 @@ impl Channel {
                 {
                     return Ok(vec![Event::LeaseDenied {
                         token,
-                        reason: "TotK is busy, locked, or its save differs".into(),
+                        reason: "game is busy, locked, or its save differs".into(),
                     }]);
                 }
                 self.session.lock = Some(play::acquire(None, false, &peer, &token)?);
@@ -1412,30 +1545,30 @@ impl Channel {
                 let (requested, hash, created) = self
                     .launch_request
                     .take()
-                    .context("No pending TotK launch")?;
+                    .context("No pending game launch")?;
                 ensure!(
                     token == requested
                         && created.elapsed() < Duration::from_secs(30)
                         && play::matches(self.session.lock.as_ref(), &self.device, &token),
-                    "Stale TotK launch approval"
+                    "Stale game launch approval"
                 );
                 ensure!(
-                    snapshot(&self.profile()?)?.map(|save| save.hash) == hash,
-                    "TotK progress changed before launch approval"
+                    self.game.snapshot(&self.profile()?)?.map(|save| save.hash) == hash,
+                    "game progress changed before launch approval"
                 );
                 self.status.launch_pending = false;
                 if let Err(error) = self.start_game(Some(token.clone())) {
                     self.session.lock = None;
                     self.session.release = Some(token.clone());
                     self.persist()?;
-                    self.status.message = format!("TotK did not launch: {error:#}");
+                    self.status.message = format!("game did not launch: {error:#}");
                     return Ok(vec![Event::LeaseRelease {
                         token,
                         hash: self.status.local_hash.clone(),
                     }]);
                 }
                 self.status.message =
-                    "TotK is running with coordinated online play protection.".into();
+                    "game is running with coordinated online play protection.".into();
                 return Ok(vec![self.shared_state()]);
             }
             Event::LeaseDenied { token, reason } => {
@@ -1444,37 +1577,37 @@ impl Channel {
                         .as_ref()
                         .is_some_and(|(requested, _, _)| requested == &token)
                         && play::matches(self.session.lock.as_ref(), &self.device, &token),
-                    "Unexpected TotK launch denial"
+                    "Unexpected game launch denial"
                 );
                 self.launch_request = None;
                 self.status.launch_pending = false;
                 self.session.lock = None;
                 self.persist()?;
-                self.status.message = format!("TotK play was not reserved: {reason}");
+                self.status.message = format!("game play was not reserved: {reason}");
             }
             Event::LeaseRelease { token, hash } => {
                 self.idle()?;
                 ensure!(
                     !self.status.busy && hash.as_ref().is_none_or(|hash| valid_hash(hash)),
-                    "TotK save transfer is still active"
+                    "game save transfer is still active"
                 );
-                let peer = self.peer.as_ref().context("Missing TotK peer")?;
+                let peer = self.peer.as_ref().context("Missing game peer")?;
                 if self.session.lock.is_some() {
                     ensure!(
                         play::matches(self.session.lock.as_ref(), peer, &token),
-                        "TotK release does not own the active session"
+                        "game release does not own the active session"
                     );
                     self.session.lock = None;
                     self.persist()?;
                 } else {
-                    ensure!(valid_hash(&token), "Invalid TotK release token");
+                    ensure!(valid_hash(&token), "Invalid game release token");
                 }
                 return Ok(vec![Event::LeaseReleased { token }, self.shared_state()]);
             }
             Event::LeaseReleased { token } => {
                 ensure!(
                     self.session.release.as_ref() == Some(&token),
-                    "Unexpected TotK release receipt"
+                    "Unexpected game release receipt"
                 );
                 self.session.release = None;
                 self.persist()?;
@@ -1483,25 +1616,25 @@ impl Channel {
                 self.idle()?;
                 ensure!(
                     valid_hash(&token) && !self.status.busy && !self.status.remote_running,
-                    "TotK recovery is unsafe while a game or transfer is active"
+                    "game recovery is unsafe while a game or transfer is active"
                 );
                 ensure!(
                     self.session
                         .lock
                         .as_ref()
                         .is_none_or(|lock| lock.token == token),
-                    "TotK recovery targets another session"
+                    "game recovery targets another session"
                 );
                 self.recovery_pending = Some(token);
                 self.status.recovery_pending = true;
                 self.status.message =
-                    "Partner requests recovery of the completed TotK play session.".into();
+                    "Partner requests recovery of the completed game play session.".into();
             }
             Event::RecoveryApproved { token } => {
                 self.idle()?;
                 ensure!(
                     self.recovery_request.as_ref() == Some(&token) && !self.status.busy,
-                    "Unexpected TotK recovery approval"
+                    "Unexpected game recovery approval"
                 );
                 self.session.lock = None;
                 self.session.release = None;
@@ -1542,12 +1675,15 @@ impl Channel {
                 self.status.remote_lock = lock;
             }
             Event::SavePreviewRequest { hash } => {
-                let save = snapshot(&self.profile()?)?.context("No TotK save to preview")?;
-                ensure!(save.hash == hash, "TotK save changed before preview");
+                let save = self
+                    .game
+                    .snapshot(&self.profile()?)?
+                    .context("No game save to preview")?;
+                ensure!(save.hash == hash, "game save changed before preview");
                 return Ok(vec![Event::SavePreview {
                     hash,
                     base: self.session.base.clone(),
-                    bytes: serde_json::to_vec(&summary(&save.bytes)?)?,
+                    bytes: serde_json::to_vec(&self.game.summary(&save.bytes)?)?,
                 }]);
             }
             Event::SavePreview {
@@ -1557,7 +1693,7 @@ impl Channel {
             } => {
                 ensure!(
                     self.status.remote_hash.as_ref() == Some(&hash),
-                    "Stale TotK comparison"
+                    "Stale game comparison"
                 );
                 let preview: Summary = serde_json::from_slice(&bytes)?;
                 ensure!(
@@ -1567,7 +1703,7 @@ impl Channel {
                         && preview.slots.iter().all(|slot| valid_hash(&slot.hash)
                             && slot.files <= MAX_FILES
                             && slot.bytes <= MAX_SAVE_SIZE),
-                    "Invalid TotK comparison metadata"
+                    "Invalid game comparison metadata"
                 );
                 self.status.remote_summary = Some(preview);
             }
@@ -1581,7 +1717,7 @@ impl Channel {
                 size,
                 preview,
             } => {
-                let current = snapshot(&self.profile()?)?;
+                let current = self.game.snapshot(&self.profile()?)?;
                 let chosen =
                     self.selected_remote
                         .as_ref()
@@ -1628,11 +1764,11 @@ impl Channel {
                     hash.as_ref().is_none_or(|hash| valid_hash(hash))
                         && files <= MAX_FILES
                         && size <= MAX_BUNDLE_SIZE as u64,
-                    "Invalid TotK peer state"
+                    "Invalid game peer state"
                 );
                 ensure!(
                     hash.is_none() || (installed && !running && files > 0 && size > 0),
-                    "Invalid TotK save readiness"
+                    "Invalid game save readiness"
                 );
                 if !self.shared_peer_state {
                     self.status.remote_save_ready = installed && !running;
@@ -1654,22 +1790,22 @@ impl Channel {
                 self.idle()?;
                 ensure!(
                     !self.status.busy,
-                    "Another TotK transfer is already pending"
+                    "Another game transfer is already pending"
                 );
                 ensure!(
                     valid_hash(&hash)
                         && expected.as_ref().is_none_or(|hash| valid_hash(hash))
                         && (1..=MAX_FILES).contains(&files)
                         && (1..=MAX_BUNDLE_SIZE as u64).contains(&size),
-                    "Invalid TotK save offer"
+                    "Invalid game save offer"
                 );
-                let current = snapshot(&self.profile()?)?;
+                let current = self.game.snapshot(&self.profile()?)?;
                 if current.as_ref().is_some_and(|save| save.hash == hash) {
                     return Ok(vec![Event::TotkSaved { hash }]);
                 }
                 ensure!(
                     current.as_ref().map(|save| &save.hash) == expected.as_ref(),
-                    "TotK progress changed; refresh both saves before offering a replacement"
+                    "game progress changed; refresh both saves before offering a replacement"
                 );
                 self.pending = Some(Offer {
                     hash,
@@ -1684,7 +1820,7 @@ impl Channel {
                 self.status.pending = true;
                 self.status.busy = true;
                 self.status.message = format!(
-                    "Partner offered {files} TotK save files. Local progress will be backed up before replacement."
+                    "Partner offered {files} game save files. Local progress will be backed up before replacement."
                 );
             }
             Event::TotkAccept { hash } => {
@@ -1692,14 +1828,16 @@ impl Channel {
                 let (save, offered) = self
                     .outgoing
                     .take()
-                    .context("No outgoing TotK save offer")?;
+                    .context("No outgoing game save offer")?;
                 ensure!(
                     save.hash == hash && offered.elapsed() < Duration::from_secs(120),
-                    "Stale TotK approval"
+                    "Stale game approval"
                 );
                 ensure!(
-                    snapshot(&self.profile()?)?.is_some_and(|current| current.hash == hash),
-                    "TotK save changed after it was offered"
+                    self.game
+                        .snapshot(&self.profile()?)?
+                        .is_some_and(|current| current.hash == hash),
+                    "game save changed after it was offered"
                 );
                 let mut events: Vec<_> = save
                     .bytes
@@ -1711,17 +1849,17 @@ impl Channel {
                     .collect();
                 events.push(Event::TotkDone { hash: hash.clone() });
                 self.sent = Some((hash, Instant::now()));
-                self.status.message = "Sending approved TotK save...".into();
+                self.status.message = "Sending approved game save...".into();
                 return Ok(events);
             }
             Event::TotkChunk { hash, bytes } => {
-                let incoming = self.incoming.as_mut().context("Unapproved TotK transfer")?;
+                let incoming = self.incoming.as_mut().context("Unapproved game transfer")?;
                 ensure!(
                     hash == incoming.offer.hash
                         && !bytes.is_empty()
                         && bytes.len() <= CHUNK_SIZE
                         && incoming.received + bytes.len() as u64 <= incoming.offer.size,
-                    "Invalid TotK transfer chunk"
+                    "Invalid game transfer chunk"
                 );
                 incoming.temporary.write_all(&bytes)?;
                 incoming.received += bytes.len() as u64;
@@ -1729,22 +1867,24 @@ impl Channel {
             }
             Event::TotkDone { hash } => {
                 self.idle()?;
-                let mut incoming = self.incoming.take().context("No approved TotK transfer")?;
+                let mut incoming = self.incoming.take().context("No approved game transfer")?;
                 ensure!(
                     hash == incoming.offer.hash && incoming.received == incoming.offer.size,
-                    "Incomplete TotK transfer"
+                    "Incomplete game transfer"
                 );
                 incoming.temporary.flush()?;
                 let bytes = fs::read(incoming.temporary.path())?;
                 ensure!(
                     sha256(&bytes) == hash && decode(&bytes)?.len() == incoming.offer.files,
-                    "TotK transfer checksum or file count mismatch"
+                    "game transfer checksum or file count mismatch"
                 );
-                let verified_summary = summary(&bytes)
-                    .context("Incoming TotK metadata verification failed before commit")?;
+                let verified_summary = self
+                    .game
+                    .summary(&bytes)
+                    .context("Incoming game metadata verification failed before commit")?;
                 self.receive_allowed(incoming.offer.lease.as_deref())?;
                 let profile = self.profile()?;
-                if let Some(current) = snapshot(&profile)? {
+                if let Some(current) = self.game.snapshot(&profile)? {
                     self.capture(&current, history::Reason::BeforeReceive)?;
                 }
                 let peer = self.peer.clone();
@@ -1762,11 +1902,13 @@ impl Channel {
                     self.status.comparison_verified = true;
                     self.status.history = self.history()?.page(None)?;
                     self.status.busy = false;
-                    self.status.message = "Both TotK branches are retained for comparison; local progress was not changed.".into();
+                    self.status.message = "Both game branches are retained for comparison; local progress was not changed.".into();
                     return Ok(vec![Event::TotkSaved { hash }]);
                 }
-                let previous = snapshot(&profile)?.map(|save| save.hash);
-                let backup = apply(&profile, &bytes, incoming.offer.expected.as_deref())?;
+                let previous = self.game.snapshot(&profile)?.map(|save| save.hash);
+                let backup =
+                    self.game
+                        .apply(&profile, &bytes, incoming.offer.expected.as_deref())?;
                 if let (Some(peer), Some(_)) = (&peer, &previous)
                     && self
                         .selected_remote
@@ -1788,10 +1930,10 @@ impl Channel {
                 self.refresh()?;
                 self.status.busy = false;
                 self.status.message = backup.map_or_else(
-                    || "TotK saves received and verified.".into(),
+                    || "game saves received and verified.".into(),
                     |path| {
                         format!(
-                            "TotK saves received. Previous progress retained at {}",
+                            "game saves received. Previous progress retained at {}",
                             path.display()
                         )
                     },
@@ -1804,7 +1946,7 @@ impl Channel {
                     .as_ref()
                     .map(|(hash, _)| hash)
                     .or_else(|| self.outgoing.as_ref().map(|(save, _)| &save.hash));
-                ensure!(expected == Some(&hash), "Unexpected TotK transfer receipt");
+                ensure!(expected == Some(&hash), "Unexpected game transfer receipt");
                 self.sent = None;
                 self.outgoing = None;
                 self.status.busy = false;
@@ -1819,20 +1961,20 @@ impl Channel {
                 self.status.remote_hash = Some(hash);
                 self.session.base = self.status.remote_hash.clone();
                 self.persist()?;
-                self.status.message = "Partner received and verified the TotK saves.".into();
+                self.status.message = "Partner received and verified the game saves.".into();
             }
             Event::TotkDeclined { hash } => {
                 ensure!(
                     self.outgoing
                         .as_ref()
                         .is_some_and(|(save, _)| save.hash == hash),
-                    "Unexpected TotK decline"
+                    "Unexpected game decline"
                 );
                 self.outgoing = None;
                 self.status.busy = false;
-                self.status.message = "Partner kept their existing TotK progress.".into();
+                self.status.message = "Partner kept their existing game progress.".into();
             }
-            _ => anyhow::bail!("Not a TotK sync event"),
+            _ => anyhow::bail!("Not a game sync event"),
         }
         Ok(Vec::new())
     }
@@ -1856,7 +1998,7 @@ impl Channel {
         if timed_out {
             self.reset();
             self.status.message =
-                "TotK transfer expired; committed progress was not changed.".into();
+                "game transfer expired; committed progress was not changed.".into();
         }
     }
 
@@ -1898,7 +2040,7 @@ impl Channel {
                 .as_ref()
                 .is_none_or(|lock| self.peer.as_ref() == Some(&lock.owner)
                     && lease == Some(lock.token.as_str())),
-            "Finish the TotK play session before replacing a save"
+            "Finish the game play session before replacing a save"
         );
         Ok(())
     }
@@ -1989,6 +2131,122 @@ mod tests {
         let mut channel = Channel::new(root.join("sync"), Ok(install));
         channel.monitor = ProcessMonitor::for_test(false);
         Ok(channel)
+    }
+
+    #[test]
+    fn program_updates_pause_play_and_sync_without_changing_saves_or_reservations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut channel = fixture(temp.path(), Some(b"unchanged progress"))?;
+        channel.identify(&"a".repeat(64), "Local user");
+        channel.bind_peer(&"b".repeat(64))?;
+        channel.refresh()?;
+        let before = channel.status.local_hash.clone();
+        channel.session.base = before.clone();
+        channel.status.updating = true;
+        assert!(channel.launch(false, false).is_err());
+        assert!(channel.offer().is_err());
+        assert!(channel.require_update_idle().is_err());
+        assert!(channel.require_app_update_idle().is_err());
+        assert!(
+            channel
+                .handle(Event::TotkOffer {
+                    hash: "c".repeat(64),
+                    expected: before.clone(),
+                    files: 1,
+                    size: 10,
+                })
+                .is_err()
+        );
+        let denied = channel.handle(Event::LeaseRequest {
+            token: "c".repeat(64),
+            hash: before.clone(),
+        })?;
+        assert!(matches!(denied.as_slice(), [Event::LeaseDenied { .. }]));
+        assert!(channel.session.lock.is_none());
+        assert!(matches!(
+            channel.shared_state(),
+            Event::State {
+                save_ready: false,
+                hash: None,
+                game: true,
+                ..
+            }
+        ));
+        channel.last_poll = Instant::now() - Duration::from_secs(4);
+        assert!(channel.tick(true)?.iter().any(|event| matches!(
+            event,
+            Event::TotkState {
+                running: true,
+                hash: None,
+                ..
+            }
+        )));
+        channel.reset();
+        assert!(
+            channel.status.updating,
+            "A disconnect must not unpause an update"
+        );
+        channel.status.updating = false;
+        channel.refresh()?;
+        assert_eq!(channel.status.local_hash, before);
+        assert_eq!(channel.session.base, before);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_source_activation_preserves_the_common_base_and_rejects_changed_saves() -> Result<()>
+    {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let mut channel = fixture(first.path(), Some(b"same progress"))?;
+        fixture(second.path(), Some(b"same progress"))?;
+        channel.refresh()?;
+        let expected = channel.status.local_hash.clone();
+        channel.session.base = expected.clone();
+        channel.persist()?;
+        channel.activate_verified_executable(
+            &second.path().join("game").join("totk.exe"),
+            expected.as_deref(),
+        )?;
+        assert_eq!(channel.session.base, expected);
+        assert_eq!(channel.status.local_hash, expected);
+        assert!(
+            channel
+                .activate_verified_executable(
+                    &first.path().join("game").join("totk.exe"),
+                    Some(&"f".repeat(64)),
+                )
+                .is_err()
+        );
+        assert_eq!(channel.session.base, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_program_updates_block_a_restarted_channel_but_allow_update_retry() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let channel = fixture(temp.path(), Some(b"unchanged progress"))?;
+        let install = channel
+            .profile()?
+            .parent()
+            .context("Missing install")?
+            .to_path_buf();
+        fs::write(install.join("twilight-update-pending.json"), b"{}")?;
+        let mut restarted = Channel::new(temp.path().join("sync"), Ok(install));
+        restarted.monitor = ProcessMonitor::for_test(false);
+        assert!(restarted.refresh().is_err());
+        assert!(
+            restarted
+                .status
+                .verification_error
+                .as_ref()
+                .is_some_and(|error| error.contains("update is incomplete"))
+        );
+        assert!(restarted.profile().is_err());
+        assert!(restarted.launch(false, false).is_err());
+        assert!(restarted.require_update_idle().is_ok());
+        Ok(())
     }
 
     #[test]
@@ -2480,6 +2738,89 @@ mod tests {
             };
             frames.extend(replies.into_iter().map(|event| (!to_left, event)));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_uses_the_shared_history_restore_and_durable_play_protocol() -> Result<()> {
+        let left_root = tempfile::tempdir()?;
+        let right_root = tempfile::tempdir()?;
+        let mut channels = Vec::new();
+        for (root, device, peer, marker) in [
+            (left_root.path(), "a".repeat(64), "b".repeat(64), 1),
+            (right_root.path(), "b".repeat(64), "a".repeat(64), 2),
+        ] {
+            let install = root.join("game");
+            fs::create_dir_all(&install)?;
+            fs::write(install.join("Triforce.exe"), b"never executed")?;
+            fs::write(install.join("image.bin"), b"synthetic game marker")?;
+            fs::create_dir(install.join("romfs"))?;
+            crate::triforce::tests::seed(&install.join("user"), marker)?;
+            let mut channel = Channel::for_game(
+                root.join("sync"),
+                Ok(install),
+                crate::native::Game::Triforce,
+            );
+            channel.monitor = ProcessMonitor::for_test(false);
+            channel.test_launch = true;
+            channel.identify(&device, "Test user");
+            channel.bind_peer(&peer)?;
+            channel.refresh()?;
+            channels.push(channel);
+        }
+        let mut right = channels.pop().context("Missing right channel")?;
+        let mut left = channels.pop().context("Missing left channel")?;
+        let previous = right.status.local_hash.clone();
+        left.handle(right.shared_state())?;
+        right.handle(left.shared_state())?;
+        let offer = left.offer()?;
+        exchange(&mut left, &mut right, offer, false)?;
+        assert!(right.status.pending);
+        assert_eq!(right.status.local_hash, previous);
+        let accepted = right.accept(true)?;
+        exchange(&mut left, &mut right, accepted, true)?;
+        assert_eq!(left.status.local_hash, right.status.local_hash);
+        assert!(
+            right
+                .status
+                .history
+                .entries
+                .iter()
+                .any(|entry| entry.game == "OOTR")
+        );
+        let old = right
+            .status
+            .history
+            .entries
+            .iter()
+            .find(|entry| Some(&entry.hash) == previous.as_ref())
+            .context("Previous Triforce branch was not retained")?
+            .id
+            .clone();
+        let expected = right.status.local_hash.clone();
+        right.restore(&old, expected.as_deref())?;
+        assert_eq!(right.status.local_hash, previous);
+        assert!(!right.profile()?.join("account.uid").try_exists()?);
+        left.handle(right.shared_state())?;
+        right.handle(left.shared_state())?;
+        let offer = left.offer()?;
+        exchange(&mut left, &mut right, offer, false)?;
+        let accepted = right.accept(true)?;
+        exchange(&mut left, &mut right, accepted, true)?;
+        left.handle(right.shared_state())?;
+        right.handle(left.shared_state())?;
+        let requests = left.launch(true, false)?;
+        exchange(&mut left, &mut right, requests, false)?;
+        assert!(left.status.running);
+        assert!(Session::load(&left.root)?.lock.is_some());
+        assert!(Session::load(&right.root)?.lock.is_some());
+        assert!(right.launch(true, false).is_err());
+        left.monitor = ProcessMonitor::for_test(false);
+        left.stable_since = Instant::now() - Duration::from_secs(3);
+        left.last_poll = Instant::now() - Duration::from_secs(4);
+        let release = left.tick(true)?;
+        exchange(&mut left, &mut right, release, false)?;
+        assert!(left.session.lock.is_none() && right.session.lock.is_none());
         Ok(())
     }
 
