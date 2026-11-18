@@ -299,7 +299,7 @@ pub fn validate_container(file: &mut File, kind: Kind, size: u64) -> Result<()> 
         file.read_exact(&mut table)?;
         let names = &table[table_size as usize..];
         let mut has_nca = false;
-        for entry in table[..table_size as usize].chunks_exact(24) {
+        for entry in table[..table_size as usize].as_chunks::<24>().0 {
             let offset = u64::from_le_bytes(entry[..8].try_into()?);
             let length = u64::from_le_bytes(entry[8..16].try_into()?);
             let name_at = u32::from_le_bytes(entry[16..20].try_into()?) as usize;

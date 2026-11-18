@@ -413,7 +413,7 @@ integration inside Dusklight itself.
 Open the selected game's **Game setup** on both paired PCs. Enable **I own this
 game and allow game-file transfers** on each PC, select the local input on the
 sender, and choose **Offer OOT .nup**, **Offer TotK base .nsp**, or **Offer TotK
-update .nsp**. Both managers must support `twilightProto/4` discovery (v0.16.0
+update .nsp**. Both managers must support `twilightProto/4` discovery (v0.16.1
 or later); legacy save and disc event encodings are unchanged.
 
 The receiver approves each offer and chooses a new destination with the
