@@ -395,6 +395,72 @@ fn fetch_shader_reference(source: &Path, git: &Path, runner: &mut Runner<'_>) ->
     Ok(())
 }
 
+fn stage_totk_sdk(ucrt: &Path, destination: &Path) -> Result<()> {
+    let include = destination.join("include");
+    for name in ["SDL3", "opus", "vpx", "vulkan", "vk_video"] {
+        copy_tree(&ucrt.join("include").join(name), &include.join(name))?;
+    }
+    let vma = ucrt.join("include").join("vma");
+    ensure_safe_path(&vma)?;
+    if vma.join("vk_mem_alloc.h").is_file() {
+        copy_tree(&vma, &include.join("vma"))?;
+    } else {
+        copy_tree(
+            &ucrt.join("include").join("vk_mem_alloc.h"),
+            &include.join("vk_mem_alloc.h"),
+        )?;
+    }
+    for name in ["zstd.h", "zstd_errors.h"] {
+        copy_tree(&ucrt.join("include").join(name), &include.join(name))?;
+    }
+    for name in [
+        "libSDL3.dll.a",
+        "libopus.dll.a",
+        "libvpx.a",
+        "libvulkan-1.dll.a",
+        "libzstd.a",
+    ] {
+        copy_tree(
+            &ucrt.join("lib").join(name),
+            &destination.join("lib").join(name),
+        )?;
+    }
+    for name in ["SDL3.dll", "libopus-0.dll", "libiconv-2.dll"] {
+        copy_tree(
+            &ucrt.join("bin").join(name),
+            &destination.join("bin").join(name),
+        )?;
+    }
+    Ok(())
+}
+
+fn prepare_nuget(workspace: &Path) -> Result<PathBuf> {
+    let path = workspace.join("NuGet.Config");
+    files::atomic_write(
+        &path,
+        br#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+  </packageSources>
+</configuration>
+"#,
+    )?;
+    Ok(path)
+}
+
+fn configure_nuget(command: &mut Command, workspace: &Path, config: &Path) {
+    command
+        .env("RestoreConfigFile", config)
+        .env("NUGET_PACKAGES", workspace.join("nuget").join("packages"))
+        .env(
+            "NUGET_HTTP_CACHE_PATH",
+            workspace.join("nuget").join("http"),
+        )
+        .env("DOTNET_CLI_HOME", workspace.join("dotnet-home"));
+}
+
 fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Command> {
     // Dev-mode layout uses the running interpreter when no embedded Python exists.
     let python = context
@@ -404,7 +470,7 @@ fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Comman
         .join("python.exe");
     let mut command = context.command(&python)?;
     command
-        .args(["-B", "-m", "installer", "--root"])
+        .args(["-B", "-m", "installer", "--lang", "en-US", "--root"])
         .arg(context.source)
         .arg("--dest")
         .arg(context.output)
@@ -432,7 +498,8 @@ fn totk_installer(context: &ContextData<'_>, request: &Request) -> Result<Comman
                 .as_ref()
                 .context("Missing console keys file")?,
         )
-        .env("TOTK_LIFT_JOBS", request.preference.jobs.to_string());
+        .env("TOTK_LIFT_JOBS", request.preference.jobs.to_string())
+        .env("PYTHON_CPU_COUNT", request.preference.jobs.to_string());
     if let Some(firmware) = &request.preference.firmware {
         command.arg("--firmware").arg(firmware);
     }
@@ -488,30 +555,35 @@ pub(super) fn build(
                 python.parent().context("Python has no directory")?.into(),
             );
             let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            let binary = workspace.join("b");
             let mut configure = context.vs_command(
-                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --preset windows-msvc-relwithdebinfo \"-DCMAKE_INSTALL_PREFIX=%TS_OUTPUT%\" \"-DPython3_EXECUTABLE=%TS_PYTHON%\" \"-DCMAKE_MAKE_PROGRAM=%TS_NINJA%\"",
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --preset windows-msvc-relwithdebinfo -B \"%TS_BUILD%\" \"-DCMAKE_INSTALL_PREFIX=%TS_OUTPUT%\" \"-DPython3_EXECUTABLE=%TS_PYTHON%\" \"-DCMAKE_MAKE_PROGRAM=%TS_NINJA%\"",
                 &vs, &python,
             )?;
             configure
                 .env("TS_CMAKE", &cmake.entry)
+                .env("TS_BUILD", &binary)
                 .env("TS_NINJA", &ninja.entry);
             runner.run(
                 &mut configure,
                 "Configuring Dusklight from the approved source",
             )?;
             let mut compile = context.vs_command(
-                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --build --preset windows-msvc-relwithdebinfo --parallel %TS_JOBS%",
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --build \"%TS_BUILD%\" --parallel %TS_JOBS%",
                 &vs, &python,
             )?;
             compile
                 .env("TS_CMAKE", &cmake.entry)
+                .env("TS_BUILD", &binary)
                 .env("TS_JOBS", request.preference.jobs.to_string());
             runner.run(&mut compile, "Compiling Dusklight locally")?;
             let mut install = context.vs_command(
-                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --install \"%TS_SOURCE%\\build\\windows-msvc-relwithdebinfo\" --prefix \"%TS_OUTPUT%\"",
+                "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_CMAKE%\" --install \"%TS_BUILD%\" --prefix \"%TS_OUTPUT%\"",
                 &vs, &python,
             )?;
-            install.env("TS_CMAKE", &cmake.entry);
+            install
+                .env("TS_CMAKE", &cmake.entry)
+                .env("TS_BUILD", &binary);
             runner.run(
                 &mut install,
                 "Staging the source-built Dusklight program and resources",
@@ -531,20 +603,7 @@ pub(super) fn build(
             )?;
             copy_tree(&llvm.root, &llvm_destination)?;
             let deps = source.join("toolchain").join("deps-mingw");
-            for relative in ["include", "lib"] {
-                copy_tree(&Path::new(MSYS).join(relative), &deps.join(relative))?;
-            }
-            fs::create_dir_all(deps.join("bin"))?;
-            for entry in fs::read_dir(Path::new(MSYS).join("bin"))? {
-                let entry = entry?;
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
-                {
-                    copy_tree(&entry.path(), &deps.join("bin").join(entry.file_name()))?;
-                }
-            }
+            stage_totk_sdk(Path::new(MSYS), &deps)?;
             context.paths.insert(0, Path::new(MSYS).join("bin"));
             if let Some(dotnet) = dotnet_root()? {
                 context.paths.push(dotnet);
@@ -573,6 +632,7 @@ pub(super) fn build(
                 runner,
             )?;
             let vs = vs_dev()?.context("Install Visual Studio C++ Build Tools first")?;
+            let nuget = prepare_nuget(workspace)?;
             for (script, label) in [
                 (
                     "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_PYTHON%\" tools\\build_hactool.py",
@@ -583,7 +643,9 @@ pub(super) fn build(
                     "Building the shader translator from source",
                 ),
             ] {
-                runner.run(&mut context.vs_command(script, &vs, &main)?, label)?;
+                let mut command = context.vs_command(script, &vs, &main)?;
+                configure_nuget(&mut command, workspace, &nuget);
+                runner.run(&mut command, label)?;
             }
             runner.run(&mut totk_installer(&context, request)?, "Compiling and preparing TotK from the checked-out source (shader preparation may open a window)")?;
         }
@@ -771,6 +833,133 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
+    #[ignore = "Uses the installed SDK and verified compiler to compile only synthetic C++ headers, never game code"]
+    fn real_totk_sdk_compiles_cpp_with_the_managed_runtime_headers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let staged = temp.path().join("deps");
+        stage_totk_sdk(Path::new(MSYS), &staged)?;
+        let root = crate::config::root_path()?;
+        let mut tools = Toolset::new(&root)?;
+        let llvm = tools.ensure(
+            Package::Llvm,
+            true,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| Ok(()),
+        )?;
+        let fixture = temp.path().join("sdk.cpp");
+        fs::write(&fixture, b"#include <atomic>\n#include <cstring>\n#include <mutex>\n#include <SDL3/SDL.h>\n#include <vk_mem_alloc.h>\nint main() { std::atomic<int> n{0}; return n.load(); }\n")?;
+        let output = Command::new(&llvm.entry)
+            .args(["-x", "c++", "-fsyntax-only", "-I"])
+            .arg(staged.join("include"))
+            .arg("-I")
+            .arg(staged.join("include").join("vma"))
+            .arg(&fixture)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Managed C++ SDK probe failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!(
+            "Actual managed Clang and staged MSYS2 SDK compile the C++ runtime headers without CRT shadowing."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn totk_sdk_staging_never_shadows_the_managed_compilers_crt_or_cpp_runtime() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sdk = temp.path().join("ucrt64");
+        for directory in ["SDL3", "opus", "vpx", "vulkan", "vk_video", "vma"] {
+            let path = sdk.join("include").join(directory);
+            fs::create_dir_all(&path)?;
+            fs::write(
+                path.join(if directory == "vma" {
+                    "vk_mem_alloc.h"
+                } else {
+                    "fixture.h"
+                }),
+                b"third-party SDK header",
+            )?;
+        }
+        fs::write(sdk.join("include").join("zstd.h"), b"zstd")?;
+        fs::write(sdk.join("include").join("zstd_errors.h"), b"zstd errors")?;
+        fs::write(
+            sdk.join("include").join("string.h"),
+            b"#error wrong C runtime",
+        )?;
+        fs::write(
+            sdk.join("include").join("windows.h"),
+            b"#error wrong Windows headers",
+        )?;
+        fs::create_dir(sdk.join("lib"))?;
+        for name in [
+            "libSDL3.dll.a",
+            "libopus.dll.a",
+            "libvpx.a",
+            "libvulkan-1.dll.a",
+            "libzstd.a",
+            "libstdc++.a",
+        ] {
+            fs::write(sdk.join("lib").join(name), b"synthetic SDK library")?;
+        }
+        fs::create_dir(sdk.join("bin"))?;
+        for name in [
+            "SDL3.dll",
+            "libopus-0.dll",
+            "libiconv-2.dll",
+            "unrelated.dll",
+        ] {
+            fs::write(sdk.join("bin").join(name), b"synthetic SDK runtime")?;
+        }
+        let staged = temp.path().join("staged");
+        stage_totk_sdk(&sdk, &staged)?;
+        assert!(
+            staged
+                .join("include")
+                .join("vma")
+                .join("vk_mem_alloc.h")
+                .is_file()
+        );
+        assert!(staged.join("lib").join("libvpx.a").is_file());
+        assert!(staged.join("bin").join("libiconv-2.dll").is_file());
+        for path in [
+            staged.join("include").join("string.h"),
+            staged.join("include").join("windows.h"),
+            staged.join("lib").join("libstdc++.a"),
+            staged.join("bin").join("unrelated.dll"),
+        ] {
+            assert!(!path.try_exists()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dotnet_restore_uses_an_isolated_official_feed_and_cache() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("build");
+        fs::create_dir(&workspace)?;
+        let config = prepare_nuget(&workspace)?;
+        let text = fs::read_to_string(&config)?;
+        assert!(text.contains("<clear />"));
+        assert_eq!(text.matches("<add ").count(), 1);
+        assert!(text.contains("https://api.nuget.org/v3/index.json"));
+        let mut command = Command::new("not-executed");
+        configure_nuget(&mut command, &workspace, &config);
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("RestoreConfigFile")),
+            Some(&Some(config.as_os_str()))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("NUGET_PACKAGES")),
+            Some(&Some(workspace.join("nuget").join("packages").as_os_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn totk_source_installer_uses_its_python314_environment_and_local_inputs() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("source");
@@ -808,6 +997,7 @@ mod tests {
                 .join("python.exe")
         );
         let args: Vec<_> = command.get_args().collect();
+        assert!(args.windows(2).any(|args| args == ["--lang", "en-US"]));
         for (flag, path) in [
             ("--root", source.as_path()),
             ("--dest", output.as_path()),

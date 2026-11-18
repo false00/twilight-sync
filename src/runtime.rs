@@ -145,6 +145,7 @@ pub enum Command {
     BuildSource {
         game: protocol::GameId,
         commit: String,
+        preference: source_build::Preference,
         approved: bool,
     },
     ActivateSourceBuild(protocol::GameId),
@@ -689,6 +690,15 @@ fn ui_smoke_save(hearts: u16, rupees: u16, play_seconds: u64) -> save_data::Summ
 
 #[cfg(any(debug_assertions, test))]
 pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
+    ui_preview_backend(scenario, Duration::from_secs(20))
+}
+
+#[cfg(any(debug_assertions, test))]
+pub fn ui_preview_backend(scenario: &str, lifetime: Duration) -> Result<Backend> {
+    ensure!(
+        (1..=1800).contains(&lifetime.as_secs()),
+        "Preview lifetime must be 1 to 1800 seconds"
+    );
     ensure!(
         matches!(
             scenario,
@@ -817,7 +827,7 @@ pub fn ui_smoke_backend(scenario: &str) -> Result<Backend> {
     let (sender, receiver) = bounded(16);
     let worker_view = view.clone();
     thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + lifetime;
         while Instant::now() < deadline {
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Input::Command(Command::Shutdown)) => break,
@@ -2304,6 +2314,7 @@ impl Engine {
             Command::BuildSource {
                 game,
                 commit,
+                preference,
                 approved,
             } => {
                 ensure!(
@@ -2316,7 +2327,10 @@ impl Engine {
                     .clone()
                     .filter(|plan| plan.game == game && plan.commit == commit)
                     .context("Check and review the current source commit before building")?;
-                let preference = self.source.preferences.get(game).clone();
+                ensure!(
+                    &preference == self.source.preferences.get(game),
+                    "Build preferences changed; review and approve the current settings before building"
+                );
                 ensure!(
                     preference.method == source_build::Method::Source,
                     "Select Build from source first"
@@ -6535,6 +6549,12 @@ mod tests {
                 .command(Command::BuildSource {
                     game: protocol::GameId::Dusklight,
                     commit: "a".repeat(40),
+                    preference: harness
+                        .left
+                        .source
+                        .preferences
+                        .get(protocol::GameId::Dusklight)
+                        .clone(),
                     approved: false,
                 })
                 .is_err()
@@ -6549,6 +6569,12 @@ mod tests {
                 .command(Command::BuildSource {
                     game: protocol::GameId::Dusklight,
                     commit: "a".repeat(40),
+                    preference: harness
+                        .left
+                        .source
+                        .preferences
+                        .get(protocol::GameId::Dusklight)
+                        .clone(),
                     approved: true,
                 })
                 .is_err()
@@ -6558,6 +6584,51 @@ mod tests {
         assert_eq!(harness.left.current_hash()?, before);
         assert!(!harness.left.root.join("build-tools").try_exists()?);
         assert!(!harness.left.root.join("source-builds").try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn source_build_rejects_settings_changed_after_approval_for_every_game() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let before = harness.left.current_hash()?;
+        harness.left.settings.play_lock = Some(PlayLock {
+            owner: harness.left.identity.public.clone(),
+            token: "b".repeat(64),
+        });
+        for game in [
+            protocol::GameId::Dusklight,
+            protocol::GameId::Totk,
+            protocol::GameId::Triforce,
+        ] {
+            let approved = source_build::Preference {
+                method: source_build::Method::Source,
+                jobs: 2,
+                ..source_build::Preference::default()
+            };
+            let mut changed = approved.clone();
+            changed.jobs = 3;
+            harness.left.source.preferences.set(game, changed)?;
+            harness.left.source.plan = Some(source_build::Plan {
+                game,
+                tag: "v1.0.0-test".into(),
+                commit: "a".repeat(40),
+                review_url: source_build::source_url(game),
+            });
+            let error = harness
+                .left
+                .command(Command::BuildSource {
+                    game,
+                    commit: "a".repeat(40),
+                    preference: approved,
+                    approved: true,
+                })
+                .err()
+                .context("A stale build approval was accepted")?;
+            assert!(error.to_string().contains("Build preferences changed"));
+        }
+        assert!(!harness.left.source.busy && !harness.left.install_busy);
+        assert!(!harness.left.root.join("build-logs").try_exists()?);
+        assert_eq!(harness.left.current_hash()?, before);
         Ok(())
     }
 

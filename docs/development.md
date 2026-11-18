@@ -90,7 +90,7 @@ accepts no custom directory and does not initialize startup or write settings.
 ### Offline play, forks, and progress
 
 ```powershell
-cargo test --lib --locked -- save_data::tests history::tests runtime::tests ui::tests ui::saves::tests
+cargo test --lib --locked -- save_data::tests history::tests runtime::tests ui::
 ```
 
 The read-only decoder uses synthetic, checksum-valid PC/console saves matching
@@ -101,11 +101,12 @@ verified previews, common-base disagreement, receiver consent, stale choices,
 and prevention of writes during play or after a profile change. Fork history
 tests reopen and reconstruct both branches and two-parent resolutions.
 
-Native egui tests inspect text geometry and emitted shapes, without screenshots,
-at narrow, short, high-DPI, and desktop logical sizes in light/dark appearances.
-They cover complete comparison dialogs, each selection state, no default winner,
-and reconciliation without a local game installation. These synthetic tests do
-not launch a real Dusklight build or read/write real user profiles.
+Slint tests activate actual component accessibility actions and check navigation,
+disabled source controls, both themes, and horizontal bounds/touch targets at
+720, 900 and 1200 logical pixels. Safety-model tests keep unverified branches
+unselectable and preserve stored reservations. These synthetic tests do not
+launch games or read/write real user profiles; use the separate real-source
+validator for complete installation evidence.
 
 ### Raw memory cards
 
@@ -172,22 +173,69 @@ The supplied v1.2.0 archive selects exactly 5,456 native texture keys and
 restored configuration values only inside an owned temporary profile. Original
 JSON formatting is not a save-setting value and is not assumed to be stable.
 
-## README screenshots
+## Slint interface and UI validation
 
-The README images are captures of the native Windows app with synthetic preview
-data, not live profiles, network details, or real save files. To refresh them
-when screenshots are explicitly requested:
+The interface lives in `ui\app.slint` and `ui\components.slint`. The Rust bridge
+is `src\ui.rs`; state and safety predicates are separated into `src\ui\model.rs`.
+The original adventure artwork is in `assets\adventure-*.svg`.
 
 ```powershell
-cargo build --locked
-.\scripts\Capture-Readme.ps1
+cargo test --lib --locked ui::
+cargo build --example ui-preview --locked
+.\target\debug\examples\ui-preview.exe
 ```
 
-The helper starts only the isolated 20-second `--ui-smoke` previews, verifies
-window ownership and title, captures their client areas at physical pixel sizes,
-and rejects blank images. It never captures the desktop or attaches to an
-existing manager. Images are written to `docs/images`; inspect readability and
-framing before committing them. Do not substitute private app captures.
+The preview uses synthetic example data, never the real manager store, saves,
+pairing, or startup preferences. It cannot perform real game or network actions.
+It exits after 30 minutes or from its Quit control. Its About dialog can save
+an example-data PNG; inspect the interface and exported image before using it
+in documentation. Do not publish private app captures.
+
+Headless tests use the exact matching Slint testing backend to activate actual
+accessible controls, navigate the source wizard, check disabled build actions,
+and verify touch-target and horizontal layout bounds in both themes. They do
+not replace an interactive native-window check. Slint debug metadata is compiled
+only in debug builds; no UI control server is enabled in production.
+
+The generated Slint module has a scoped `clippy::unwrap_used` allowance because
+the toolkit generates those calls. Handwritten application code retains the
+repository-wide restriction.
+
+Confirmation dialogs are asynchronous and parented to the main window.
+Blocking message boxes inside Slint callbacks can deadlock the native UI.
+The dispatcher owns the current interaction across the await without holding
+a `RefCell` borrow; other commands cannot alter that pending decision.
+
+## Real source installation validation
+
+Tests, metadata requests and installer `--help` checks are not proof that a game
+can be built. Run complete source installations with your own supported local
+inputs before claiming recipe compatibility:
+
+```powershell
+cargo build --example source-check --locked
+.\target\debug\examples\source-check.exe totk APPROVED_FULL_COMMIT 6
+```
+
+Use `dusklight`, `totk` or `triforce`; find the current full commit with
+`--check-source-updates GAME` and review it before approving execution.
+The validator uses configured inputs, requires the real manager to be closed,
+and uses production process monitoring. It installs side-by-side and checks
+runtime output and preserved save hashes without changing active selections
+or play reservations. Workspaces and game-derived output stay private.
+
+Record a successful complete build, output receipt and executable/runtime
+checks for each title. A later-stage failure is still a failed installation,
+even when extraction or compilation partly succeeded.
+
+TotK builds use a build-local official NuGet configuration and cache instead of
+depending on user feed settings. Stage only the third-party SDK headers and
+libraries: copying the entire MSYS2 include tree shadows LLVM's C/C++ runtime
+headers and breaks native compilation.
+
+Dusklight uses a short `workspace\b` CMake binary directory for configure,
+build and install. Longer preset output paths exceed MSVC's generated-object
+path limits even when the source files themselves can be opened.
 
 ## Windows release packaging
 
@@ -254,8 +302,9 @@ cargo install cargo-about --version 0.9.2 --locked --features cli
 pwsh -NoProfile -File .\scripts\Generate-Notices.ps1
 ```
 
-The generator uses the Windows dependency graph and separately includes the
-licenses of every embedded dashboard font. Packaging refuses stale Cargo
+The generator uses the Windows dependency graph and includes Slint's selected
+royalty-free desktop license text. The main About screen displays AboutSlint
+attribution. Packaging refuses stale Cargo
 manifest/lockfile notice stamps. Fingerprints normalize CRLF to LF so clean
 Windows and Linux checkouts agree; original third-party license whitespace is
 otherwise preserved.

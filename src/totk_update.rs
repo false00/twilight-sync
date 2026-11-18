@@ -259,6 +259,7 @@ fn setup_command(
         .stderr(File::create_new(setup.join(STDERR))?);
     if let Some(inputs) = inputs {
         command
+            .args(["--lang", "en-US"])
             .arg("--base")
             .arg(inputs.base.as_ref().context("Missing TotK base game")?)
             .arg("--update")
@@ -590,6 +591,7 @@ mod tests {
         assert!(!target.try_exists()?);
         let command = setup_command(temp.path(), &target, Some(&inputs))?;
         let args: Vec<_> = command.get_args().collect();
+        assert!(args.windows(2).any(|args| args == ["--lang", "en-US"]));
         for (flag, path) in [
             ("--base", &inputs.base),
             ("--update", &inputs.update),

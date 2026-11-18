@@ -1,0 +1,166 @@
+export global Theme {
+    in-out property <bool> dark: true;
+    out property <color> canvas: dark ? #12151c : #f1f3f5;
+    out property <color> panel: dark ? #1e232d : #ffffff;
+    out property <color> raised: dark ? #2a303c : #e6eaef;
+    out property <color> line: dark ? #343c4a : #d1d7de;
+    out property <color> text: dark ? #f5f7fa : #15202c;
+    out property <color> muted: dark ? #a6b0c1 : #546375;
+    out property <color> accent: dark ? #76e4dd : #087f83;
+    out property <color> ink: dark ? #102d31 : #ffffff;
+    out property <color> danger: dark ? #ff9aab : #a32449;
+    out property <color> success: dark ? #9ee2a3 : #246d38;
+}
+
+export component ActionButton inherits FocusScope {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> subtle: false;
+    in property <bool> available: true;
+    callback clicked;
+    min-width: 124px;
+    min-height: 48px;
+    preferred-height: 48px;
+    vertical-stretch: 0;
+    accessible-role: button;
+    accessible-label: text;
+    accessible-enabled: available;
+    accessible-action-default => {
+        if root.available { root.focus(); root.clicked(); }
+    }
+    Rectangle {
+        border-radius: 12px;
+        background: !root.available ? Theme.raised : root.primary ? Theme.accent : touch.has-hover ? Theme.raised.brighter(12%) : root.subtle ? transparent : Theme.raised;
+        border-width: root.has-focus ? 3px : 1px;
+        border-color: root.has-focus ? Theme.accent : root.primary ? Theme.accent : Theme.line;
+        opacity: root.available ? 1 : 0.48;
+        animate background, border-color { duration: 130ms; }
+        Text {
+            text: root.text;
+            color: root.primary ? Theme.ink : Theme.text;
+            font-size: 15px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        touch := TouchArea {
+            enabled: root.available;
+            mouse-cursor: pointer;
+            clicked => { root.focus(); root.clicked(); }
+        }
+    }
+    key-pressed(event) => {
+        if (root.available && (event.text == Key.Return || event.text == " ")) {
+            root.clicked();
+            return accept;
+        }
+        return reject;
+    }
+}
+
+export component SectionTitle inherits Text {
+    color: Theme.text;
+    font-weight: 600;
+    font-size: 22px;
+    min-height: 32px;
+}
+
+export component Muted inherits Text {
+    color: Theme.muted;
+    font-size: 14px;
+    wrap: word-wrap;
+}
+
+export component Surface inherits Rectangle {
+    border-radius: 18px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.line;
+}
+
+export component GameTile inherits FocusScope {
+    in property <string> title;
+    in property <string> status;
+    in property <image> artwork;
+    in property <bool> selected;
+    callback clicked;
+    min-height: 242px;
+    min-width: 0px;
+    preferred-width: 0px;
+    accessible-role: button;
+    accessible-label: "Select " + title;
+    accessible-description: (selected ? "Selected. " : "") + status;
+    accessible-action-default => { root.focus(); root.clicked(); }
+    Rectangle {
+        border-radius: 20px; clip: true;
+        background: Theme.panel;
+        border-width: root.selected || root.has-focus ? 4px : 1px;
+        border-color: root.selected || root.has-focus ? Theme.accent : touch.has-hover ? Theme.muted : Theme.line;
+        animate border-color { duration: 130ms; }
+        Image { x: 0px; y: 0px; source: root.artwork; image-fit: cover; width: parent.width; height: 166px; }
+        VerticalLayout {
+            padding: 18px; padding-top: 176px; spacing: 3px;
+            Text { text: root.title; color: Theme.text; font-size: 18px; font-weight: 600; overflow: elide; }
+            Muted { text: root.status; font-size: 12px; }
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { root.focus(); root.clicked(); } }
+    }
+    key-pressed(event) => {
+        if event.text == Key.Return || event.text == " " { root.clicked(); return accept; }
+        return reject;
+    }
+}
+
+export component SwitchRow inherits FocusScope {
+    in property <string> title;
+    in property <string> description;
+    in property <bool> checked;
+    in property <bool> available: true;
+    callback toggled(bool);
+    min-height: description == "" ? 54px : 72px;
+    accessible-role: checkbox;
+    accessible-label: title;
+    accessible-checked: checked;
+    accessible-enabled: available;
+    accessible-checkable: true;
+    accessible-action-default => {
+        if root.available { root.focus(); root.toggled(!root.checked); }
+    }
+    HorizontalLayout {
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            Text { text: root.title; color: Theme.text; font-size: 16px; wrap: word-wrap; }
+            if root.description != "": Muted { text: root.description; }
+        }
+        Rectangle {
+            width: 48px;
+            height: 28px;
+            border-radius: 14px;
+            background: root.checked ? Theme.accent : Theme.raised;
+            border-color: root.has-focus ? Theme.accent : Theme.line;
+            border-width: root.has-focus ? 3px : 1px;
+            Rectangle {
+                x: root.checked ? 23px : 5px;
+                y: 5px;
+                width: 18px; height: 18px;
+                border-radius: 9px;
+                background: root.checked ? Theme.ink : Theme.muted;
+                animate x { duration: 120ms; easing: ease-in-out; }
+            }
+        }
+    }
+    TouchArea {
+        enabled: root.available;
+        mouse-cursor: pointer;
+        clicked => { root.focus(); root.toggled(!root.checked); }
+    }
+    key-pressed(event) => {
+        if (root.available && (event.text == " " || event.text == Key.Return)) {
+            root.toggled(!root.checked); return accept;
+        }
+        return reject;
+    }
+}

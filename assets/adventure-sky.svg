@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+<defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#307f96"/><stop offset="1" stop-color="#d7e4c3"/></linearGradient></defs>
+<path fill="url(#sky)" d="M0 0h640v400H0z"/><circle cx="475" cy="80" r="46" fill="#f8efd0"/>
+<g fill="#e8f4e4" opacity=".65"><ellipse cx="145" cy="89" rx="100" ry="15"/><ellipse cx="332" cy="162" rx="133" ry="13"/><ellipse cx="549" cy="239" rx="124" ry="17"/></g>
+<path fill="#789d96" d="m0 324 133-103 108 109 155-125 244 119v76H0z"/><path fill="#2f746a" d="m0 370 163-74 152 67 178-61 147 59v39H0z"/>
+<path fill="#65695b" d="m198 140 148-19-32 80-50 47z"/><path fill="#b5c29a" d="m187 136 89-36 83 21-48 24z"/><path fill="#687c5b" d="m437 208 96-12-36 73z"/><path fill="#bfcc9f" d="m431 204 51-24 59 16-43 16z"/>
+<path d="m302 197-7 140M318 186l-4 108" stroke="#9ce0d4" stroke-width="5" opacity=".65"/>
+<path fill="#c7cebb" d="m80 400 12-36 35-20 64 6 36 50z"/><path fill="#3f5148" d="M117 353v-47h11v48zm19-3v-62h9v63z"/>
+</svg>

@@ -532,8 +532,9 @@ alternative. Existing custom install folders are respected; updates do not move 
 
 ## Source builds: one workflow for all games
 
-**Games > Installation method > Build from source** uses the same check, setup,
-input, consent, build/log and cancellation controls for all three games.
+**Game setup > Build from source** uses the same check, setup,
+input, consent, build/log and cancellation controls for all three games. The
+Slint interface groups the workflow into **Tools**, **Game files**, and **Build**.
 Dusklight/TotK retain their official-release/setup option. Triforce is built from
 source; the manager does not invoke its publisher's Setup.
 

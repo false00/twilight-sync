@@ -12,6 +12,106 @@ const DEPENDENCY_NOTICES: &str = include_str!(r"..\THIRD_PARTY_NOTICES.txt");
 #[cfg(not(windows))]
 const DEPENDENCY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
 
+fn build_source(game: twilight_sync::protocol::GameId, commit: &str, jobs: u8) -> Result<()> {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    use twilight_sync::{runtime::Command, source_build::Method};
+    anyhow::ensure!(
+        cfg!(all(windows, target_arch = "x86_64")),
+        "Managed source builds require Windows x64"
+    );
+    anyhow::ensure!(
+        commit.len() == 40
+            && commit
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "Approve an exact lowercase 40-character source commit"
+    );
+    anyhow::ensure!((1..=16).contains(&jobs), "Choose 1 to 16 compiler workers");
+    println!("{}", twilight_sync::source_build::WARNING);
+    let backend = twilight_sync::runtime::start_maintenance()?;
+    backend.command(Command::CheckSource(game))?;
+    let started = Instant::now();
+    let checked = loop {
+        let snapshot = backend.snapshot()?;
+        if snapshot.source.game == Some(game) && !snapshot.source.busy {
+            if let Some(error) = &snapshot.source.error {
+                bail!("{error}");
+            }
+            break snapshot;
+        }
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(180),
+            "Source check did not finish: {}",
+            snapshot.error.as_deref().unwrap_or(&snapshot.message)
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    let plan = checked
+        .source
+        .plan
+        .as_ref()
+        .context("Source check did not return a build plan")?;
+    anyhow::ensure!(
+        plan.game == game && plan.commit == commit,
+        "The latest source commit differs from the approved commit; review it before executing"
+    );
+    let mut preference = checked.source.preferences.get(game).clone();
+    preference.method = Method::Source;
+    preference.jobs = jobs;
+    backend.command(Command::SetSourcePreference {
+        game,
+        preference: preference.clone(),
+    })?;
+    backend.command(Command::BuildSource {
+        game,
+        commit: commit.into(),
+        preference,
+        approved: true,
+    })?;
+    let started = Instant::now();
+    let mut last_message = String::new();
+    loop {
+        let snapshot = backend.snapshot()?;
+        if snapshot.source.message != last_message {
+            println!("{}", snapshot.source.message);
+            last_message = snapshot.source.message.clone();
+        }
+        if !snapshot.source.busy {
+            if let Some(error) = &snapshot.source.error {
+                bail!("{error}");
+            }
+            if let Some(error) = &snapshot.error {
+                bail!("{error}");
+            }
+            if let Some(built) = &snapshot.source.built {
+                anyhow::ensure!(
+                    built.game == game && built.commit == commit && built.executable.is_file(),
+                    "The completed source installation does not match the approved request"
+                );
+                println!(
+                    "SOURCE INSTALL VERIFIED\nGame: {game:?}\nTag: {}\nCommit: {}\nExecutable: {}\nSHA-256: {}\nSave before/after: {}\nLog: {}",
+                    built.tag,
+                    built.commit,
+                    built.executable.display(),
+                    built.sha256,
+                    built.expected_save.as_deref().unwrap_or("no save"),
+                    built.log.display()
+                );
+                backend.command(Command::Shutdown)?;
+                return Ok(());
+            }
+        }
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(4 * 60 * 60),
+            "Source installation exceeded four hours; inspect the retained build log"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Twilight Sync: {error:#}");
@@ -111,6 +211,44 @@ fn run() -> Result<()> {
         println!("{PROJECT_LICENSE}\n\n{DEPENDENCY_NOTICES}");
         return Ok(());
     }
+    if first.as_deref().is_some_and(|a| a == "--build-source") {
+        let game = match arguments
+            .next()
+            .context("Choose dusklight, totk or triforce")?
+            .to_str()
+        {
+            Some("dusklight") => twilight_sync::protocol::GameId::Dusklight,
+            Some("totk") => twilight_sync::protocol::GameId::Totk,
+            Some("triforce") => twilight_sync::protocol::GameId::Triforce,
+            _ => bail!("Choose dusklight, totk or triforce"),
+        };
+        if arguments
+            .next()
+            .as_deref()
+            .is_none_or(|a| a != "--approve-commit")
+        {
+            bail!("Explicit source execution approval requires --approve-commit FULL_SHA");
+        }
+        let commit = arguments.next().context("Missing approved commit")?;
+        let commit = commit.to_str().context("Commit must be UTF-8")?;
+        let jobs = if let Some(flag) = arguments.next() {
+            if flag != "--jobs" {
+                bail!("Expected --jobs N");
+            }
+            arguments
+                .next()
+                .context("Missing worker count")?
+                .to_str()
+                .context("Worker count must be UTF-8")?
+                .parse::<u8>()?
+        } else {
+            4
+        };
+        if arguments.next().is_some() {
+            bail!("Unexpected source-build arguments");
+        }
+        return build_source(game, commit, jobs);
+    }
     if first
         .as_deref()
         .is_some_and(|argument| argument == "--check-source-updates")
@@ -127,6 +265,7 @@ fn run() -> Result<()> {
         if arguments.next().is_some() {
             bail!("Unexpected source-check arguments");
         }
+
         let (plan, prerequisites) = twilight_sync::source_build::check(game)?;
         println!(
             "SOURCE RELEASE\nGame: {game:?}\nTag: {}\nCommit: {}\nReview: {}",

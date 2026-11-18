@@ -1,22 +1,43 @@
 use anyhow::{Context, Result, ensure};
-use eframe::egui;
+pub(super) struct Pixels {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
+#[cfg(test)]
 const WINDOW_PNG: &[u8] = include_bytes!(r"..\..\assets\app-icon-256.png");
 const TRAY_PNG: &[u8] = include_bytes!(r"..\..\assets\app-icon-32.png");
 
-pub(super) fn window() -> Result<egui::IconData> {
-    eframe::icon_data::from_png_bytes(WINDOW_PNG).context("Loading the embedded window icon")
+fn decode(bytes: &[u8]) -> Result<Pixels> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(Pixels {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
 
-pub(super) fn tray() -> Result<egui::IconData> {
-    eframe::icon_data::from_png_bytes(TRAY_PNG).context("Loading the embedded tray icon")
+#[cfg(test)]
+pub(super) fn window() -> Result<Pixels> {
+    decode(WINDOW_PNG).context("Loading the embedded window icon")
+}
+
+pub(super) fn tray() -> Result<Pixels> {
+    decode(TRAY_PNG).context("Loading the embedded tray icon")
 }
 
 pub(super) fn set_application_identity() -> Result<()> {
-    let id: Vec<u16> = "false00.TwilightSync"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    set_identity("false00.TwilightSync")
+}
+
+pub(super) fn set_preview_identity() -> Result<()> {
+    set_identity("false00.TwilightSync.Preview")
+}
+
+fn set_identity(name: &str) -> Result<()> {
+    let id: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let result = unsafe {
         windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr())
     };
@@ -91,7 +112,7 @@ mod tests {
             let png = bytes
                 .get(offset..offset + length)
                 .context("Invalid ICO image range")?;
-            let icon = eframe::icon_data::from_png_bytes(png)?;
+            let icon = decode(png)?;
             assert_eq!((icon.width, icon.height), (expected, expected));
         }
         Ok(())

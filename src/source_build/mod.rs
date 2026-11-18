@@ -747,6 +747,71 @@ pub fn verify_activation(
     Ok(())
 }
 
+pub fn stage_configured(
+    game: GameId,
+    approved_commit: &str,
+    jobs: u8,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(String) -> Result<()>,
+) -> Result<Built> {
+    let root = crate::config::root_directory()?;
+    let _instance = crate::config::acquire_instance(&root)?;
+    let settings = crate::config::Settings::load(&root)?;
+    let preferences = Preferences::load(&root)?;
+    let (plan, _) = check(game)?;
+    ensure!(
+        plan.commit == approved_commit && valid_commit(approved_commit),
+        "The source revision differs from the explicitly approved commit"
+    );
+    let mut preference = preferences.get(game).clone();
+    preference.method = Method::Source;
+    preference.jobs = jobs;
+    let previous_executable = match game {
+        GameId::Dusklight => settings.game_exe.clone(),
+        GameId::Totk | GameId::Triforce => {
+            let native = native_game(game)?;
+            let channel = crate::totk::Channel::for_game(
+                root.join(format!("{}-transfers", key(game))),
+                install::default_directory(game),
+                native,
+            );
+            Some(channel.executable()?)
+        }
+    };
+    let previous_install = previous_executable
+        .as_deref()
+        .map(|executable| {
+            if game == GameId::Dusklight || !executable.is_file() {
+                Ok(executable
+                    .parent()
+                    .context("Game executable has no directory")?
+                    .to_path_buf())
+            } else {
+                native_game(game)?.installation(executable)
+            }
+        })
+        .transpose()?;
+    let built = build(
+        &root,
+        Request {
+            plan,
+            preference,
+            previous_install: previous_install.clone(),
+            previous_executable: previous_executable.clone(),
+            approved: true,
+            log: new_log(&root, game)?,
+        },
+        cancel,
+        progress,
+    )?;
+    verify_activation(
+        &built,
+        previous_install.as_deref(),
+        previous_executable.as_deref(),
+    )?;
+    Ok(built)
+}
+
 pub fn build(
     root: &Path,
     request: Request,

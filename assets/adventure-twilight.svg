@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+<defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#1b2647"/><stop offset="1" stop-color="#775c8a"/></linearGradient><radialGradient id="glow"><stop stop-color="#fff5c3" stop-opacity=".5"/><stop offset="1" stop-color="#fff5c3" stop-opacity="0"/></radialGradient></defs>
+<path fill="url(#sky)" d="M0 0h640v400H0z"/><circle cx="440" cy="96" r="118" fill="url(#glow)"/><circle cx="440" cy="96" r="46" fill="#f3e5b7"/><circle cx="455" cy="80" r="42" fill="#333552"/>
+<path fill="#32334b" d="m0 226 90-64 71 58 99-92 103 107 83-64 194 82v147H0z"/><path fill="#1e293a" d="m0 300 153-73 115 79 168-62 204 45v111H0z"/>
+<path fill="#0d1b2a" d="M0 350h640v50H0zM40 95l-32 202h64zM104 146 69 335h70zM568 125l-46 228h92zM618 79l-42 268h64V79z"/>
+<path d="M294 400q-36-71 24-105t6-76" fill="none" stroke="#e9b5b4" stroke-width="13" opacity=".7"/>
+<g fill="#e9e7ce" opacity=".8"><circle cx="128" cy="80" r="2"/><circle cx="210" cy="43" r="2"/><circle cx="270" cy="113" r="2"/><circle cx="505" cy="42" r="2"/><circle cx="355" cy="65" r="2"/></g>
+</svg>

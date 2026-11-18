@@ -1,537 +1,229 @@
-<img src="assets/app-icon-256.png" align="right" width="72" height="72" alt="Twilight Sync moon icon">
+<img src="assets/app-icon-256.png" align="right" width="76" height="76" alt="Twilight Sync moon">
 
 # Twilight Sync
 
-**Your Zelda saves, across your desktop and handheld.**
+## Your adventures. Any PC.
 
-Keep your [Dusklight](https://twilitrealm.dev/), native TotK Recomp, and
-[Triforce / Ocarina of Time](https://git.triforceproject.com/triforce/source)
-saves in sync between two Windows PCs over your home network. Play offline and transfer
-your progress when you reconnect. No cloud account, subscription, or
-administrator access required.
+**A home for your native Zelda games—and the progress you don't want to leave behind.**
 
-[Download for Windows](https://github.com/false00/twilight-sync/releases/latest) ·
-[Report an issue](https://github.com/false00/twilight-sync/issues) ·
-[Technical guide](docs/guide.md)
+Install, update, or build supported PC projects. Pick an adventure from a
+console-inspired **Slint** interface. Move between your desktop and Windows
+handheld with private, encrypted save sharing over your home network.
 
-**Windows 10/11 x64** | **Encrypted LAN sync** | **Offline play** | **MIT licensed**
+**No cloud account. No subscription. No choosing a save folder.**
 
-![Twilight Sync Home showing a paired Legion Go and a quest's hearts, play time, rupees, and collectibles](docs/images/dashboard.png)
+[**Download for Windows**](https://github.com/false00/twilight-sync/releases/latest)
+&nbsp;·&nbsp; [Get started](#up-and-playing)
+&nbsp;·&nbsp; [Report a problem](https://github.com/false00/twilight-sync/issues)
 
-*The native Windows app, shown with example save and device data. Light and dark
-themes are included. No game assets or real save files are bundled.*
+**Windows 10/11 x64** · **Desktop + handheld** · **Encrypted LAN** · **Offline play**
 
-## Built for picking up where you left off
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="assets/interface-light.png">
+  <img src="assets/interface-dark.png" width="1200" alt="Twilight Sync's console-inspired game library, showing three adventures and verified save progress">
+</picture>
 
-- **Desktop to handheld:** pair two PCs once and sync over your home network.
-- **No connection required to play:** keep playing offline, then sync or compare
-   your progress when both PCs are back online.
-- **One interface for all three games:** shared Home and Games layouts, save cards,
-   comparison dialogs, approvals, and on-demand history previews.
-- **See what you are choosing:** compare hearts, rupees, and play time before
-   replacing a save, with verified game-specific details where available.
-- **Keep a way back:** preserved branches and compact snapshots let you restore
-   an earlier version. Different progress never silently picks a winner.
+*The new Slint interface, shown with synthetic example data.*
 
-## Install with one PowerShell command
+| Twilight Princess | Tears of the Kingdom | Ocarina of Time |
+|:---:|:---:|:---:|
+| [Dusklight](https://twilitrealm.dev/) | [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) | [Triforce](https://git.triforceproject.com/triforce/source) |
 
-Open **PowerShell as your normal Windows user**, not as administrator, and run:
+*Original adventure artwork used in the interface. Games, Nintendo artwork,
+ROMs, and console keys are not included.*
+
+---
+
+### Less setup. More adventure.
+
+- **One place to play.** A calm game library, clear status, and large,
+  touch-friendly controls for your desktop or handheld.
+- **Your choice of installation.** Use official releases where supported,
+  or review a source revision and build your own copy.
+- **Pick up where you left off.** Pair two PCs once. Share saves over your
+  private LAN, without uploading them to a cloud service.
+- **Offline is welcome.** Keep playing here. Reconnect later to sync or
+  compare the progress from both PCs.
+- **See before you choose.** Compare verified save information such as hearts,
+  rupees, and play time where the game's format supports it.
+- **Keep a way back.** Complete save branches, compact history, and rollback
+  copies protect against an accidental choice. Different progress never
+  silently picks a winner.
+
+## Install in one command
+
+Open **PowerShell as your normal Windows user** and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/false00/twilight-sync/main/install.ps1 | iex
 ```
 
-**Requirements:** Windows 10/11 **x64** (Intel/AMD), PowerShell 5.1 or newer, and
-a working graphics driver for the native dashboard. No Rust, Visual Studio,
-account, or administrator access is required for the downloaded app.
+The installer downloads the latest stable app, checks its published SHA-256,
+adds a Start-menu shortcut, and opens Twilight Sync. Existing saves, pairing,
+texture libraries, and startup preferences stay in place.
 
-Windows PowerShell 5.1 and PowerShell 7 are both supported, including 32-bit
-PowerShell on x64 Windows handhelds such as the Legion Go.
+You do **not** need Rust, Visual Studio, Python, or .NET to run the downloaded
+app. Building games from source has additional requirements, explained in the app.
 
-**The app is currently unsigned.** Windows may show an unfamiliar-publisher
-warning, and some managed devices block unsigned apps. Only run the installer
-if you trust this repository; [read it first](install.ps1) or use the manual
-download instructions below.
+> **Before you run it:** remote install commands execute code as your user.
+> [Read the installer](install.ps1) first if you prefer. The app is currently
+> unsigned, so Windows or a managed-device policy may block it. Checksums
+> verify downloads—not publisher trust. Do not disable Windows security controls.
 
 <details>
-<summary>Installer details, manual download, and Windows security</summary>
-
-The installer:
-
-- Downloads the latest stable release from this repository.
-- Checks the published SHA-256 checksums and Windows x64 executable headers.
-- Installs to `%LOCALAPPDATA%\Programs\TwilightSync`.
-- Adds a **Twilight Sync** Start-menu shortcut and opens the app.
-- Leaves your saves, pairing keys, texture library, and existing startup
-  preferences alone.
-
-> Remote install commands execute code as your user. Only run this command if
-> you trust this repository. You can [read the installer](install.ps1) first,
-> or use the manual download below. Checksums detect changed downloads; they
-> are not a substitute for trusting the publisher.
-
-### Prefer a manual download?
+<summary><strong>Prefer a manual download?</strong></summary>
 
 1. Open the [latest release](https://github.com/false00/twilight-sync/releases/latest).
 2. Download `twilight-sync-windows-x86_64.exe` and `SHA256SUMS.txt`.
-3. Compare the executable's hash with the matching checksum:
+3. Check the executable:
 
    ```powershell
    Get-FileHash .\twilight-sync-windows-x86_64.exe -Algorithm SHA256
    ```
 
-4. Keep the executable somewhere stable and open it. No installer or extra
-   runtime download is required.
-   License texts are embedded in the executable and available with `--licenses`;
-   they are also readable in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+4. Compare the result with the matching line in `SHA256SUMS.txt`.
+5. Keep the executable in a stable location and open it.
 
-The app is currently unsigned, so Windows may display an unfamiliar-publisher
-warning. Verify the source and checksum before deciding to run it. Twilight Sync
-does not disable SmartScreen, antivirus, or PowerShell security settings.
-
-**Application Control:** some Windows policies block unsigned applications
-entirely, including with error **4551**. A valid checksum does not satisfy a
-code-signing policy. Such devices need a build signed by a publisher trusted by
-their policy; do not replace a working installation with an unsigned build that
-your device cannot run. Twilight Sync does not bypass or change these controls.
+Windows x64 means Intel/AMD PCs and Windows handhelds. ARM64 release binaries
+are not currently provided. PowerShell 5.1 and PowerShell 7 are supported,
+including 32-bit PowerShell running on x64 Windows.
 
 </details>
 
-## Set up your first sync
+## Up and playing
 
-Do these steps on **both PCs**:
+### 1. Choose your adventure
 
-1. Join the same home LAN and set its Windows network profile to **Private**.
-2. Open **Devices**, check the displayed router information, and approve
-   that network.
-3. Open pairing on both PCs. On **one PC only**, choose the other device's
-   **Compare codes** button. Compare the full code on both screens.
-   **Both devices must approve the matching code.**
-4. In **Dusklight**, locate `dusklight.exe` or use **Install / update Dusklight**.
-   Configure the game with your own legally obtained disc dump.
-5. Save setup is automatic. Sync finds Dusklight's standard save in its active
-   profile and prepares a receiving PC when needed. There are no save-file or
-   save-folder pickers.
-6. If progress differs, compare the save branches. Choose a complete save to
-   keep, or choose **Keep both; play this PC** and reconcile later. Replacing
-   the partner's save still requires their approval.
-7. Use **Play Dusklight**, including when the other PC is offline. Local progress
-   is retained and synced or compared when you reconnect. Matching online saves
-   still use the coordinated play lock.
+Open **Game setup**, choose a game, and select an installation method:
 
-Installing or updating Dusklight through the app also creates or refreshes
-**Dusklight (Twilight Sync)** on your Windows desktop. It opens the manager's
-Play controls, reusing the running manager if necessary; it never launches the
-game directly or bypasses local save, process, and profile checks.
-Unrelated or independently modified shortcuts are not overwritten.
+| Project | Official install / updates | Build locally | Your local inputs |
+| --- | :---: | :---: | --- |
+| **Dusklight** | Yes | Yes | Your supported Twilight Princess GameCube disc dump for gameplay; compiling the engine itself needs no game assets |
+| **TotK Recomp** | Yes | Yes | Your base game, supported update, and your console's `prod.keys` |
+| **Triforce / OoT** | Source workflow | Yes | Your supported `.nup`, or retained `romfs` and `exefs` files from an existing installation |
 
-New managed Dusklight builds are installed side-by-side under
-`%USERPROFILE%\Games\Dusklight`. Existing installations and custom executable
-selections are not moved automatically.
+First-time official TotK setup runs **inside the managed workflow**. Select
+your local inputs and choose **Install / update**—there is no separate manual
+installer to run first.
 
-If Windows Firewall asks, allow the app on **Private networks only**.
-Guest Wi-Fi isolation, routed VLANs, and blocked local VPN traffic may prevent
-discovery. The app does not open router ports or create public firewall rules.
+New game builds go under your own `Games` folder. Existing custom installations
+are respected. Source builds are installed side-by-side, not over your working
+copy.
 
-Closing the window keeps the app in the system tray. Double-click its moon icon
-to reopen it. Use the tray's **Quit** action after stopping the game.
+### 2. Play here
 
-### Native Tears of the Kingdom saves
+Open **Play**, select a game, and choose **Play**. The app detects supported
+save locations automatically and explains when a session, transfer, or
+verification needs attention.
 
-Update both PCs to **v0.10.0 or newer**. Choose **Dusklight** or
-**Tears of the Kingdom** on Home, Games, or Save history. Play, Sync, comparison,
-history and tray commands follow that selection; network approval and pairing
-remain shared. The game selection is remembered locally. Older managers keep
-their existing Dusklight protocol; TotK channels are enabled only for peers
-that advertise support.
+Use the protected game shortcuts created by Twilight Sync when you want its
+play checks. Launching a game directly is outside the manager's control.
 
-TotK is discovered at `%USERPROFILE%\Games\TotKRecomp` by default, or select
-its native `totk.exe` under **Games**. Select **Tears of the Kingdom** and choose
-**Install / update TotK Recomp**. For a first installation, select your local
-base game, supported update and console's `prod.keys` once; firmware fonts are
-optional. Twilight Sync downloads and verifies the official tools, then runs
-setup automatically. You do not need to run a separate installer or install the
-source-build SDKs. No game assets or console keys are downloaded.
+### 3. Bring your other PC along
 
-Fresh installations use a stable, versioned subfolder beneath
-`%USERPROFILE%\Games\TotKRecomp` and are selected automatically when verified.
-Existing custom installations with a supported `totk-install.json` receipt are
-updated in place. Saves, settings and mods are preserved; an unmanaged old folder
-is retained rather than overwritten. Play and save sync pause during setup.
-Failures retain logs and block play/sync until **Install / update TotK Recomp**
-finishes successfully. The [manual official setup](https://github.com/valentderah/totk-pc-recomp/releases/latest)
-remains an optional alternative. **Build from source** below also supports fresh
-installation using the same local input selections.
-A separate **Tears of the Kingdom (Twilight Sync)**
-desktop shortcut opens its protected Play controls in the existing manager.
-Unrelated and modified desktop shortcuts are never overwritten.
+On **both PCs**:
 
-All three games use the same authenticated Noise connection, bounded game-scoped
-protocol envelopes, common-base reconciliation rules, content-addressed history
-implementation and exclusive-play helpers. Their saves, bases, history,
-reservations and recovery state are separate. A TotK event cannot enter the
-Dusklight channel or release its lock.
+1. Join the same private home network.
+2. Open **Devices**, review the displayed router, and approve that network.
+3. Open pairing. On **one PC**, select the other device.
+4. Compare the **entire code** on both screens. Both PCs must approve it.
 
-| Workflow | Dusklight | Native TotK Recomp | Triforce / OoT |
-| --- | --- | --- | --- |
-| Stable-save observation and safe one-sided automatic sync | Yes | Yes | Yes |
-| Different progress requires an explicit complete-branch choice | Yes | Yes | Yes |
-| Keep both branches and continue this PC, including offline | Yes | Yes | Yes |
-| Compact snapshots, retained partner branches and restore | Yes | Yes | Yes |
-| Online play grant, durable reservation, release and recovery | Yes | Yes | Yes |
-| Managed desktop shortcut and game-aware tray controls | Yes | Yes | Yes |
-| Decoded save information | Hearts, quests, play time and inventory | Hearts, rupees, stamina, play time, caption date/type and map/position for supported layouts | Hearts, rupees, play time and caption date/type for the recognized native layout |
-| Game-program installation and updates | Official releases or source builds | Official setup/updates or source builds | Source builds |
-| Texture management | Dusklight tools | Managed separately | Managed separately |
+That's it. Matching progress stays simple; different progress gets a clear
+choice. You can compare complete branches, keep both and play here, or restore
+an earlier snapshot from **Save history**.
 
-Matching saves establish a common base. After playing on one PC, close the game
-and let the connected managers sync the safe one-sided change. If both PCs
-changed since that base, neither branch wins automatically: compare the
-retained snapshots, choose **Keep this PC's save**, **Use partner's save**, or
-**Keep both; play this PC**. Replacing divergent partner progress still needs
-their approval. TotK's slot comparisons are verified against the complete
-snapshot; they do not guess quest state from file timestamps or sizes.
-From v0.11.0, supported native saves also show each slot's manual/autosave type,
-stored save date, hearts, rupees, play time, stamina and expandable map/position.
-Matching snapshots share one compact slot list. Disabled Play/Sync controls
-show their specific reason beside the action and on hover, including pending
-choices, reservations, unverified saves and already-synchronized progress.
+Allow Twilight Sync on **Private networks only** if Windows Firewall asks.
+Guest Wi-Fi, VPN routing, and client isolation can prevent local discovery.
+The app does not open router ports or create public firewall rules.
 
-Online **Play Tears of the Kingdom** waits for matching saves and the other
-manager's play grant. Both reservations are persisted before the game launches.
-Completed sessions release them through the same game-scoped lease protocol.
-Interrupted sessions require explicit recovery; offline recovery can release
-only this PC's own reservation and retains the partner's reservation until
-reconnection. Offline play cannot guarantee exclusivity across disconnected PCs.
+## Want to build from source?
 
-TotK transfers include the complete active-account committed save: every slot,
-options and album file. Each PC retains its own `profile\account.uid`; incoming
-paths are mapped to that local identity. Inactive accounts, graphics INI files,
-mods, GPU caches and transaction working directories are not transferred.
-Running games, changed progress, expired offers, unsafe paths, unfinished game
-commits or failed checksums prevent replacement. Recover an unfinished native
-commit by launching and closing TotK normally before syncing.
+Choose **Build from source** in **Game setup**, then follow three focused steps:
 
-TotK uses the same deduplicated history engine with a separate **256 MiB**
-managed budget; Dusklight retains its **64 MiB** budget. History restore creates
-a new commit and retains the previous branch. Transaction rollback copies also
-remain under `profile\save-sync-backups`; these are outside managed history and
-are not automatically pruned. A full branch choice is never a hybrid merge of
-quest flags or inventory. Unknown formats show details unavailable; malformed
-known metadata is rejected before live replacement. Failed refreshes invalidate
-old matching hashes instead of leaving stale verified claims.
-[Read-only format verification and compatibility](docs/totk-save-details.md).
-Existing README images show the Dusklight workflow.
+1. **Tools:** check prerequisites, prepare verified build tools, and review the
+   exact source commit. Missing .NET/MSYS2 prerequisites offer approved setup
+   actions and copyable commands.
+2. **Game files:** choose your own supported local inputs. Keys are not sent
+   to your paired PC.
+3. **Build:** review the settings, approve the scripts, and build your copy.
+   Progress, retained logs, and safe cancellation are available.
 
-Read-only inspection is also available with `twilight-sync --check-totk-save`.
-For controlled setup, `--export-totk-save ABSOLUTE_PATH` creates a new bundle
-without changing progress, and `--import-totk-save ABSOLUTE_PATH --expected HASH`
-requires the receiving save's current canonical hash. `--expected missing` is
-only for an empty receiving account. These commands do not bypass the game,
-path, checksum or stale-progress guards.
+Approval applies to the exact revision and build settings. Changing either
+requires a fresh review.
 
-**Startup is enabled by default on the first normal launch.** Turn it off in
-**Settings** or the tray menu if you prefer. The installer does not
-override a startup preference you already changed.
+**Important:** slower is **not confirmed safer**. Source code, build scripts,
+compilers, and dependencies run with your Windows account's permissions.
+This is not a sandbox. Use a separate VM for code you do not trust.
 
-### Native Ocarina of Time / Triforce saves
+Native builds need at least **64 GiB free**, plus room for copied local data;
+the complete process can take an hour or more. Workspaces and old installs
+are retained. Shader preparation may open a window, but normal gameplay does
+not start as part of the build.
 
-Update both managers to a build with Triforce support, then select **Ocarina of
-Time** on Home, Games, or Save history. The default game folder is
-`%USERPROFILE%\Games\Triforce`; existing custom installs can be located with
-their native `Triforce.exe`. Managed launch prefers the actual game under `bin`
-when present, not the upstream Setup launcher.
+Triforce builds include their required Vulkan/SDL and movie/audio dependencies.
+Optional graphics controls are separate from what the game needs to run.
+Codec SDK data comes from **Takoroka/ffmpeg-av1**, not FFmpeg.org; a matching
+checksum is not source-to-binary attestation.
 
-Triforce gets its own encrypted save channel, automatic common-base sync,
-complete-branch choices, retained history, restore, play reservations and protected
-desktop shortcut. The committed active-user save is transferred, including
-`account.sav`, `option.sav`, and each slot's progress/caption files. Graphics
-settings, mods, inactive accounts, game transaction working copies and game-owned
-backups stay local. Unfinished native commits pause sync until you launch and
-close the game normally; unknown account layouts are not guessed.
-
-Older managers keep their existing Dusklight/TotK channels; Triforce traffic is
-enabled only when the paired manager advertises support. Complete save hashes,
-slot/file counts and branch comparisons are available. The recognized native
-layout also shows hearts, rupees, play time and save date/type. Dates come from
-the game's caption, not filesystem timestamps. Unknown layouts remain explicitly
-unavailable; malformed recognized metadata fails verification. Quest, inventory,
-stamina and map details are not inferred.
-
-### Build any game from source
-
-In **Games**, each game has an **Installation method** control. Keep the official
-workflow for Dusklight/TotK, or choose **Build from source**. Triforce defaults to
-source builds rather than its publisher's Setup.
-
-1. Choose **Check source version / prerequisites** and review the exact commit.
-   The build is pinned to that stable source revision, not a moving branch.
-2. Use **Prepare / verify official tools** to approve per-user tool downloads.
-   The app verifies published SHA-256 digests and caches archives; each build
-   extracts fresh tool copies. Some SDKs require a one-time setup: Visual Studio
-   C++/Windows SDK and Rust for Dusklight; C++ tools, .NET 10 and MSYS2 UCRT64 for
-   TotK. Missing .NET/MSYS2 rows offer automatic setup after approval, or
-   **Copy setup commands**. The .NET option uses
-   `winget install --id Microsoft.DotNet.SDK.10 --exact --source winget`.
-   MSYS2 setup installs if missing, updates core packages in two fresh sessions,
-   then installs the required UCRT64 packages. Close other MSYS2 terminals first.
-3. Choose your local inputs. Dusklight compiles without game assets. TotK needs
-   your base game, supported update and console keys. Triforce can reuse a native
-   install's retained game files or use your own `.nup` / extracted game folder.
-4. Choose the worker count, accept the source/build-script warning, and select
-   **Build / update from source**. Progress, cancellation and a local build log
-   are provided. Builds are staged under your `Games` folder, preserving the
-   previous install and verifying save progress before selection.
-
-**Slower does not mean proven safer.** Local compilation reduces reliance on
-prebuilt game executables, but is **not confirmed to be safer**. Build scripts
-and dependencies run with your Windows user's permissions; this is **not a
-sandbox**. Use a separate VM for code you do not trust. Tool checksums verify
-download integrity, not the absence of malware in tools or source.
-
-Allow at least **8 GiB** free for a Dusklight build and **64 GiB** for a native
-TotK/Triforce build, plus room for copied mods/portable data. Triforce can take an
-hour or more. Workspaces and old installs are retained and can consume substantial
-disk space. No normal gameplay starts automatically; shader preparation can open
-a window. Triforce builds include and validate the Vulkan renderer and SDL
-runtimes, plus AV1/audio codec libraries from the disclosed
-[Takoroka/ffmpeg-av1 supplier](https://github.com/Takoroka/ffmpeg-av1), not
-FFmpeg.org binaries. Checksums do not prove source-to-binary safety.
-The custom WebGPU fallback is not needed for Vulkan and is excluded; the new
-folder explicitly selects Vulkan while retaining the old folder's settings.
-RenoDX HDR and shader preparation retain upstream defaults. Optional graphics
-controls offer AMD FSR 4 and NVIDIA DLSS/frame generation; NVIDIA requires explicit
-license acceptance. These options can download additional dependencies.
-
-### App updates and stored play reservations
-
-Use **Check for updates** followed by **Update Twilight Sync** in Settings or
-the tray. The app downloads and verifies the official stable release, waits
-for a clean shutdown, updates its executable and installer receipt, and
-restarts. No manual replacement or save migration is needed.
-
-From **v0.10.1**, a stored play reservation alone does not disable app updates.
-Reservations, pairing and saves remain intact across the restart; gameplay and
-save replacement still respect the reservations afterwards. Active games,
-launches, installations and transfers must finish first. A disabled update
-button displays its current blocking reason, and the tray uses the same rule.
-
-In **v0.9.0/v0.10.0**, an older shared management gate could disable Update
-because a completed play session left a reservation. If affected, use the
-app's normal completed-session recovery controls, then update in the app.
-Offline recovery applies only to that PC's record and warns that partner
-activity is unknown; do not reset pairing or overwrite save files to recover.
-
-### Windows appearance
-
-The dashboard follows your Windows light/dark setting by default. Choose
-**Settings > Appearance** to use Windows, Light, or Dark; the choice is saved
-locally without changing game or pairing settings. Window chrome follows the
-chosen theme too.
-
-The interface uses installed Windows Segoe UI fonts and system icons, with
-compact navigation for smaller windows and high-DPI handheld displays. Windows
-font files are loaded from the operating system, not bundled or redistributed.
-
-## Compare progress, not just file dates
-
-Played on both PCs since the last sync? See both branches side by side, with
-their actual quest progress. Choose a complete save explicitly, or keep both
-and play the local branch. Replacing your partner's save requires their consent.
-
-![A save conflict showing each PC's quest, hearts, play time, rupees, and an explicit choice to keep both and play locally](docs/images/save-comparison.png)
-
-No default winner, no last-writer-wins, and no splicing quest flags into a hybrid
-save. All three Dusklight quest slots travel together. Both PCs need v0.9.0 or
-newer for Dusklight's decoded preview and reconciliation workflow; TotK's
-game-scoped workflow requires v0.10.0 on both PCs.
-
-## Also included
-
-| Tool | What it does |
-| --- | --- |
-| Encrypted LAN sync | Noise encryption, router approval, and pinned device identities; no save-cloud account. |
-| Texture library | Import authorized Henriko or TP Definitive Edition+ archives and switch installed packs. |
-| Dusklight installer | Verified, side-by-side official game-program updates that preserve your profile and saves. |
-| App updates | Optional version checks; downloading and installing always require confirmation. |
-| ISO / RVZ transfer | Separately approved transfers of verified disc images you own; RVZ stays compressed. |
+## A few good things to know
 
 <details>
-<summary>Texture packs and disc-image transfer</summary>
+<summary><strong>Can I play without my other PC?</strong></summary>
 
-### Textures
-
-Open **Texture packs**, choose the project, confirm permission to use its assets,
-and select **Install ZIP**. Use the complete archive; no manual extraction,
-variant-folder selection, or `config.json` picker is needed. Installation also
-activates the pack in Dusklight's automatically detected profile.
-
-Stop Dusklight on both devices before applying packs. Direct downloads are
-paused until accessible creator sources are available; archives you already have
-can be installed directly.
-
-Creator accounts and access controls stay with the creator; the app does not
-scrape logins, bypass access controls, or rehost texture assets. Nintendo-derived
-HD assets require your own authorization and are not bundled with this app.
-
-[Texture installation, switching, and recovery details](docs/guide.md#texture-packs-creator-downloads-managed-installs)
-
-### Your disc image
-
-Open **Dusklight** and choose your own `.iso` or `.rvz` file. Enable disc-image
-transfers on both devices, then **Offer verified disc image**. Your partner
-approves the transfer and chooses a new destination; existing images are never
-overwritten.
-
-Both managers need **v0.5.0 or later** to transfer RVZ. Lossless RVZ images are
-checked against the same original-disc catalog as ISOs, without writing an
-expanded ISO. Scrubbed or modified images that cannot reproduce an approved
-original disc are rejected.
+Yes. Local progress stays on this PC. When both devices return, matching
+branches can sync and divergent progress is preserved for comparison.
+A stored protected-play reservation still needs normal completed-session
+recovery; closing the app does not silently remove that protection.
 
 </details>
-
-## Follow your save history
-
-Open **Save history** to browse and restore earlier valid saves. Unchanged
-blocks are reused rather than copied for every revision. Oldest commits are
-pruned when the managed store reaches 64 MiB; filesystem allocation overhead,
-textures, and game installations are separate.
-
-![Dark-theme save history showing local and partner branches connected to a common save, with play-time, heart, and rupee changes](docs/images/save-history.png)
-
-The timeline connects local and preserved partner branches. Each snapshot shows
-decoded progress and gains/losses since its parent. The comparison prompt shows
-both versions, changes since the retained common save when available, and an
-explicit branch selection with no default winner. All three quest slots travel
-together; inventory and story flags are never spliced into an unsafe hybrid save.
-Save clocks are informational, not proof that one branch is preferable.
-Both PCs need this build for the read-only preview and reconciliation workflow.
-
-In one 100-revision synthetic test, history used **571,527 bytes rather than
-3,283,200 bytes: 82.6% less managed storage**. This is a fixture-specific result,
-not a guaranteed compression ratio.
-
-[Snapshot format, retention, migration, and restore details](docs/guide.md#compact-save-snapshots-a-commit-trail-not-full-copies)
-
-## Update Twilight Sync
-
-Twilight Sync checks this repository's stable GitHub releases shortly after
-startup and every **six hours** by default. Turn **Automatically check app
-updates** off in the tray or **Settings** to opt out. Manual checks
-remain available.
-
-When a newer version exists, the tray shows **Update Twilight Sync to v...**:
-
-1. Stop all games and finish any save/disc-image/texture/source-build work.
-2. Choose the update action and confirm the version/download size.
-3. The app checks the published SHA-256 digest and checksum list, stages a
-   verified native helper, and waits for its readiness acknowledgement.
-4. Twilight Sync shuts down cleanly. The helper waits for that exact process
-   to exit, replaces the executable, preserves the installer receipt when
-   present, and restarts the app in the tray.
-
-**Version checks do not download or install updates.** Installation always
-requires your approval. Update-check errors are shown separately and do not
-disable LAN save syncing. Game state, pairing, snapshots, textures, and startup
-preferences remain under `%USERPROFILE%\.twilight-sync` unchanged.
-
-There is no forced process termination or elevation. If a file changes, is in
-use, or fails validation, the update is refused. Native handoff tests cover
-waiting for a running app, rollback, and receipt preservation. Failed updates
-retain their private logs/backups under `.twilight-sync\updates` for review.
-Portable builds update their existing executable path; the PowerShell installer
-continues to manage its normal per-user location.
 
 <details>
-<summary>Manual updates, installation options, and recovery</summary>
+<summary><strong>What gets shared?</strong></summary>
 
-For versions that predate tray updates, stop Dusklight, **quit Twilight Sync
-from its tray menu**, then rerun the one-line command.
+The supported game's verified, committed save data—not console keys, mods,
+graphics settings, or unrelated accounts. The games have separate save
+channels, histories, and play reservations.
 
-The installer will not forcibly stop an app or overwrite an unrelated or
-modified executable. Reinstalling an unchanged release does not open a duplicate
-instance. If an upgrade is interrupted, preserve any `.install-*` recovery
-folder until you have checked its previous files.
-
-For a specific release, or to install without opening the app, download and
-review [install.ps1](install.ps1), then run:
-
-```powershell
-.\install.ps1 -Version v0.9.0 -NoLaunch
-```
-
-Optional parameters:
-
-| Parameter | Purpose |
-| --- | --- |
-| `-Version v0.9.0` | Install a specific published stable release |
-| `-InstallDirectory 'D:\Apps\TwilightSync'` | Choose a local per-user installation folder |
-| `-NoLaunch` | Do not open the app after installation |
-| `-NoShortcut` | Do not create or update a Start-menu shortcut |
+Optional verified GameCube ISO/RVZ transfer requires separate consent on each
+PC and for each incoming transfer. Game downloads are never supplied.
 
 </details>
 
-## Important limits
+<details>
+<summary><strong>Where did the window go?</strong></summary>
 
-This is an **early release, not an independently audited security product**.
-Start with copies of your saves.
+Closing the window keeps Twilight Sync available in the system tray.
+Double-click its moon icon to reopen it. Use **Quit** when you want to stop
+the manager, after finishing any game or installation.
 
-- Windows x64 is the initial downloadable platform; macOS/Linux desktop builds
-  and native Windows ARM64 releases are not currently published.
-- One trusted partner per device; no multi-device mesh or Internet save relay.
-- GCI folders and raw memory cards are supported. Only the validated
-  Twilight Princess save is transferred; other card contents stay local.
-  Mod scripts, save archives, and whole-directory transfers are not supported.
-- Router fingerprints are spoofable policy checks, not proof of physical
-  proximity. Pairing and pinned keys are separate security layers.
-- File validation cannot prove the absence of every game-engine exploit.
-- Exclusive play protects launches through this manager. Direct or renamed
-  game executables and compromised hosts can bypass cooperative enforcement.
-- Online coordination is optional; offline or independent branch play cannot
-   guarantee exclusivity across PCs. Offline recovery requires local confirmation
-   that the game is stopped; divergent saves still require reconciliation later.
+</details>
 
-[Protocol, threat model, file checks, and diagnostics](docs/guide.md)
+<details>
+<summary><strong>Something failed. What should I do?</strong></summary>
 
-## Privacy and uninstalling
+Read the visible error and use **Open build log** for a source failure.
+After installing SDKs with copied commands, use **Check source & tools** again.
+Do not delete your saves, clear reservations blindly, or repeatedly reinstall
+an SDK that is already marked **Found**.
 
-There is no save-cloud account or telemetry. Automatic app-update checks use the
-Internet for public GitHub release metadata only and can be disabled. Binary
-downloads, game-program updates, and creator pages still require your action;
-save traffic stays within the app's approved-LAN policy.
+If you [report an issue](https://github.com/false00/twilight-sync/issues),
+include the app version and relevant error text. Remove private paths or
+personal information, and **never attach console keys, game assets, or saves
+you do not intend to share publicly**.
 
-Local logs and snapshot metadata include usernames, file paths, hashes, and
-security decisions. Treat `%USERPROFILE%\.twilight-sync` as private and redact
-logs before posting them in issues. Save snapshots are not encrypted at rest.
+</details>
 
-To uninstall:
+## For contributors
 
-1. Stop the game, resolve any outstanding play lock, and disable **Start with Windows**.
-2. Quit Twilight Sync from the tray.
-3. Remove its Start-menu shortcut and `%LOCALAPPDATA%\Programs\TwilightSync`
-   folder (or the custom folder you chose).
-4. Keep `%USERPROFILE%\.twilight-sync` if you want your history and settings;
-   remove it deliberately only after preserving anything you need.
+Twilight Sync is a Rust application with a Slint interface. The sync engine,
+history, and protected-play checks are independent of the UI.
 
-## Build or contribute
+- [Development and validation](docs/development.md)
+- [Detailed user and technical guide](docs/guide.md)
+- [Supported native save details](docs/totk-save-details.md)
+- [Project license](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.txt)
 
-Source builds require Rust 1.95+ with the MSVC toolchain and the Visual Studio C++
-Build Tools/Windows SDK.
-
-```powershell
-git clone https://github.com/false00/twilight-sync.git
-Set-Location twilight-sync
-cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo build --release --locked
-```
-
-The Windows x64 release statically links the C runtime. The repository includes
-installer tests, Windows CI, and a tag-triggered release workflow.
-
-[Development and release notes](docs/development.md) · [MIT license](LICENSE) ·
-[Third-party notices](THIRD_PARTY_NOTICES.txt)
-
-Twilight Sync is an independent companion, not affiliated with or endorsed by
-Nintendo or TwilitRealm. No copyrighted game assets, disc images, saves, or
-third-party texture packs are included.
+Original project code is MIT-licensed. Slint and other dependencies retain
+their own licenses; Slint attribution is available from the main **About**
+button. Twilight Sync is not affiliated with Nintendo or the upstream game
+projects. Supply only game files you are legally entitled to use.

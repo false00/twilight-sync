@@ -2,13 +2,46 @@ use super::{Cancelled, check_cancelled};
 use crate::files::ensure_safe_path;
 use anyhow::{Context, Result, ensure};
 use std::{
+    collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::AtomicBool,
     time::Duration,
 };
+
+fn failure_summary(path: &Path) -> Result<String> {
+    let mut errors = VecDeque::new();
+    let mut tail = VecDeque::new();
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        let message: String = line.chars().take(1000).collect();
+        if lower.contains("error:")
+            || lower.contains(": error ")
+            || lower.contains("fatal error")
+            || lower.starts_with("failed:")
+            || lower.contains("\"type\": \"error\"")
+        {
+            if errors.len() == 6 {
+                errors.pop_front();
+            }
+            errors.push_back(message.clone());
+        }
+        if tail.len() == 6 {
+            tail.pop_front();
+        }
+        tail.push_back(message);
+    }
+    Ok(if errors.is_empty() { tail } else { errors }
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
 
 pub(super) struct Runner<'a> {
     pub log: PathBuf,
@@ -146,11 +179,38 @@ impl<'a> Runner<'a> {
         };
         #[cfg(windows)]
         drop(job);
-        ensure!(
-            status.success(),
-            "{label} failed ({status}). See {}",
-            self.log.display()
-        );
+        if !status.success() {
+            anyhow::bail!(
+                "{label} failed ({status}).\n{}\nFull log: {}",
+                failure_summary(&self.log)?,
+                self.log.display()
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiler_errors_are_not_lost_behind_parallel_build_progress() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("build.log");
+        let mut file = File::create(&path)?;
+        writeln!(
+            file,
+            "generated.cpp : fatal error C1083: invalid output path"
+        )?;
+        for index in 0..100 {
+            writeln!(file, "[{index}/100] Compiled another object")?;
+        }
+        drop(file);
+        let summary = failure_summary(&path)?;
+        assert!(summary.contains("fatal error C1083"));
+        assert!(!summary.contains("Compiled another object"));
         Ok(())
     }
 }

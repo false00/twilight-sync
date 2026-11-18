@@ -1,6 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=assets\\twilight-sync.ico");
     if std::env::var("CARGO_CFG_TARGET_OS")? == "windows" {
+        slint_build::compile_with_config(
+            "ui\\app.slint",
+            slint_build::CompilerConfiguration::new()
+                .with_debug_info(std::env::var("PROFILE")? == "debug"),
+        )?;
         let icon = std::path::Path::new("assets").join("twilight-sync.ico");
         winresource::WindowsResource::new()
             .set_icon(icon.to_str().ok_or("Windows icon path is not Unicode")?)

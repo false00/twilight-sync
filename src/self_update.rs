@@ -1147,7 +1147,8 @@ mod tests {
             parent.0.wait()?.success(),
             "Fixture parent did not exit cleanly"
         );
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // This fixture includes the debug UI and test harness, unlike the smaller release binary.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = helper.0.try_wait()? {
                 ensure!(status.success(), "Native update helper failed");

@@ -1,0 +1,642 @@
+import { AboutSlint, ScrollView, LineEdit, ProgressIndicator, Palette } from "std-widgets.slint";
+import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile } from "components.slint";
+
+export enum Action {
+    play, sync-save, setup, locate-game, refresh, compare, continue-local,
+    use-local, use-remote, accept-save, decline-save, recover, approve-recovery, decline-recovery,
+    check-source, reset-source, review-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
+    setup-dotnet, setup-msys, copy-dotnet, copy-msys, check-release, install-release,
+    trust-network, open-pairing, connect-device, approve-pairing, reject-pairing, unpair,
+    history-refresh, history-older, history-preview, history-restore, close-preview,
+    check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso,
+    open-texture-site, import-texture-zip, import-texture-folder, cancel-textures, activate-texture,
+    disable-textures, recover-textures, refresh-textures, open-data, open-licenses,
+    export-preview, quit
+}
+export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent, dark-mode }
+export struct GameCard { title: string, subtitle: string, status: string, installed: bool }
+export struct SaveCard { title: string, kind: string, date: string, hearts: string, rupees: string, played: string, extra: string, warning: string }
+export struct DeviceCard { name: string, detail: string, pairing: bool }
+export struct HistoryCard { title: string, detail: string, current: bool }
+export struct ToolRow { name: string, detail: string, ready: bool, setup: int }
+export struct PackCard { title: string, detail: string, active: bool }
+
+export component MainWindow inherits Window {
+    in property <string> window-title: "Twilight Sync";
+    title: root.window-title;
+    preferred-width: 1200px; preferred-height: 820px;
+    min-width: 720px; min-height: 600px;
+    default-font-family: "Segoe UI";
+    default-font-size: 16px;
+    background: Theme.canvas;
+    icon: @image-url("../assets/app-icon-256.png");
+    in-out property <int> section: 0;
+    in-out property <int> selected-game: 0;
+    in-out property <bool> dark-mode: true;
+    in property <bool> demo-mode;
+    in property <string> version;
+    in property <string> status;
+    in property <string> connection;
+    in property <bool> connected;
+    in property <string> error;
+    in property <[GameCard]> games;
+    in property <[SaveCard]> local-saves;
+    in property <[SaveCard]> remote-saves;
+    in property <[DeviceCard]> devices;
+    in property <[HistoryCard]> history;
+    in property <[ToolRow]> tools;
+    in property <bool> tools-missing;
+    in-out property <bool> show-tool-details: false;
+    in property <[PackCard]> packs;
+    in property <string> game-title;
+    in property <string> game-subtitle;
+    in property <string> installed-path;
+    in property <bool> installed;
+    in property <bool> can-play;
+    in property <bool> can-sync;
+    in property <bool> can-continue;
+    in property <bool> can-restore;
+    in property <bool> can-resolve;
+    in property <bool> can-manage;
+    in property <bool> can-install;
+    in property <bool> can-locate;
+    in property <bool> has-conflict;
+    in property <bool> pending-save;
+    in property <bool> recovery-needed;
+    in property <bool> incoming-recovery;
+    in property <string> play-reason;
+    in property <string> sync-reason;
+    in property <string> save-state;
+    in property <bool> source-mode;
+    in property <bool> source-busy;
+    in property <bool> operation-busy;
+    in property <bool> preferences-valid: true;
+    in property <bool> has-built;
+    in property <bool> sdk-busy;
+    in property <bool> source-ready;
+    in property <bool> source-consent;
+    in property <bool> managed-tools;
+    in property <bool> renodx;
+    in property <bool> fsr;
+    in property <bool> nvidia;
+    in property <bool> shaders;
+    in property <int> workers: 4;
+    in property <string> source-tag;
+    in property <string> source-commit;
+    in property <string> source-message;
+    in property <string> source-error;
+    in property <string> source-log;
+    in property <string> source-blocker;
+    in property <string> source-input;
+    in property <string> source-update;
+    in property <string> source-keys;
+    in property <string> source-firmware;
+    in property <string> release-tag;
+    in property <string> network-name;
+    in property <string> network-detail;
+    in property <bool> network-trusted;
+    in property <bool> pairing-open;
+    in property <string> pairing-code;
+    in property <bool> pairing-approved;
+    in property <string> peer-name;
+    in property <bool> startup;
+    in property <bool> auto-updates;
+    in property <string> app-update;
+    in property <bool> can-update-app;
+    in property <bool> disc-sharing;
+    in property <string> iso-path;
+    in property <bool> pending-iso;
+    in property <bool> history-more;
+    in property <string> history-info;
+    in property <string> preview-title;
+    in property <[SaveCard]> preview-saves;
+    in property <string> texture-status;
+    in property <[string]> texture-creators;
+    in-out property <int> texture-creator: 0;
+    in-out property <string> texture-version: "1.2.0";
+    in property <bool> texture-consent;
+    in property <bool> texture-busy;
+    in property <bool> texture-cancellable;
+    in property <bool> texture-recovery;
+    in-out property <bool> about-open: false;
+    in-out property <int> setup-step: 0;
+    in-out property <bool> advanced-source: false;
+    callback action(Action, int);
+    callback game-selected(int);
+    callback toggle(Toggle, bool);
+    callback choose-input(int);
+    callback clear-input(int);
+    callback set-workers(int);
+    init => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
+    changed dark-mode => {
+        Theme.dark = root.dark-mode;
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed section => { main-scroll.content-y = 0px; }
+    changed selected-game => { main-scroll.content-y = 0px; root.setup-step = 0; }
+    changed setup-step => { main-scroll.content-y = 0px; }
+
+    Rectangle { width: root.width; height: root.height; background: Theme.canvas; }
+    VerticalLayout {
+        x: 0px; y: 0px;
+        width: root.width; height: root.height;
+        spacing: 0px;
+        Rectangle {
+            height: 84px;
+            background: Theme.canvas;
+            HorizontalLayout {
+                padding-left: 32px; padding-right: 32px; padding-top: 18px; padding-bottom: 18px; spacing: 16px;
+                Image { source: @image-url("../assets/app-icon-256.png"); width: 42px; height: 42px; }
+                VerticalLayout {
+                    alignment: center; spacing: 0px;
+                    Text { text: "TWILIGHT SYNC"; font-weight: 700; font-size: 19px; letter-spacing: 2px; color: Theme.text; }
+                    Muted { text: root.demo-mode ? "INTERFACE PREVIEW · EXAMPLE DATA" : "YOUR ADVENTURES. CONNECTED."; font-size: 10px; }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? Theme.success : Theme.muted; }
+                Text { text: root.connection; color: Theme.muted; font-size: 14px; vertical-alignment: center; }
+                ActionButton { text: "About"; min-width: 72px; subtle: true; clicked => { root.about-open = true; } }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        HorizontalLayout {
+            spacing: 0px;
+            Rectangle {
+                width: root.width < 1000px ? 134px : 174px; background: Theme.canvas;
+                VerticalLayout {
+                    padding: 18px; spacing: 8px;
+                    for label[index] in ["Play", "Game setup", "Devices", "Save history", "Textures", "Settings"]: ActionButton {
+                        min-width: 0px;
+                        text: label; primary: root.section == index; subtle: root.section != index;
+                        clicked => { root.section = index; }
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    Muted { text: "LOCAL FIRST\nPRIVATE BY DESIGN"; font-size: 10px; }
+                    Muted { text: "v" + root.version; font-size: 11px; }
+                }
+            }
+            Rectangle { width: 1px; background: Theme.line; }
+            main-scroll := ScrollView {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 28px; spacing: 20px; alignment: start;
+                    if root.error != "": Rectangle {
+                        border-radius: 12px; background: Theme.dark ? #40262f : #f9dfe6;
+                        HorizontalLayout { padding: 16px; Text { text: root.error; color: Theme.danger; wrap: word-wrap; } }
+                    }
+                    if root.section == 1 || root.section == 3: HorizontalLayout {
+                        spacing: 12px;
+                        for game[index] in root.games: ActionButton {
+                            text: game.title; primary: root.selected-game == index;
+                            clicked => { root.selected-game = index; root.game-selected(index); }
+                        }
+                    }
+                    if root.section == 0: VerticalLayout {
+                        spacing: 24px;
+                        Text { text: "Pick up your adventure."; color: Theme.text; font-size: 34px; font-weight: 600; wrap: word-wrap; }
+                        Muted { text: "One library. Three worlds. Your progress comes with you."; font-size: 16px; }
+                        HorizontalLayout {
+                            spacing: 18px;
+                            for game[index] in root.games: GameTile {
+                                horizontal-stretch: 1;
+                                title: game.title; status: game.status; selected: root.selected-game == index;
+                                artwork: index == 0 ? @image-url("../assets/adventure-twilight.svg") : index == 1 ? @image-url("../assets/adventure-sky.svg") : @image-url("../assets/adventure-time.svg");
+                                clicked => { root.selected-game = index; root.game-selected(index); }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 24px; spacing: 12px;
+                                HorizontalLayout {
+                                    VerticalLayout { spacing: 4px; SectionTitle { text: root.game-title; } Muted { text: root.game-subtitle; } }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Text { text: root.installed ? "READY TO PLAY" : "LET'S GET YOU SET UP"; color: root.installed ? Theme.success : Theme.accent; font-size: 11px; font-weight: 600; vertical-alignment: center; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.section = 1; } } }
+                                    ActionButton { text: "Sync progress"; available: root.can-sync; clicked => { root.action(Action.sync-save, 0); } }
+                                    ActionButton { text: "Refresh"; subtle: true; clicked => { root.action(Action.refresh, 0); } }
+                                }
+                                if root.play-reason != "": Muted { text: root.play-reason; }
+                                if root.sync-reason != "" && root.sync-reason != root.play-reason: Muted { text: root.sync-reason; }
+                            }
+                        }
+                        if root.pending-save: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "A save is waiting for your decision"; }
+                                Muted { text: "Compare before choosing. Your existing progress is retained before replacement."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Accept save"; primary: true; clicked => { root.action(Action.accept-save, 0); } }
+                                    ActionButton { text: "Keep this PC"; clicked => { root.action(Action.decline-save, 0); } }
+                                }
+                            }
+                        }
+                        if root.has-conflict: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "Two adventures. You choose."; }
+                                Muted { text: "Both PCs have different progress. We never silently pick a winner."; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionButton { text: "Compare saves"; primary: true; clicked => { root.action(Action.compare, 0); } }
+                                    ActionButton { text: "Keep both, play here"; available: root.can-continue; clicked => { root.action(Action.continue-local, 0); } }
+                                }
+                            }
+                        }
+                        if root.recovery-needed: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "Finish the previous play session"; }
+                                Muted { text: "Reservations protect your saves, even after a restart. Recover only after play has ended."; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    if !root.incoming-recovery: ActionButton { text: "Recover session"; clicked => { root.action(Action.recover, 0); } }
+                                    if root.incoming-recovery: ActionButton { text: "Approve recovery"; clicked => { root.action(Action.approve-recovery, 0); } }
+                                    if root.incoming-recovery: ActionButton { text: "Keep reservation"; clicked => { root.action(Action.decline-recovery, 0); } }
+                                }
+                            }
+                        }
+                        SectionTitle { text: "Your progress"; }
+                        Muted { text: root.save-state; }
+                        for save in root.local-saves: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 10px;
+                                HorizontalLayout { Text { text: save.title; color: Theme.text; font-weight: 600; } Text { text: save.kind; color: Theme.accent; horizontal-alignment: right; } }
+                                HorizontalLayout {
+                                    Text { text: "HEARTS  " + save.hearts; color: Theme.text; }
+                                    Text { text: "RUPEES  " + save.rupees; color: Theme.text; }
+                                    Text { text: "PLAYED  " + save.played; color: Theme.text; }
+                                }
+                                Muted { text: save.date + "\n" + save.extra; }
+                                if save.warning != "": Muted { text: save.warning; color: Theme.danger; }
+                            }
+                        }
+                        if root.remote-saves.length > 0: SectionTitle { text: "Other PC · verified comparison"; }
+                        for save in root.remote-saves: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 8px;
+                                Text { text: save.title + " · " + save.kind; color: Theme.text; font-weight: 600; }
+                                Muted { text: "Hearts " + save.hearts + "   Rupees " + save.rupees + "   Played " + save.played + "\n" + save.date + "\n" + save.extra; }
+                                if save.warning != "": Muted { text: save.warning; color: Theme.danger; }
+                            }
+                        }
+                        if root.has-conflict && root.remote-saves.length > 0: HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "Use this PC's save"; available: root.can-resolve; clicked => { root.action(Action.use-local, 0); } }
+                            ActionButton { text: "Use other PC's save"; available: root.can-resolve; clicked => { root.action(Action.use-remote, 0); } }
+                        }
+                    }
+                    if root.section == 1: VerticalLayout {
+                        spacing: 20px;
+                        Text { text: "Set up " + root.game-title; color: Theme.text; font-size: 28px; font-weight: 600; wrap: word-wrap; }
+                        Muted { text: "Install once. Update here. Your saves stay protected."; }
+                        if !root.preferences-valid: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                SectionTitle { text: "Build preferences need attention"; }
+                                Muted { text: "Reset these preferences to choose your local inputs again. Games, saves, pairing and reservations are untouched."; }
+                                ActionButton { text: "Reset build preferences"; available: !root.operation-busy; clicked => { root.action(Action.reset-source, 0); } }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                Text { text: "INSTALLATION METHOD"; color: Theme.muted; font-size: 11px; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    if root.selected-game != 2: ActionButton { text: "Official setup"; primary: !root.source-mode; available: root.can-manage; clicked => { root.toggle(Toggle.source-mode, false); } }
+                                    ActionButton { text: "Build from source"; primary: root.source-mode; available: root.can-manage; clicked => { root.toggle(Toggle.source-mode, true); } }
+                                    ActionButton { text: "Locate installed game"; available: root.can-locate; clicked => { root.action(Action.locate-game, 0); } }
+                                }
+                                Muted { text: root.installed-path == "" ? "New games are installed in your Games folder." : root.installed-path; }
+                            }
+                        }
+                        if root.source-mode: HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "1  Tools"; primary: root.setup-step == 0; available: root.can-manage; clicked => { root.setup-step = 0; } }
+                            if root.selected-game != 0: ActionButton { text: "2  Game files"; primary: root.setup-step == 1; available: root.can-manage; clicked => { root.setup-step = 1; } }
+                            ActionButton { text: root.selected-game == 0 ? "2  Build" : "3  Build"; primary: root.setup-step == 2; available: root.can-manage; clicked => { root.setup-step = 2; } }
+                        }
+                        if root.source-mode && root.setup-step == 0: VerticalLayout {
+                            spacing: 16px;
+                            Muted { text: "Source builds take longer and are not confirmed safer. Scripts run with your permissions, outside a sandbox; use a separate VM for code you do not trust."; }
+                            Surface {
+                                VerticalLayout {
+                                    padding: 22px; spacing: 14px;
+                                    SectionTitle { text: "1   Get ready"; }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        ActionButton { text: "Check source & tools"; available: root.can-manage; primary: root.source-tag == ""; clicked => { root.action(Action.check-source, 0); } }
+                                        ActionButton { text: "Prepare build tools"; available: root.can-manage; clicked => { root.action(Action.prepare-tools, 0); } }
+                                    }
+                                    if root.source-tag != "": Muted { text: "Source " + root.source-tag + " · " + root.source-commit; }
+                                    if root.source-tag != "": ActionButton { text: "Review this source revision"; available: root.can-manage; clicked => { root.action(Action.review-source, 0); } }
+                                    if root.tools.length > 0 && !root.tools-missing: HorizontalLayout {
+                                        Text { text: "All build prerequisites found"; color: Theme.success; vertical-alignment: center; }
+                                        ActionButton { text: root.show-tool-details ? "Hide checks" : "Show checks"; clicked => { root.show-tool-details = !root.show-tool-details; } }
+                                    }
+                                    if root.tools-missing || root.show-tool-details: VerticalLayout {
+                                    for tool[index] in root.tools: VerticalLayout {
+                                        spacing: 6px;
+                                        HorizontalLayout {
+                                            spacing: 10px;
+                                            Text { text: tool.ready ? "FOUND" : "SETUP NEEDED"; color: tool.ready ? Theme.success : Theme.accent; font-size: 11px; width: 110px; vertical-alignment: center; }
+                                            Muted { text: tool.name; horizontal-stretch: 1; }
+                                            if !tool.ready && tool.setup > 0: ActionButton { text: "Set up"; available: root.can-manage; min-width: 88px; clicked => { root.action(tool.setup == 1 ? Action.setup-dotnet : Action.setup-msys, 0); } }
+                                            if !tool.ready && tool.setup > 0: ActionButton { text: "Commands"; subtle: true; min-width: 100px; clicked => { root.action(tool.setup == 1 ? Action.copy-dotnet : Action.copy-msys, 0); } }
+                                            if !tool.ready && tool.setup == 0: ActionButton { text: "Instructions"; min-width: 100px; clicked => { root.action(Action.tool-help, index); } }
+                                        }
+                                        if tool.detail != "": Muted { text: tool.detail; color: Theme.danger; }
+                                    }
+                                    }
+                                    Muted { text: "After running copied commands, check source & tools again to refresh the results."; }
+                                    ActionButton { text: root.selected-game == 0 ? "Next: review build" : "Next: game files"; primary: true; available: root.can-manage; clicked => { root.setup-step = root.selected-game == 0 ? 2 : 1; } }
+                                }
+                            }
+                        }
+                        if root.selected-game != 0 && (!root.source-mode || root.setup-step == 1): Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: root.source-mode ? "2   Your local game files" : "Your local game files"; }
+                                Muted { text: root.selected-game == 1 ? "Your own base game, supported update and console keys stay local. We never supply or transfer keys." : "Use your own .nup or retained romfs and exefs files from an existing Triforce installation."; }
+                                Text { text: root.selected-game == 1 ? "BASE GAME" : "GAME INPUT"; color: Theme.muted; font-size: 11px; }
+                                Muted { text: root.source-input == "" ? "No file selected" : root.source-input; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionButton { text: "Choose game file"; available: root.can-manage; clicked => { root.choose-input(0); } }
+                                    if root.selected-game == 2: ActionButton { text: "Use existing folder"; available: root.can-manage; clicked => { root.choose-input(4); } }
+                                    if root.source-input != "": ActionButton { text: "Clear"; available: root.can-manage; clicked => { root.clear-input(0); } }
+                                }
+                                if root.selected-game == 1: VerticalLayout {
+                                    spacing: 10px;
+                                    Text { text: "UPDATE"; color: Theme.muted; font-size: 11px; }
+                                    Muted { text: root.source-update == "" ? "Select your supported update" : root.source-update; }
+                                    ActionButton { text: "Choose update"; available: root.can-manage; clicked => { root.choose-input(1); } }
+                                    if root.source-update != "": ActionButton { text: "Clear update"; available: root.can-manage; clicked => { root.clear-input(1); } }
+                                    Text { text: "CONSOLE KEYS"; color: Theme.muted; font-size: 11px; }
+                                    Muted { text: root.source-keys == "" ? "Select your prod.keys file" : root.source-keys; }
+                                    ActionButton { text: "Choose keys"; available: root.can-manage; clicked => { root.choose-input(2); } }
+                                    if root.source-keys != "": ActionButton { text: "Clear keys selection"; available: root.can-manage; clicked => { root.clear-input(2); } }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        ActionButton { text: "Optional firmware fonts"; available: root.can-manage; clicked => { root.choose-input(3); } }
+                                        Muted { text: root.source-firmware; }
+                                        if root.source-firmware != "": ActionButton { text: "Clear fonts"; available: root.can-manage; clicked => { root.clear-input(3); } }
+                                    }
+                                }
+                                if root.source-mode: ActionButton { text: "Next: review build"; primary: true; available: root.can-manage; clicked => { root.setup-step = 2; } }
+                            }
+                        }
+                        if root.source-mode && root.setup-step == 2: Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: root.selected-game == 0 ? "2   Build your copy" : "3   Build your copy"; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "Build workers"; color: Theme.text; vertical-alignment: center; }
+                                    ActionButton { text: "−"; min-width: 46px; max-width: 46px; available: root.can-manage && root.workers > 1; clicked => { root.set-workers(root.workers - 1); } }
+                                    Text { text: root.workers; color: Theme.text; width: 30px; horizontal-alignment: center; vertical-alignment: center; }
+                                    ActionButton { text: "+"; min-width: 46px; max-width: 46px; available: root.can-manage && root.workers < 16; clicked => { root.set-workers(root.workers + 1); } }
+                                }
+                                SwitchRow { title: "Prepare missing official build tools"; description: "Download verified tool archives after approval."; checked: root.managed-tools; available: root.can-manage; toggled(value) => { root.toggle(Toggle.managed-tools, value); } }
+                                if root.selected-game == 2: ActionButton { text: root.advanced-source ? "Hide graphics options" : "Graphics options"; available: root.can-manage; clicked => { root.advanced-source = !root.advanced-source; } }
+                                if root.selected-game == 2 && root.advanced-source: VerticalLayout {
+                                    spacing: 6px;
+                                    Muted { text: "Vulkan, SDL and movie/audio codecs are included. Codec binaries are supplied by Takoroka/ffmpeg-av1, not FFmpeg.org; checksums do not prove source-to-binary safety."; }
+                                    SwitchRow { title: "RenoDX HDR"; description: "Upstream default; downloads shader/compiler dependencies."; checked: root.renodx; available: root.can-manage; toggled(value) => { root.toggle(Toggle.renodx, value); } }
+                                    SwitchRow { title: "AMD FSR 4"; checked: root.fsr; available: root.can-manage; toggled(value) => { root.toggle(Toggle.fsr, value); } }
+                                    SwitchRow { title: "NVIDIA DLSS / frame generation"; description: "Enable only after reviewing and accepting NVIDIA's SDK terms."; checked: root.nvidia; available: root.can-manage; toggled(value) => { root.toggle(Toggle.nvidia, value); } }
+                                    ActionButton { text: "Review NVIDIA SDK terms"; clicked => { root.action(Action.nvidia-terms, 0); } }
+                                    SwitchRow { title: "Prepare shaders after compiling"; checked: root.shaders; available: root.can-manage; toggled(value) => { root.toggle(Toggle.shaders, value); } }
+                                }
+                                SwitchRow { title: "I reviewed the source and approve this build"; description: "I own the required game files and accept running this revision's scripts and dependencies."; checked: root.source-consent; available: root.can-manage && root.source-tag != ""; toggled(value) => { root.toggle(Toggle.source-consent, value); } }
+                                if root.source-blocker != "": Muted { text: root.source-blocker; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Build & install"; primary: true; available: root.source-ready; clicked => { root.action(Action.build-source, 0); } }
+                                }
+                            }
+                        }
+                        if !root.source-mode: Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Ready when you are"; }
+                                Muted { text: root.release-tag == "" ? "Install the latest verified official release using your local game inputs." : "Latest official release: " + root.release-tag; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Install / update"; primary: true; available: root.can-install; clicked => { root.action(Action.install-release, 0); } }
+                                    ActionButton { text: "Check latest"; available: root.can-manage; clicked => { root.action(Action.check-release, 0); } }
+                                }
+                            }
+                        }
+                        if root.operation-busy || root.source-message != "" || root.source-error != "": Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: root.operation-busy ? "Getting your adventure ready" : root.source-error == "" ? "Build status" : "Let's resolve this"; }
+                                if root.operation-busy: ProgressIndicator { indeterminate: true; }
+                                Text { text: root.source-message; color: Theme.text; wrap: word-wrap; }
+                                if root.source-error != "": Muted { text: root.source-error; color: Theme.danger; }
+                                Muted { text: "Previous installations and saves stay intact until verification succeeds."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Open build log"; available: root.source-log != ""; clicked => { root.action(Action.open-log, 0); } }
+                                    if root.source-busy && !root.sdk-busy: ActionButton { text: "Cancel safely"; clicked => { root.action(Action.cancel-source, 0); } }
+                                    if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
+                                }
+                            }
+                        }
+                    }
+                    if root.section == 2: VerticalLayout {
+                        spacing: 20px;
+                        Text { text: "Together, locally."; color: Theme.text; font-size: 34px; font-weight: 600; }
+                        Muted { text: "Pair two Windows PCs on your private home network. No cloud account. No subscription."; font-size: 16px; }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "1   Your private network"; }
+                                Text { text: root.network-name; color: Theme.text; }
+                                Muted { text: root.network-detail; }
+                                ActionButton { text: root.network-trusted ? "Network approved" : "Approve this network"; primary: !root.network-trusted; available: !root.network-trusted && root.network-name != ""; clicked => { root.action(Action.trust-network, 0); } }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "2   Find your other PC"; }
+                                Muted { text: root.peer-name == "" ? "Open pairing on both PCs. Choose the other PC on just one screen." : "Paired with " + root.peer-name; }
+                                ActionButton { text: root.pairing-open ? "Pairing is open" : "Open pairing"; available: root.network-trusted; clicked => { root.action(Action.open-pairing, 0); } }
+                                for device[index] in root.devices: HorizontalLayout {
+                                    spacing: 10px;
+                                    VerticalLayout { Text { text: device.name; color: Theme.text; } Muted { text: device.detail; } }
+                                    ActionButton { text: "Compare codes"; available: device.pairing; clicked => { root.action(Action.connect-device, index); } }
+                                }
+                            }
+                        }
+                        if root.pairing-code != "": Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 16px;
+                                SectionTitle { text: "3   Compare the full code on both PCs"; }
+                                Text { text: root.pairing-code; color: Theme.accent; font-size: 28px; font-weight: 600; wrap: word-wrap; }
+                                Muted { text: "Approve only if every part matches. Both PCs must confirm."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: root.pairing-approved ? "Approved · waiting" : "Codes match"; primary: true; available: !root.pairing-approved; clicked => { root.action(Action.approve-pairing, 0); } }
+                                    ActionButton { text: "Cancel pairing"; clicked => { root.action(Action.reject-pairing, 0); } }
+                                }
+                            }
+                        }
+                        if root.peer-name != "": ActionButton { text: "Unpair this device"; clicked => { root.action(Action.unpair, 0); } }
+                    }
+                    if root.section == 3: VerticalLayout {
+                        spacing: 20px;
+                        Text { text: "A way back, always."; color: Theme.text; font-size: 34px; font-weight: 600; }
+                        Muted { text: "Compact snapshots keep complete save branches. Restore with a clear choice, never a guess."; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "Refresh history"; clicked => { root.action(Action.history-refresh, 0); } }
+                            ActionButton { text: "Older snapshots"; available: root.history-more; clicked => { root.action(Action.history-older, 0); } }
+                        }
+                        Muted { text: root.history-info; }
+                        for item[index] in root.history: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 12px;
+                                Text { text: item.title + (item.current ? " · CURRENT" : ""); color: item.current ? Theme.accent : Theme.text; font-weight: 600; }
+                                Muted { text: item.detail; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "View progress"; clicked => { root.action(Action.history-preview, index); } }
+                                    ActionButton { text: "Restore"; available: !item.current && root.can-restore; clicked => { root.action(Action.history-restore, index); } }
+                                }
+                            }
+                        }
+                        if root.preview-title != "": Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 10px;
+                                SectionTitle { text: root.preview-title; }
+                                for save in root.preview-saves: Muted { text: save.title + " · Hearts " + save.hearts + " · Rupees " + save.rupees + " · Played " + save.played + "\n" + save.extra; }
+                                ActionButton { text: "Close preview"; clicked => { root.action(Action.close-preview, 0); } }
+                            }
+                        }
+                    }
+                    if root.section == 4: VerticalLayout {
+                        spacing: 20px;
+                        Text { text: "A fresh look for Hyrule."; color: Theme.text; font-size: 34px; font-weight: 600; }
+                        Muted { text: "Optional Dusklight texture packs. Download from the creator, then import files you are authorized to use."; }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Make it your own"; }
+                                for creator[index] in root.texture-creators: ActionButton { text: creator; primary: root.texture-creator == index; clicked => { root.texture-creator = index; } }
+                                ActionButton { text: "Visit creator download page"; clicked => { root.action(Action.open-texture-site, root.texture-creator); } }
+                                LineEdit { text <=> root.texture-version; placeholder-text: "Version label"; }
+                                SwitchRow { title: "I have permission to use these textures"; checked: root.texture-consent; toggled(value) => { root.toggle(Toggle.texture-consent, value); } }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Import ZIP"; available: root.texture-consent && !root.texture-busy; clicked => { root.action(Action.import-texture-zip, 0); } }
+                                    ActionButton { text: "Import folder"; available: root.texture-consent && !root.texture-busy; clicked => { root.action(Action.import-texture-folder, 0); } }
+                                }
+                                Muted { text: root.texture-status; }
+                                if root.texture-busy && root.texture-cancellable: ActionButton { text: "Cancel import safely"; clicked => { root.action(Action.cancel-textures, 0); } }
+                            }
+                        }
+                        for pack[index] in root.packs: Surface {
+                            VerticalLayout {
+                                padding: 20px; spacing: 10px;
+                                Text { text: pack.title + (pack.active ? " · ACTIVE" : ""); color: pack.active ? Theme.accent : Theme.text; font-weight: 600; }
+                                Muted { text: pack.detail; }
+                                ActionButton { text: "Use this pack"; available: !root.texture-busy && !pack.active; clicked => { root.action(Action.activate-texture, index); } }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "Disable textures"; available: !root.texture-busy; clicked => { root.action(Action.disable-textures, 0); } }
+                            ActionButton { text: "Refresh"; clicked => { root.action(Action.refresh-textures, 0); } }
+                            if root.texture-recovery: ActionButton { text: "Recover interrupted change"; clicked => { root.action(Action.recover-textures, 0); } }
+                        }
+                    }
+                    if root.section == 5: VerticalLayout {
+                        spacing: 20px;
+                        Text { text: "Your space, your way."; color: Theme.text; font-size: 34px; font-weight: 600; }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 14px;
+                                SectionTitle { text: "Comfort & convenience"; }
+                                SwitchRow { title: "Midnight theme"; description: "Switch off for a bright, quiet workspace."; checked: root.dark-mode; toggled(value) => { root.dark-mode = value; root.toggle(Toggle.dark-mode, value); } }
+                                SwitchRow { title: "Ready when Windows starts"; description: "Start quietly in the tray."; checked: root.startup; toggled(value) => { root.toggle(Toggle.startup, value); } }
+                                SwitchRow { title: "Check for app updates"; description: "Metadata only. Updates still need your approval."; checked: root.auto-updates; toggled(value) => { root.toggle(Toggle.updates, value); } }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Keep the good things coming"; }
+                                Muted { text: root.app-update; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Check for updates"; clicked => { root.action(Action.check-app-update, 0); } }
+                                    ActionButton { text: "Update Twilight Sync"; available: root.can-update-app; primary: root.can-update-app; clicked => { root.action(Action.update-app, 0); } }
+                                }
+                            }
+                        }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Optional game-disc transfer"; }
+                                Muted { text: "Only your verified Twilight Princess GameCube ISO/RVZ. Disabled by default. Never downloads games."; }
+                                SwitchRow { title: "I own this game and allow disc transfers"; checked: root.disc-sharing; toggled(value) => { root.toggle(Toggle.disc-sharing, value); } }
+                                Muted { text: root.iso-path; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Choose ISO / RVZ"; clicked => { root.action(Action.choose-iso, 0); } }
+                                    ActionButton { text: "Offer verified disc"; available: root.disc-sharing; clicked => { root.action(Action.send-iso, 0); } }
+                                }
+                                if root.pending-iso: HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Accept disc"; available: root.disc-sharing; clicked => { root.action(Action.accept-iso, 0); } }
+                                    ActionButton { text: "Decline"; clicked => { root.action(Action.decline-iso, 0); } }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "Open local data"; clicked => { root.action(Action.open-data, 0); } }
+                            ActionButton { text: "Licenses & credits"; clicked => { root.about-open = true; } }
+                            ActionButton { text: "Quit"; clicked => { root.action(Action.quit, 0); } }
+                        }
+                    }
+                    Rectangle { height: 16px; background: transparent; }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        Rectangle {
+            height: 42px; background: Theme.canvas;
+            HorizontalLayout {
+                padding-left: 24px; padding-right: 24px;
+                Text { text: root.status; color: Theme.muted; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                Text { text: "PRIVATE LAN   /   PROTECTED SAVES"; color: Theme.muted; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+        }
+    }
+    if root.about-open: Rectangle {
+        background: #000a;
+        TouchArea { }
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: min(parent.width - 80px, 600px); height: min(parent.height - 60px, 520px);
+            background: Theme.panel; border-radius: 24px; border-width: 1px; border-color: Theme.line;
+            VerticalLayout {
+                padding: 30px; spacing: 16px;
+                SectionTitle { text: "Twilight Sync"; }
+                Muted { text: "Your adventures, across your PCs.\nVersion " + root.version + "\nOriginal console-inspired interface. Not affiliated with Nintendo."; }
+                AboutSlint { }
+                ActionButton { text: "View third-party licenses"; clicked => { root.action(Action.open-licenses, 0); } }
+                if root.demo-mode: ActionButton { text: "Save example screenshot"; clicked => { root.action(Action.export-preview, 0); } }
+                ActionButton { text: "Back to your adventure"; primary: true; clicked => { root.about-open = false; } }
+            }
+        }
+    }
+}

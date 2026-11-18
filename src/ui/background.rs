@@ -1,7 +1,7 @@
-use super::Tray;
+use super::{Tray, widgets::MainWindow};
 use crate::runtime::{Backend, Command};
 use anyhow::{Result, ensure};
-use eframe::egui;
+use slint::ComponentHandle;
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroIsize,
@@ -26,7 +26,7 @@ thread_local! {
 
 struct Pump {
     backend: Backend,
-    context: egui::Context,
+    ui: slint::Weak<MainWindow>,
     tray: Tray,
     window: NonZeroIsize,
     last_status: RefCell<String>,
@@ -42,14 +42,17 @@ pub(super) struct BackgroundGuard {
     timer: usize,
 }
 
-pub(super) fn reveal(window: NonZeroIsize, context: &egui::Context) {
-    // Hidden Win32 windows do not receive redraws. Show natively before asking egui to repaint.
+pub(super) fn reveal(window: NonZeroIsize, ui: &slint::Weak<MainWindow>) {
     unsafe {
         ShowWindow(window.get() as HWND, SW_RESTORE);
     }
-    context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    context.send_viewport_cmd(egui::ViewportCommand::Focus);
-    context.request_repaint();
+    if let Some(ui) = ui.upgrade() {
+        if let Err(error) = ui.show() {
+            eprintln!("Cannot reveal Twilight Sync: {error}");
+        }
+        ui.window().set_minimized(false);
+        ui.window().request_redraw();
+    }
 }
 
 fn open_message() -> std::io::Result<u32> {
@@ -108,13 +111,13 @@ pub(super) fn open_selected_game(title: &str, game: crate::protocol::GameId) -> 
 impl BackgroundGuard {
     pub(super) fn install(
         window: NonZeroIsize,
-        context: egui::Context,
+        ui: slint::Weak<MainWindow>,
         backend: Backend,
         tray: Tray,
     ) -> std::io::Result<Self> {
         let pump = Rc::new(Pump {
             backend,
-            context,
+            ui,
             tray,
             window,
             last_status: RefCell::new(String::new()),
@@ -149,7 +152,7 @@ impl BackgroundGuard {
     }
 
     pub(super) fn reveal(&self) {
-        reveal(self.pump.window, &self.pump.context);
+        reveal(self.pump.window, &self.pump.ui);
     }
 
     pub(super) fn error(&self) -> Option<String> {
@@ -201,7 +204,7 @@ unsafe extern "system" fn window_message(
             } else {
                 crate::protocol::GameId::Dusklight
             }));
-        reveal(pump.window, &pump.context);
+        reveal(pump.window, &pump.ui);
         return 1;
     }
     if message == WM_NCDESTROY
@@ -267,7 +270,7 @@ impl Pump {
                 "Check Twilight Sync updates"
             });
         let can_update = snapshot.self_updates.available()
-            && super::Dashboard::update_blocker(&snapshot).is_none();
+            && super::model::app_update_blocker(&snapshot).is_none();
         self.tray.update_app.set_enabled(can_update);
         let update_text = if snapshot.self_updates.preparing {
             "Preparing verified app update...".into()
@@ -303,13 +306,15 @@ impl Pump {
             || snapshot.comparison_code.is_some();
         let previous = self.attention.replace(attention);
         if snapshot.shutdown || (attention && !previous) {
-            reveal(self.window, &self.context);
+            reveal(self.window, &self.ui);
         }
         let desktop_error = self.error.borrow().clone();
         if let Some(detail) = desktop_error {
             self.backend.command(Command::DesktopRecovered(detail))?;
             *self.error.borrow_mut() = None;
-            self.context.request_repaint();
+            if let Some(ui) = self.ui.upgrade() {
+                ui.window().request_redraw();
+            }
         }
         Ok(())
     }
@@ -321,7 +326,7 @@ impl Pump {
             if let Err(error) = self.backend.command(Command::DesktopError(detail)) {
                 eprintln!("Cannot report the desktop failure to the manager: {error:#}");
             }
-            reveal(self.window, &self.context);
+            reveal(self.window, &self.ui);
         }
     }
 }
