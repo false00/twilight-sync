@@ -630,6 +630,24 @@ The flow:
    Compiler workers are selected automatically from the PC's available CPU
    threads and memory. Compiling and owned shader-preparation processes are not reported
    as gameplay, so the paired PC can still reserve and play its existing game.
+   Game setup shows live stage progress, completed/total work, elapsed time and
+   an estimated time left **for the current stage**, not a fabricated whole-build
+   countdown. OOT's builder estimates use its measurements from this PC when
+   available; otherwise estimates use observed progress after enough work has
+   completed. TotK's byte/item counters and CMake/Ninja compiler output are
+   recognized too. New phases, reset counters and stalls discard stale estimates;
+   silent or unmeasurable phases remain indeterminate. **Show live activity**
+   displays recent output inside the app, newest first. This view is bounded and
+   refreshed in the build worker, so verbose output does not flood the GUI.
+   **Open full log externally**, inside that panel, remains an optional diagnostic
+   action; omitted verbose lines remain in the full log.
+   Build settings, approvals and local game-input selections are locked during
+   the operation; navigation and read-only browsing stay available. After a
+   verified build is selected successfully, a persistent green completion banner
+   appears across pages with **Go to Play** / **View build** actions. It does not
+   launch the game or bypass play reservations. If compilation succeeds but
+   activation is blocked, an amber banner explicitly says activation is required
+   instead. The completion notice can be dismissed.
    Actual running games and play reservations remain protected; a completed
    build cannot replace the selected installation until play has finished.
    Triforce prepares shaders before the new installation is

@@ -57,6 +57,12 @@ pub(super) fn installed(snapshot: &Snapshot, game: GameId) -> bool {
     })
 }
 
+pub(super) fn executable(snapshot: &Snapshot, game: GameId) -> Option<&std::path::PathBuf> {
+    native(snapshot, game).map_or(snapshot.settings.game_exe.as_ref(), |state| {
+        state.executable.as_ref()
+    })
+}
+
 pub(super) fn saves_match(snapshot: &Snapshot, game: GameId) -> bool {
     snapshot.ready
         && if let Some(state) = native(snapshot, game) {
@@ -165,6 +171,7 @@ pub(super) fn management_available(snapshot: &Snapshot) -> bool {
 
 pub(super) fn configuration_available(snapshot: &Snapshot) -> bool {
     !snapshot.install_busy
+        && !snapshot.source.busy
         && !snapshot.texture_busy
         && !snapshot.self_updates.preparing
         && snapshot.source.preferences_valid
@@ -751,6 +758,21 @@ mod tests {
         let snapshot = backend.snapshot()?;
         backend.command(crate::runtime::Command::Shutdown)?;
         Ok(snapshot)
+    }
+
+    #[test]
+    fn source_work_locks_build_configuration_even_without_the_install_flag() -> Result<()> {
+        let mut snapshot = snapshot()?;
+        assert!(configuration_available(&snapshot));
+        snapshot.source.busy = true;
+        snapshot.source.building = true;
+        snapshot.install_busy = false;
+        assert!(!configuration_available(&snapshot));
+        assert!(!can_locate(&snapshot, GameId::Triforce));
+        snapshot.source.busy = false;
+        snapshot.source.building = false;
+        assert!(configuration_available(&snapshot));
+        Ok(())
     }
 
     #[test]

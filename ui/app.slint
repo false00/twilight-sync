@@ -197,6 +197,12 @@ export component MainWindow inherits Window {
     in-out property <int> branch-choice: -1;
     in property <bool> source-mode;
     in property <bool> source-busy;
+    in property <bool> source-building;
+    in property <bool> build-complete;
+    in property <bool> build-needs-activation;
+    in property <int> build-result-game;
+    in property <string> build-result-detail;
+    in-out property <bool> build-result-dismissed: false;
     in property <bool> operation-busy;
     in property <bool> preferences-valid: true;
     in property <bool> has-built;
@@ -213,6 +219,16 @@ export component MainWindow inherits Window {
     in property <string> source-message;
     in property <string> source-error;
     in property <string> source-log;
+    in property <bool> source-progress-visible;
+    in property <bool> source-progress-known;
+    in property <float> source-progress;
+    in property <string> source-elapsed;
+    in property <string> source-work;
+    in property <string> source-eta;
+    in property <string> source-rate;
+    in property <string> source-activity;
+    in property <string> source-activity-status;
+    in-out property <bool> show-source-activity: false;
     in property <string> source-blocker;
     in property <string> source-input;
     in property <string> source-update;
@@ -306,6 +322,8 @@ export component MainWindow inherits Window {
         Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
     }
     changed section => { main-scroll.content-y = 0px; }
+    changed build-complete => { root.build-result-dismissed = false; }
+    changed build-needs-activation => { root.build-result-dismissed = false; }
     changed selected-game => {
         main-scroll.content-y = 0px; root.setup-step = 0;
         root.extra-game-inputs = false;
@@ -351,6 +369,33 @@ export component MainWindow inherits Window {
             }
         }
         Rectangle { height: 1px; background: Theme.line; }
+        if root.build-complete && !root.build-result-dismissed: Rectangle {
+            background: root.build-needs-activation ? Theme.warning-fill : Theme.dark ? #74d99a14 : #e9f7ee;
+            border-width: 1px;
+            border-color: root.build-needs-activation ? Theme.warning : Theme.success;
+            HorizontalLayout {
+                padding-left: 24px; padding-right: 24px; padding-top: 12px; padding-bottom: 12px; spacing: 12px;
+                VerticalLayout {
+                    horizontal-stretch: 1; spacing: 4px;
+                    Text {
+                        text: root.build-needs-activation ? "Build finished — activation required" : "Build completed successfully";
+                        color: root.build-needs-activation ? Theme.warning : Theme.success;
+                        font-size: 20px; font-weight: 700; wrap: word-wrap; min-width: 0px;
+                    }
+                    Muted { text: root.build-result-detail; min-width: 0px; }
+                }
+                ActionButton {
+                    text: !root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? "Go to Play" : "View build";
+                    primary: true; horizontal-stretch: 0;
+                    clicked => {
+                        root.section = !root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? 0 : 1;
+                        root.selected-game = root.build-result-game;
+                        root.game-selected(root.build-result-game);
+                    }
+                }
+                ActionButton { text: "Dismiss"; subtle: true; horizontal-stretch: 0; clicked => { root.build-result-dismissed = true; } }
+            }
+        }
         HorizontalLayout {
             spacing: 0px;
             Rectangle {
@@ -533,16 +578,56 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: root.sdk-busy ? "Installing build prerequisites" : root.operation-busy ? "Getting your adventure ready" : root.source-error == "" ? "Build status" : "Let's resolve this"; }
-                                if root.operation-busy: ProgressIndicator { indeterminate: true; }
+                                if root.operation-busy: ProgressIndicator {
+                                    indeterminate: !root.source-busy || !root.source-progress-visible || !root.source-progress-known;
+                                    progress: root.source-progress;
+                                }
                                 Text { text: root.source-message; color: Theme.text; wrap: char-wrap; min-width: 0px; }
                                 if root.source-error != "": Text { text: root.source-error; color: Theme.danger; wrap: char-wrap; min-width: 0px; }
+                                if root.source-building: Muted {
+                                    text: "Build settings and game inputs are locked until this build finishes or is cancelled. You can still browse other pages.";
+                                    color: Theme.accent;
+                                }
+                                if root.source-progress-visible: VerticalLayout {
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            Muted { text: root.source-busy ? "TOTAL ELAPSED" : "TOTAL TIME"; }
+                                            Text { text: root.source-elapsed; color: Theme.text; font-size: 20px; wrap: char-wrap; min-width: 0px; }
+                                        }
+                                        if root.source-busy: VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            Muted { text: "ESTIMATED STAGE LEFT"; }
+                                            Text { text: root.source-eta; color: Theme.text; font-size: 20px; wrap: char-wrap; min-width: 0px; }
+                                        }
+                                    }
+                                    if root.source-busy: Text { text: root.source-work; color: Theme.text; wrap: char-wrap; min-width: 0px; }
+                                    if root.source-busy && root.source-rate != "": Muted { text: root.source-rate; }
+                                    if root.source-busy: Muted { text: "Estimates cover this stage, not the whole build. Later stages may take additional time."; }
+                                    if root.source-busy && root.source-activity-status != "": Muted { text: root.source-activity-status; }
+                                }
                                 Muted { text: root.sdk-busy ? "Complete any installer, license or Windows approval prompts. Keep the installer open until it finishes; SDK installation cannot be cancelled as a game build." : "Previous installations and saves stay intact until verification succeeds."; }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Open build log"; available: root.source-log != ""; clicked => { root.action(Action.open-log, 0); } }
+                                    ActionButton { text: root.show-source-activity ? "Hide live activity" : "Show live activity"; clicked => { root.show-source-activity = !root.show-source-activity; } }
                                     if root.source-busy && !root.sdk-busy: ActionButton { text: "Cancel safely"; clicked => { root.action(Action.cancel-source, 0); } }
-                                    if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
                                 }
+                                if root.show-source-activity: VerticalLayout {
+                                    spacing: 10px;
+                                    Muted { text: "LATEST ACTIVITY · NEWEST FIRST"; }
+                                    ScrollView {
+                                        height: 170px;
+                                        Text {
+                                            text: root.source-activity == "" ? "Live output will appear here as build tools report it. Vendor SDK installers may use their own windows." : root.source-activity;
+                                            color: Theme.text; font-family: "Consolas"; font-size: 12px;
+                                            wrap: char-wrap; min-width: 0px;
+                                        }
+                                    }
+                                    ActionButton { text: "Open full log externally"; available: root.source-log != ""; subtle: true; clicked => { root.action(Action.open-log, 0); } }
+                                }
+                                if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
                             }
                         }
                         if !root.preferences-valid: Surface {
@@ -691,7 +776,7 @@ export component MainWindow inherits Window {
                                 if root.source-blocker != "": Muted { text: root.source-blocker; }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: "Build & install"; primary: true; available: root.source-ready; clicked => { root.action(Action.build-source, 0); } }
+                                    ActionButton { text: "Build & install"; primary: true; available: root.source-ready && !root.source-busy; clicked => { root.action(Action.build-source, 0); } }
                                 }
                             }
                         }

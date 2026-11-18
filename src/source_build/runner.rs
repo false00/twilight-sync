@@ -1,4 +1,7 @@
-use super::{Cancelled, check_cancelled};
+use super::{
+    Cancelled, check_cancelled,
+    progress::{Reader, Update},
+};
 use crate::files::ensure_safe_path;
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -8,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::AtomicBool,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn failure_summary(path: &Path) -> Result<String> {
@@ -46,14 +49,14 @@ fn failure_summary(path: &Path) -> Result<String> {
 pub(super) struct Runner<'a> {
     pub log: PathBuf,
     pub cancel: &'a AtomicBool,
-    progress: &'a mut dyn FnMut(String) -> Result<()>,
+    progress: &'a mut dyn FnMut(Update) -> Result<()>,
 }
 
 impl<'a> Runner<'a> {
     pub fn new(
         log: &Path,
         cancel: &'a AtomicBool,
-        progress: &'a mut dyn FnMut(String) -> Result<()>,
+        progress: &'a mut dyn FnMut(Update) -> Result<()>,
     ) -> Result<Self> {
         ensure_safe_path(log)?;
         File::create_new(log)?;
@@ -70,7 +73,7 @@ impl<'a> Runner<'a> {
             OpenOptions::new().append(true).open(&self.log)?,
             "\n== {text} =="
         )?;
-        (self.progress)(text.into())
+        (self.progress)(Update::Stage(text.into()))
     }
 
     pub fn run(&mut self, command: &mut Command, label: &str) -> Result<()> {
@@ -96,6 +99,9 @@ impl<'a> Runner<'a> {
 
     fn execute(&mut self, command: &mut Command, label: &str, output: File) -> Result<()> {
         self.message(label)?;
+        let mut reader = Reader::new(&self.log, label)?;
+        let started = Instant::now();
+        let mut last_report = Instant::now();
         let configured: Vec<_> = command
             .get_envs()
             .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
@@ -173,7 +179,12 @@ impl<'a> Runner<'a> {
                 return Err(Cancelled.into());
             }
             if let Some(status) = child.try_wait()? {
+                (self.progress)(Update::Output(reader.finish(started.elapsed())?))?;
                 break status;
+            }
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                (self.progress)(Update::Output(reader.poll(started.elapsed())?))?;
+                last_report = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -194,6 +205,57 @@ impl<'a> Runner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn build_output_is_reported_before_the_child_can_finish() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let acknowledgement = temp.path().join("progress-received");
+        let cancel = AtomicBool::new(false);
+        let mut observed = false;
+        let mut progress = |update| {
+            if let Update::Output(report) = update
+                && report.completed == Some(1)
+            {
+                fs::write(&acknowledgement, b"received")?;
+                observed = true;
+            }
+            Ok(())
+        };
+        let mut runner = Runner::new(&temp.path().join("build.log"), &cancel, &mut progress)?;
+        runner.run(
+            Command::new(std::env::current_exe()?)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "source_build::runner::tests::live_output_fixture",
+                    "--nocapture",
+                ])
+                .env("TS_PROGRESS_FIXTURE_ACK", &acknowledgement),
+            "Checking live subprocess progress",
+        )?;
+        assert!(observed, "Progress only arrived after the child exited");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Child process fixture for live build-output tests"]
+    fn live_output_fixture() -> Result<()> {
+        let acknowledgement = std::env::var_os("TS_PROGRESS_FIXTURE_ACK")
+            .context("This fixture must be run by its parent test")?;
+        println!("[1/2] Compiling fixture");
+        std::io::stdout().flush()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !Path::new(&acknowledgement).exists() {
+            ensure!(
+                Instant::now() < deadline,
+                "No live progress reached the parent"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        println!("[2/2] Fixture complete");
+        Ok(())
+    }
 
     #[test]
     fn compiler_errors_are_not_lost_behind_parallel_build_progress() -> Result<()> {

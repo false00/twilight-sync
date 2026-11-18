@@ -304,7 +304,7 @@ enum Input {
     },
     SourceProgress {
         game: protocol::GameId,
-        message: String,
+        update: source_build::progress::Update,
     },
     SourceToolsReady {
         game: protocol::GameId,
@@ -1111,6 +1111,15 @@ impl Engine {
     }
 
     fn input(&mut self, input: Input) -> Result<()> {
+        if matches!(
+            &input,
+            Input::SourceChecked { .. }
+                | Input::SourceToolsReady { .. }
+                | Input::SourceSdkReady { .. }
+                | Input::SourceBuilt { .. }
+        ) {
+            self.source.progress.finish();
+        }
         match input {
             Input::Command(command) => {
                 ensure!(
@@ -1333,12 +1342,12 @@ impl Engine {
                     }
                 }
             }
-            Input::SourceProgress { game, message } => {
+            Input::SourceProgress { game, update } => {
                 ensure!(
                     self.source.busy && self.source.game == Some(game),
                     "Unexpected source-build progress"
                 );
-                self.source.message = message;
+                self.source.message = self.source.progress.apply(update);
                 Ok(())
             }
             Input::SourceToolsReady { game, result } => {
@@ -1414,8 +1423,12 @@ impl Engine {
                 match result {
                     Ok(built) => {
                         self.source.built = Some(built.clone());
+                        self.source.completion =
+                            Some(source_build::Completion::NeedsActivation(game));
                         match self.activate_source(&built) {
                             Ok(()) => {
+                                self.source.completion =
+                                    Some(source_build::Completion::Ready(game));
                                 self.source.error = None;
                                 self.source.message = format!(
                                     "{} built from commit {} and selected. Previous installations were retained; normal gameplay was not started.",
@@ -2079,6 +2092,8 @@ impl Engine {
         self.source.game = Some(game);
         self.source.busy = true;
         self.source.building = building;
+        self.source.progress.start();
+        self.source.completion = None;
         self.source.sdk_setup = None;
         self.source.error = None;
         self.install_busy = true;
@@ -2287,9 +2302,9 @@ impl Engine {
                 let cancel = self.source_cancel.clone();
                 thread::spawn(move || {
                     let result =
-                        source_build::prepare_tools(&root, game, &log, &cancel, &mut |message| {
+                        source_build::prepare_tools(&root, game, &log, &cancel, &mut |update| {
                             sender
-                                .send(Input::SourceProgress { game, message })
+                                .send(Input::SourceProgress { game, update })
                                 .context("Source progress receiver stopped")
                         });
                     if sender
@@ -2330,7 +2345,10 @@ impl Engine {
                     let result = setup
                         .run(&log, &mut |message| {
                             sender
-                                .send(Input::SourceProgress { game, message })
+                                .send(Input::SourceProgress {
+                                    game,
+                                    update: source_build::progress::Update::Stage(message),
+                                })
                                 .context("SDK setup progress receiver stopped")
                         })
                         .and_then(|outcome| Ok((outcome, source_build::prerequisites(game)?)));
@@ -2377,7 +2395,7 @@ impl Engine {
                 let log = source_build::new_log(&self.root, game)?;
                 self.begin_source_operation(game, true)?;
                 self.source.log = Some(log.clone());
-                self.source.message = "Preparing an approved source build. Play and save sync are paused until it finishes or is cancelled.".into();
+                self.source.message = "Preparing an approved source build. Your paired PC can keep playing; existing saves and play reservations remain protected.".into();
                 let root = self.root.clone();
                 let sender = self.sender.clone();
                 let cancel = self.source_cancel.clone();
@@ -2393,9 +2411,9 @@ impl Engine {
                             log,
                         },
                         &cancel,
-                        &mut |message| {
+                        &mut |update| {
                             sender
-                                .send(Input::SourceProgress { game, message })
+                                .send(Input::SourceProgress { game, update })
                                 .context("Source progress receiver stopped")
                         },
                     );
@@ -2423,6 +2441,7 @@ impl Engine {
                     .filter(|built| built.game == game)
                     .context("There is no completed source build for this game")?;
                 self.activate_source(&built)?;
+                self.source.completion = Some(source_build::Completion::Ready(game));
                 self.source.error = None;
                 self.source.message =
                     "The completed source build is now selected; progress was verified unchanged."
@@ -6912,9 +6931,12 @@ mod tests {
         let before = harness.left.current_hash()?;
         let settings = fs::read(harness.left.root.join("settings.json"))?;
         for cancelled in [false, true] {
+            harness.left.source.completion =
+                Some(source_build::Completion::Ready(protocol::GameId::Triforce));
             harness
                 .left
                 .begin_source_operation(protocol::GameId::Triforce, true)?;
+            assert!(harness.left.source.completion.is_none());
             let error = if cancelled {
                 anyhow::Error::new(source_build::Cancelled)
             } else {
@@ -6932,9 +6954,63 @@ mod tests {
             );
             assert!(!harness.left.totk.status.updating && !harness.left.triforce.status.updating);
             assert!(harness.left.source.built.is_none());
+            assert!(harness.left.source.completion.is_none());
             assert_eq!(harness.left.current_hash()?, before);
             assert_eq!(fs::read(harness.left.root.join("settings.json"))?, settings);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_completed_build_with_blocked_activation_is_not_reported_ready() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let before = harness.left.current_hash()?;
+        let game = protocol::GameId::Triforce;
+        harness.left.begin_source_operation(game, true)?;
+        harness.left.settings.play_lock = Some(crate::config::PlayLock {
+            owner: harness.left.identity.public.clone(),
+            token: "a".repeat(64),
+        });
+        let built = source_build::Built {
+            game,
+            executable: harness.left.root.join("staged-game.exe"),
+            directory: harness.left.root.join("staged-game"),
+            tag: "v1.0.0-test".into(),
+            commit: "a".repeat(40),
+            sha256: "b".repeat(64),
+            source: harness.left.root.join("source"),
+            log: harness.left.root.join("build.log"),
+            expected_save: None,
+        };
+        let result = harness.left.input(Input::SourceBuilt {
+            game,
+            result: Ok(built),
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            harness.left.source.completion,
+            Some(source_build::Completion::NeedsActivation(game))
+        );
+        assert!(harness.left.source.built.is_some());
+        assert!(
+            harness
+                .left
+                .source
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("activation needs attention"))
+        );
+        assert!(
+            harness
+                .left
+                .command(Command::ActivateSourceBuild(game))
+                .is_err()
+        );
+        assert_eq!(
+            harness.left.source.completion,
+            Some(source_build::Completion::NeedsActivation(game))
+        );
+        assert_eq!(harness.left.current_hash()?, before);
         Ok(())
     }
 

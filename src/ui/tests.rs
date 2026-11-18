@@ -47,6 +47,195 @@ fn fixture() -> Result<MainWindow> {
 }
 
 #[test]
+fn source_progress_and_live_activity_fit_handhelds_and_keep_actions_in_app() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_section(1);
+    ui.set_source_busy(true);
+    ui.set_source_building(true);
+    ui.set_operation_busy(true);
+    ui.set_source_progress_visible(true);
+    ui.set_source_message("Preparing shaders for Ocarina of Time".into());
+    ui.set_source_elapsed("1h 12m 34s".into());
+    ui.set_source_eta("About 23m 45s".into());
+    ui.set_source_work("360 / 500 modules (72.0% of stage work)".into());
+    ui.set_source_log(r"C:\Build logs\oot.log".into());
+    ui.set_source_activity("Compiling code_009.c\nPreparing shaders".into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    for dark in [false, true] {
+        ui.set_dark_mode(dark);
+        for width in [720.0, 900.0, 1200.0] {
+            ui.window().set_size(slint::LogicalSize::new(width, 1800.0));
+            for known in [false, true] {
+                ui.set_source_progress_known(known);
+                ui.set_source_progress(0.72);
+                ui.set_show_source_activity(false);
+                flush();
+                assert!(
+                    ElementHandle::find_by_accessible_label(&ui, "Open full log externally")
+                        .next()
+                        .is_none()
+                );
+                activate(&ui, "Show live activity")?;
+                assert!(ui.get_show_source_activity());
+                assert!(
+                    actions.borrow().is_empty(),
+                    "Live activity launched an external log viewer"
+                );
+                for label in [
+                    "Hide live activity",
+                    "Cancel safely",
+                    "Open full log externally",
+                ] {
+                    let element = button(&ui, label)?;
+                    let position = element.absolute_position();
+                    let size = element.size();
+                    ensure!(
+                        position.x >= 0.0 && position.x + size.width <= width + 1.0,
+                        "{label} overflows at {width}px: {position:?} {size:?}"
+                    );
+                    ensure!(
+                        size.height >= 44.0,
+                        "Build controls lost their touch target"
+                    );
+                }
+                activate(&ui, "Hide live activity")?;
+            }
+        }
+    }
+    ui.window().set_size(slint::LogicalSize::new(720.0, 720.0));
+    flush();
+    let cancel = button(&ui, "Cancel safely")?;
+    ensure!(
+        cancel.absolute_position().y + cancel.size().height <= 720.0,
+        "Cancel is offscreen on a handheld"
+    );
+    activate(&ui, "Cancel safely")?;
+    assert_eq!(&*actions.borrow(), &[(Action::CancelSource, 0)]);
+    actions.borrow_mut().clear();
+    ui.set_source_busy(false);
+    ui.set_source_building(false);
+    ui.set_operation_busy(false);
+    ui.set_has_built(true);
+    ui.set_source_message("Build completed".into());
+    flush();
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Cancel safely")
+            .next()
+            .is_none()
+    );
+    activate(&ui, "Use completed build")?;
+    assert_eq!(&*actions.borrow(), &[(Action::UseBuilt, 0)]);
+    Ok(())
+}
+
+#[test]
+fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> Result<()> {
+    let ui = fixture()?;
+    ui.window().set_size(slint::LogicalSize::new(900.0, 2000.0));
+    ui.set_section(1);
+    ui.set_selected_game(2);
+    flush();
+    ui.set_setup_step(2);
+    ui.set_source_mode(true);
+    ui.set_source_tag("v1.0.0-test".into());
+    ui.set_source_message("Compiling Ocarina of Time".into());
+    ui.set_source_busy(true);
+    ui.set_source_building(true);
+    ui.set_operation_busy(true);
+    ui.set_source_ready(true);
+    ui.set_can_manage(false);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    let toggles = Rc::new(RefCell::new(Vec::new()));
+    let recorded = toggles.clone();
+    ui.on_toggle(move |toggle, value| recorded.borrow_mut().push((toggle, value)));
+    flush();
+    activate(&ui, "Build & install")?;
+    activate(&ui, "Build from source")?;
+    let approval = ElementHandle::find_by_accessible_label(
+        &ui,
+        "I reviewed the source and approve this build",
+    )
+    .next()
+    .context("Missing locked build approval")?;
+    approval.invoke_accessible_default_action();
+    assert!(actions.borrow().is_empty());
+    assert!(toggles.borrow().is_empty());
+    activate(&ui, "Devices")?;
+    assert_eq!(ui.get_section(), 2);
+    activate(&ui, "Game setup")?;
+    assert_eq!(ui.get_section(), 1);
+    ui.set_source_busy(false);
+    ui.set_source_building(false);
+    ui.set_operation_busy(false);
+    ui.set_can_manage(true);
+    ui.set_build_result_game(2);
+    ui.set_source_message("Build verified and selected".into());
+    ui.set_build_result_detail(
+        "Ocarina of Time — your built copy is installed and selected.".into(),
+    );
+    ui.set_build_complete(true);
+    flush();
+    for dark in [false, true] {
+        ui.set_dark_mode(dark);
+        for width in [720.0, 900.0, 1200.0] {
+            ui.window().set_size(slint::LogicalSize::new(width, 720.0));
+            flush();
+            let success =
+                ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+                    .next()
+                    .context("Build completion is not visible")?;
+            ensure!(
+                success.absolute_position().y + success.size().height < 720.0,
+                "Completion disappeared below the handheld viewport"
+            );
+            let action = button(&ui, "Go to Play")?;
+            ensure!(
+                action.absolute_position().x + action.size().width <= width + 1.0,
+                "Completion action overflows"
+            );
+        }
+    }
+    activate(&ui, "Go to Play")?;
+    assert_eq!(ui.get_section(), 0);
+    assert!(
+        actions.borrow().is_empty(),
+        "Completion started a game without a play reservation"
+    );
+    activate(&ui, "View build")?;
+    assert_eq!(ui.get_section(), 1);
+    ui.set_selected_game(1);
+    flush();
+    activate(&ui, "View build")?;
+    assert_eq!(ui.get_section(), 1);
+    assert_eq!(ui.get_selected_game(), 2);
+    activate(&ui, "Dismiss")?;
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+            .next()
+            .is_none()
+    );
+    ui.set_build_needs_activation(true);
+    flush();
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Build finished — activation required")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+            .next()
+            .is_none()
+    );
+    activate(&ui, "View build")?;
+    assert_eq!(ui.get_section(), 1);
+    Ok(())
+}
+
+#[test]
 fn game_file_setup_routes_each_games_inputs_and_clear_actions() -> Result<()> {
     let ui = fixture()?;
     ui.window()

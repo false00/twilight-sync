@@ -420,6 +420,10 @@ impl Controller {
         self.local_error = None;
         match toggle {
             Toggle::SourceConsent => {
+                ensure!(
+                    !self.snapshot.install_busy && !self.snapshot.source.busy,
+                    "Finish or cancel the current build before changing its approval"
+                );
                 if value {
                     let plan = self
                         .snapshot
@@ -1474,11 +1478,9 @@ impl Controller {
                 .unwrap_or_default()
                 .into(),
         );
+        let selected_executable = model::executable(snapshot, game);
         ui.set_installed_executable(
-            model::native(snapshot, game)
-                .map_or(snapshot.settings.game_exe.as_ref(), |state| {
-                    state.executable.as_ref()
-                })
+            selected_executable
                 .map(|path| path.display().to_string())
                 .unwrap_or_default()
                 .into(),
@@ -1614,17 +1616,93 @@ impl Controller {
                 .into(),
         );
         let same_game = snapshot.source.game == Some(game);
+        ui.set_source_building(snapshot.source.building);
+        let completion_current = match snapshot.source.completion {
+            Some(source_build::Completion::Ready(completed_game)) => {
+                snapshot.source.built.as_ref().is_some_and(|built| {
+                    built.game == completed_game
+                        && model::executable(snapshot, completed_game) == Some(&built.executable)
+                })
+            }
+            Some(source_build::Completion::NeedsActivation(_)) => true,
+            None => false,
+        };
+        ui.set_build_complete(!snapshot.source.busy && completion_current);
+        ui.set_build_needs_activation(matches!(
+            snapshot.source.completion,
+            Some(source_build::Completion::NeedsActivation(_))
+        ));
+        if let Some(completion) = snapshot.source.completion {
+            let (completed_game, ready) = match completion {
+                source_build::Completion::Ready(game) => (game, true),
+                source_build::Completion::NeedsActivation(game) => (game, false),
+            };
+            ui.set_build_result_game(model::index(completed_game));
+            ui.set_build_result_detail(format!("{} — {}", model::title(completed_game),
+                if ready {
+                    "Your built copy is installed and selected. Open Play when you're ready; the game was not started automatically."
+                } else {
+                    "Game files were built, but activation needs attention before this copy can be used. View the build to resolve it safely."
+                }).into());
+        }
+        let progress = &snapshot.source.progress;
+        let report = &progress.report;
+        ui.set_source_progress_visible(
+            progress.started.is_some()
+                && (same_game || snapshot.source.busy)
+                && (!snapshot.install_busy || snapshot.source.busy),
+        );
+        ui.set_source_progress_known(report.fraction.is_some());
+        ui.set_source_progress(report.fraction.unwrap_or_default() as f32);
+        ui.set_source_elapsed(source_build::progress::duration_text(progress.elapsed()).into());
+        ui.set_source_work(report.work_text().into());
+        ui.set_source_eta(
+            report
+                .eta
+                .map(|eta| format!("About {}", source_build::progress::duration_text(eta)))
+                .unwrap_or_else(|| {
+                    if report.stalled {
+                        "Re-estimating".into()
+                    } else {
+                        "Estimating…".into()
+                    }
+                })
+                .into(),
+        );
+        ui.set_source_rate(
+            report
+                .rate
+                .map(|rate| {
+                    if report.unit == "bytes" {
+                        format!("{:.1} MiB/s", rate / (1024.0 * 1024.0))
+                    } else {
+                        format!("{rate:.1} {}/s", report.unit)
+                    }
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_source_activity(report.activity.clone().into());
+        ui.set_source_activity_status(
+            if report.quiet_for >= Duration::from_secs(30) {
+                format!("No new tool output for {}. Some steps work silently; this does not mean they have stopped.",
+                    source_build::progress::duration_text(report.quiet_for))
+            } else if report.stalled {
+                "The tool is active, but its progress counter has not advanced recently. The estimate will return when it does.".into()
+            } else {
+                String::new()
+            }.into(),
+        );
         ui.set_tools_missing(
             same_game && snapshot.source.prerequisites.iter().any(|tool| !tool.ready),
         );
         ui.set_source_busy(snapshot.source.busy);
-        ui.set_has_built(
-            snapshot
-                .source
-                .built
-                .as_ref()
-                .is_some_and(|built| built.game == game),
-        );
+        ui.set_has_built(snapshot.source.built.as_ref().is_some_and(|built| {
+            built.game == game
+                && (snapshot.source.completion
+                    == Some(source_build::Completion::NeedsActivation(game))
+                    || selected_executable != Some(&built.executable))
+        }));
         ui.set_sdk_busy(snapshot.source.sdk_setup.is_some());
         ui.set_source_message(
             if same_game || snapshot.source.busy {

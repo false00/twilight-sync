@@ -1,3 +1,4 @@
+pub mod progress;
 mod recipes;
 mod runner;
 mod setup;
@@ -226,6 +227,14 @@ pub struct State {
     pub error: Option<String>,
     pub log: Option<PathBuf>,
     pub built: Option<Built>,
+    pub progress: progress::State,
+    pub completion: Option<Completion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Ready(GameId),
+    NeedsActivation(GameId),
 }
 
 impl State {
@@ -561,7 +570,7 @@ pub fn prepare_tools(
     game: GameId,
     log: &Path,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(String) -> Result<()>,
+    progress: &mut dyn FnMut(progress::Update) -> Result<()>,
 ) -> Result<()> {
     let mut runner = Runner::new(log, cancel, progress)?;
     let mut tools = Toolset::new(root)?;
@@ -777,7 +786,7 @@ pub fn stage_configured(
     approved_commit: &str,
     jobs: u8,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(String) -> Result<()>,
+    progress: &mut dyn FnMut(progress::Update) -> Result<()>,
 ) -> Result<Built> {
     let root = crate::config::root_directory()?;
     let _instance = crate::config::acquire_instance(&root)?;
@@ -841,7 +850,7 @@ pub fn build(
     root: &Path,
     request: Request,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(String) -> Result<()>,
+    progress: &mut dyn FnMut(progress::Update) -> Result<()>,
 ) -> Result<Built> {
     ensure!(
         request.approved,
