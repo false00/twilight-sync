@@ -9,12 +9,35 @@ use std::{
 pub const OPEN_ARGUMENT: &str = "--open-dusklight";
 pub const OPEN_TOTK_ARGUMENT: &str = "--open-totk";
 pub const OPEN_TRIFORCE_ARGUMENT: &str = "--open-triforce";
-const SHORTCUT_NAME: &str = "Dusklight (Twilight Sync).lnk";
-const RECEIPT_NAME: &str = "dusklight-desktop-shortcut.json";
+const SHORTCUT_NAME: &str = "Twilight Sync.lnk";
+const RECEIPT_NAME: &str = "desktop-shortcut.json";
+const LEGACY: [(&str, &str); 3] = [
+    (
+        "Dusklight (Twilight Sync).lnk",
+        "dusklight-desktop-shortcut.json",
+    ),
+    (
+        "Tears of the Kingdom (Twilight Sync).lnk",
+        "totk-desktop-shortcut.json",
+    ),
+    (
+        "Ocarina of Time (Twilight Sync).lnk",
+        "triforce-desktop-shortcut.json",
+    ),
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
+    version: u8,
+    shortcut: PathBuf,
+    manager: PathBuf,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyReceipt {
     version: u8,
     shortcut: PathBuf,
     manager: PathBuf,
@@ -30,30 +53,13 @@ struct LinkDetails {
     icon: String,
 }
 
-pub fn install_dusklight_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
+pub fn install_shortcut(root: &Path) -> Result<PathBuf> {
     ensure!(cfg!(windows), "Desktop shortcuts require Windows");
     let user = directories::UserDirs::new().context("Cannot locate the current user's folders")?;
     let desktop = user
         .desktop_dir()
         .context("Windows did not return a desktop folder")?;
-    create(root, desktop, &std::env::current_exe()?, game)
-}
-
-pub fn install_totk_shortcut(root: &Path, game: &Path) -> Result<PathBuf> {
-    install_game_shortcut(root, game, crate::protocol::GameId::Totk)
-}
-
-pub fn install_game_shortcut(
-    root: &Path,
-    game: &Path,
-    selected: crate::protocol::GameId,
-) -> Result<PathBuf> {
-    ensure!(cfg!(windows), "Desktop shortcuts require Windows");
-    let user = directories::UserDirs::new().context("Cannot locate the current user's folders")?;
-    let desktop = user
-        .desktop_dir()
-        .context("Windows did not return a desktop folder")?;
-    create_game(root, desktop, &std::env::current_exe()?, game, selected)
+    create(root, desktop, &std::env::current_exe()?)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -88,49 +94,55 @@ fn same_path(actual: &Path, expected: &Path) -> Result<bool> {
             .context("Resolving expected shortcut path")?)
 }
 
-fn create(root: &Path, desktop: &Path, manager: &Path, game: &Path) -> Result<PathBuf> {
-    create_game(
-        root,
-        desktop,
-        manager,
-        game,
-        crate::protocol::GameId::Dusklight,
-    )
+fn verify_link(details: &LinkDetails, manager: &Path) -> Result<()> {
+    ensure!(
+        same_path(&details.target, manager)?,
+        "The desktop shortcut targets a different app; it was not overwritten"
+    );
+    ensure!(
+        details.arguments.is_empty(),
+        "The desktop shortcut has custom arguments; it was not overwritten"
+    );
+    ensure!(
+        same_path(
+            &details.working,
+            manager.parent().context("Manager has no parent folder")?
+        )?,
+        "The desktop shortcut has a custom working directory; it was not overwritten"
+    );
+    let (icon, index) = details
+        .icon
+        .rsplit_once(',')
+        .context("The desktop shortcut icon has no resource index")?;
+    let icon = icon
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap_or(icon);
+    ensure!(
+        index == "0" && same_path(Path::new(icon), manager)?,
+        "The desktop shortcut has a custom icon; it was not overwritten"
+    );
+    Ok(())
 }
 
-fn create_game(
-    root: &Path,
-    desktop: &Path,
-    manager: &Path,
-    game: &Path,
-    selected: crate::protocol::GameId,
-) -> Result<PathBuf> {
-    let (shortcut_name, receipt_name, argument) = match selected {
-        crate::protocol::GameId::Dusklight => (SHORTCUT_NAME, RECEIPT_NAME, OPEN_ARGUMENT),
-        crate::protocol::GameId::Totk => (
-            "Tears of the Kingdom (Twilight Sync).lnk",
-            "totk-desktop-shortcut.json",
-            OPEN_TOTK_ARGUMENT,
-        ),
-        crate::protocol::GameId::Triforce => (
-            "Ocarina of Time (Twilight Sync).lnk",
-            "triforce-desktop-shortcut.json",
-            OPEN_TRIFORCE_ARGUMENT,
-        ),
-    };
-    let destination = desktop.join(shortcut_name);
-    let receipt_path = root.join(receipt_name);
-    for path in [root, desktop, manager, game, &destination, &receipt_path] {
+fn create(root: &Path, desktop: &Path, manager: &Path) -> Result<PathBuf> {
+    let path = create_master(root, desktop, manager)?;
+    retire_legacy(root, desktop)
+        .context("The Twilight Sync shortcut is ready, but old game shortcuts need attention")?;
+    Ok(path)
+}
+
+fn create_master(root: &Path, desktop: &Path, manager: &Path) -> Result<PathBuf> {
+    let destination = desktop.join(SHORTCUT_NAME);
+    let receipt_path = root.join(RECEIPT_NAME);
+    for path in [root, desktop, manager, &destination, &receipt_path] {
         ensure_safe_path(path)?;
     }
     ensure!(
         root.is_dir() && desktop.is_dir(),
         "Shortcut folders must already exist"
     );
-    ensure!(
-        manager.is_file() && game.is_file(),
-        "Shortcut executables are missing"
-    );
+    ensure!(manager.is_file(), "The Twilight Sync executable is missing");
     let old_receipt = if receipt_path.try_exists()? {
         Some(read_bounded(&receipt_path, 16 * 1024)?)
     } else {
@@ -142,58 +154,55 @@ fn create_game(
         .transpose()?;
     if let Some(receipt) = &receipt {
         ensure!(
-            receipt.version == 1 && valid_hash(&receipt.sha256),
-            "Invalid desktop shortcut receipt"
+            receipt.version == 2 && valid_hash(&receipt.sha256) && receipt.shortcut == destination,
+            "Invalid Twilight Sync desktop shortcut receipt"
         );
     }
     let previous = if destination.try_exists()? {
-        let receipt = receipt.as_ref().context(
-            "An unmanaged Dusklight desktop shortcut already exists; it was not overwritten",
-        )?;
-        let bytes = read_bounded(&destination, 64 * 1024)?;
-        ensure!(
-            receipt.shortcut == destination && receipt.sha256 == sha256(&bytes),
-            "The Dusklight desktop shortcut was modified; it was not overwritten"
-        );
-        if receipt.manager == manager && receipt.game == game {
-            return Ok(destination);
-        }
-        Some(bytes)
+        Some(read_bounded(&destination, 64 * 1024)?)
     } else {
         None
     };
+    let owned = receipt.as_ref().is_some_and(|receipt| {
+        previous
+            .as_ref()
+            .is_some_and(|bytes| receipt.sha256 == sha256(bytes))
+    });
+    if owned
+        && receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.manager == manager)
+    {
+        return Ok(destination);
+    }
+    if !owned && let Some(bytes) = &previous {
+        ensure!(
+            bytes.starts_with(&[0x4c, 0, 0, 0]),
+            "An unmanaged or modified desktop shortcut exists; it was not overwritten"
+        );
+        verify_link(&link_details(&destination, None)?, manager)?;
+        ensure!(
+            unchanged(&destination, Some(bytes))?
+                && unchanged(&receipt_path, old_receipt.as_deref())?,
+            "Desktop shortcut changed during verification; no files were overwritten"
+        );
+        // The installer can recreate the same app link without sharing the private receipt.
+        atomic_write(
+            &receipt_path,
+            &serde_json::to_vec_pretty(&Receipt {
+                version: 2,
+                shortcut: destination.clone(),
+                manager: manager.into(),
+                sha256: sha256(bytes),
+            })?,
+        )?;
+        return Ok(destination);
+    }
     let stage = tempfile::Builder::new()
         .prefix(".desktop-shortcut-")
         .tempdir_in(root)?;
-    let staged = stage.path().join("Dusklight.lnk");
-    let details = write_link_argument(&staged, manager, game, argument)?;
-    ensure!(
-        same_path(&details.target, manager)?,
-        "The desktop shortcut target is not the current manager"
-    );
-    ensure!(
-        details.arguments == argument,
-        "The desktop shortcut arguments do not open protected Play controls"
-    );
-    ensure!(
-        same_path(
-            &details.working,
-            manager.parent().context("Manager has no parent folder")?
-        )?,
-        "The desktop shortcut working directory does not match the manager"
-    );
-    let (icon, index) = details
-        .icon
-        .rsplit_once(',')
-        .context("The desktop shortcut icon has no resource index")?;
-    let icon = icon
-        .strip_prefix('"')
-        .and_then(|path| path.strip_suffix('"'))
-        .unwrap_or(icon);
-    ensure!(
-        index == "0" && same_path(Path::new(icon), game)?,
-        "The desktop shortcut icon does not match the installed game"
-    );
+    let staged = stage.path().join(SHORTCUT_NAME);
+    verify_link(&link_details(&staged, Some(manager))?, manager)?;
     let bytes = read_bounded(&staged, 64 * 1024)?;
     ensure!(
         bytes.starts_with(&[0x4c, 0, 0, 0]),
@@ -204,16 +213,14 @@ fn create_game(
             && unchanged(&receipt_path, old_receipt.as_deref())?,
         "Desktop shortcut changed during installation; no files were overwritten"
     );
-    let receipt = Receipt {
-        version: 1,
+    let receipt = serde_json::to_vec_pretty(&Receipt {
+        version: 2,
         shortcut: destination.clone(),
         manager: manager.into(),
-        game: game.into(),
         sha256: sha256(&bytes),
-    };
-    let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+    })?;
     atomic_write(&destination, &bytes)?;
-    if let Err(error) = atomic_write(&receipt_path, &receipt_bytes) {
+    if let Err(error) = atomic_write(&receipt_path, &receipt) {
         let rollback = (|| -> Result<()> {
             ensure!(
                 unchanged(&destination, Some(&bytes))?,
@@ -237,13 +244,50 @@ fn create_game(
     Ok(destination)
 }
 
+fn retire_legacy(root: &Path, desktop: &Path) -> Result<()> {
+    let mut errors = Vec::new();
+    for (name, receipt_name) in LEGACY {
+        if let Err(error) = retire_legacy_link(&desktop.join(name), &root.join(receipt_name)) {
+            errors.push(format!("{name}: {error:#}"));
+        }
+    }
+    ensure!(errors.is_empty(), "{}", errors.join("\n"));
+    Ok(())
+}
+
+fn retire_legacy_link(path: &Path, receipt_path: &Path) -> Result<()> {
+    if !receipt_path.try_exists()? {
+        return Ok(());
+    }
+    let bytes = read_bounded(receipt_path, 16 * 1024)?;
+    let receipt: LegacyReceipt = serde_json::from_slice(&bytes)?;
+    ensure!(
+        receipt.version == 1 && valid_hash(&receipt.sha256) && receipt.shortcut == path,
+        "Invalid legacy shortcut receipt; no legacy shortcut was removed"
+    );
+    if path.try_exists()? {
+        let shortcut = read_bounded(path, 64 * 1024)?;
+        ensure!(
+            sha256(&shortcut) == receipt.sha256,
+            "The old shortcut {} was modified and was preserved",
+            path.display()
+        );
+        ensure!(
+            unchanged(path, Some(&shortcut))? && unchanged(receipt_path, Some(&bytes))?,
+            "Legacy desktop shortcut changed; it was preserved"
+        );
+        fs::remove_file(path)?;
+    }
+    ensure!(
+        unchanged(receipt_path, Some(&bytes))?,
+        "Legacy shortcut receipt changed; it was preserved"
+    );
+    fs::remove_file(receipt_path)?;
+    Ok(())
+}
+
 #[cfg(windows)]
-fn write_link_argument(
-    destination: &Path,
-    manager: &Path,
-    game: &Path,
-    argument: &str,
-) -> Result<LinkDetails> {
+fn link_details(destination: &Path, manager: Option<&Path>) -> Result<LinkDetails> {
     use std::{os::windows::process::CommandExt, process::Command};
     let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -253,14 +297,16 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $null
 try {
     $shortcut = $shell.CreateShortcut($env:TWILIGHT_LINK)
-    $shortcut.TargetPath = $env:TWILIGHT_MANAGER
-    $shortcut.Arguments = $env:TWILIGHT_OPEN_ARGUMENT
-    $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:TWILIGHT_MANAGER)
-    $shortcut.IconLocation = $env:TWILIGHT_GAME + ',0'
-    $shortcut.Description = 'Open the game through Twilight Sync protected Play controls'
-    $shortcut.Save()
-    $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
-    $shortcut = $shell.CreateShortcut($env:TWILIGHT_LINK)
+    if (-not [string]::IsNullOrEmpty($env:TWILIGHT_MANAGER)) {
+        $shortcut.TargetPath = $env:TWILIGHT_MANAGER
+        $shortcut.Arguments = ''
+        $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:TWILIGHT_MANAGER)
+        $shortcut.IconLocation = $env:TWILIGHT_MANAGER + ',0'
+        $shortcut.Description = 'Open Twilight Sync to manage and safely play your games'
+        $shortcut.Save()
+        $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        $shortcut = $shell.CreateShortcut($env:TWILIGHT_LINK)
+    }
     @{target=$shortcut.TargetPath; arguments=$shortcut.Arguments; working=$shortcut.WorkingDirectory; icon=$shortcut.IconLocation} | ConvertTo-Json -Compress
 } finally {
     if ($null -ne $shortcut) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
@@ -273,21 +319,19 @@ try {
     )
     .args(["-NoProfile", "-NonInteractive", "-Command", script])
     .env("TWILIGHT_LINK", destination)
-    .env("TWILIGHT_MANAGER", manager)
-    .env("TWILIGHT_GAME", game)
-    .env("TWILIGHT_OPEN_ARGUMENT", argument)
+    .env("TWILIGHT_MANAGER", manager.unwrap_or_else(|| Path::new("")))
     .creation_flags(0x08000000)
     .output()?;
     ensure!(
         output.status.success(),
-        "Windows desktop shortcut creation failed: {}",
+        "Windows desktop shortcut operation failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     serde_json::from_slice(&output.stdout).context("Invalid Windows desktop shortcut result")
 }
 
 #[cfg(not(windows))]
-fn write_link_argument(_: &Path, _: &Path, _: &Path, _: &str) -> Result<LinkDetails> {
+fn link_details(_: &Path, _: Option<&Path>) -> Result<LinkDetails> {
     anyhow::bail!("Desktop shortcuts require Windows")
 }
 
@@ -300,163 +344,144 @@ mod tests {
         root: PathBuf,
         desktop: PathBuf,
         manager: PathBuf,
-        game: PathBuf,
     }
 
     fn fixture() -> Result<Fixture> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("private");
         let desktop = directory.path().join("redirected desktop");
-        let manager_folder = directory.path().join("Manager's app");
-        let game_folder = directory.path().join("game v1");
-        for path in [&root, &desktop, &manager_folder, &game_folder] {
+        let folder = directory.path().join("Manager's app");
+        for path in [&root, &desktop, &folder] {
             fs::create_dir(path)?;
         }
-        let manager = manager_folder.join("twilight-sync.exe");
-        let game = game_folder.join("dusklight.exe");
+        let manager = folder.join("twilight-sync.exe");
         fs::write(&manager, b"manager fixture - never launched")?;
-        fs::write(&game, b"game fixture - never launched")?;
         Ok(Fixture {
             _directory: directory,
             root,
             desktop,
             manager,
-            game,
         })
     }
 
-    #[test]
-    fn both_games_have_independent_managed_shortcuts_and_receipts() -> Result<()> {
-        let fixture = fixture()?;
-        let dusklight = create(
-            &fixture.root,
-            &fixture.desktop,
-            &fixture.manager,
-            &fixture.game,
+    fn legacy(f: &Fixture, name: &str, receipt_name: &str) -> Result<PathBuf> {
+        let path = f.desktop.join(name);
+        fs::write(&path, b"receipt-owned legacy link fixture")?;
+        atomic_write(
+            &f.root.join(receipt_name),
+            &serde_json::to_vec(&LegacyReceipt {
+                version: 1,
+                shortcut: path.clone(),
+                manager: f.manager.clone(),
+                game: f.root.join("old-game.exe"),
+                sha256: sha256(&fs::read(&path)?),
+            })?,
         )?;
-        let game = fixture
-            .game
-            .parent()
-            .context("Missing fixture folder")?
-            .join("totk.exe");
-        fs::write(&game, b"TotK fixture - never executed")?;
-        let totk = create_game(
-            &fixture.root,
-            &fixture.desktop,
-            &fixture.manager,
-            &game,
-            crate::protocol::GameId::Totk,
-        )?;
-        assert_ne!(dusklight, totk);
-        assert!(fixture.root.join(RECEIPT_NAME).is_file());
-        assert!(fixture.root.join("totk-desktop-shortcut.json").is_file());
-        assert_eq!(
-            create_game(
-                &fixture.root,
-                &fixture.desktop,
-                &fixture.manager,
-                &game,
-                crate::protocol::GameId::Totk
-            )?,
-            totk
-        );
-        Ok(())
+        Ok(path)
     }
 
     #[test]
-    fn managed_desktop_shortcut_is_idempotent_and_tracks_game_updates() -> Result<()> {
+    fn one_app_shortcut_is_idempotent_recreated_and_tracks_app_moves() -> Result<()> {
         let f = fixture()?;
-        let path = create(&f.root, &f.desktop, &f.manager, &f.game)?;
-        let original = fs::read(&path)?;
-        let receipt: Receipt = serde_json::from_slice(&fs::read(f.root.join(RECEIPT_NAME))?)?;
-        assert_eq!(receipt.manager, f.manager);
-        assert_eq!(receipt.game, f.game);
-        assert_eq!(receipt.sha256, sha256(&original));
-        assert_eq!(create(&f.root, &f.desktop, &f.manager, &f.game)?, path);
-        assert_eq!(fs::read(&path)?, original);
-        let next_folder = f.root.join("game v2");
-        fs::create_dir(&next_folder)?;
-        let next = next_folder.join("dusklight.exe");
-        fs::write(&next, b"next game fixture - never launched")?;
-        assert_eq!(create(&f.root, &f.desktop, &f.manager, &next)?, path);
-        let receipt: Receipt = serde_json::from_slice(&fs::read(f.root.join(RECEIPT_NAME))?)?;
-        assert_eq!(receipt.game, next);
-        assert_eq!(receipt.sha256, sha256(&fs::read(path)?));
+        let path = create(&f.root, &f.desktop, &f.manager)?;
+        let bytes = fs::read(&path)?;
+        verify_link(&link_details(&path, None)?, &f.manager)?;
+        assert_eq!(create(&f.root, &f.desktop, &f.manager)?, path);
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(&path)?;
+        create(&f.root, &f.desktop, &f.manager)?;
+        let next = f.root.join("updated-manager.exe");
+        fs::write(&next, b"updated fixture - never executed")?;
+        create(&f.root, &f.desktop, &next)?;
+        verify_link(&link_details(&path, None)?, &next)?;
+        assert_eq!(fs::read_dir(&f.desktop)?.count(), 1);
         Ok(())
     }
 
     #[test]
-    fn shell_link_short_path_aliases_keep_the_same_protected_targets() -> Result<()> {
+    fn app_shortcut_accepts_windows_short_path_aliases() -> Result<()> {
         use std::{os::windows::process::CommandExt, process::Command};
-        #[derive(Deserialize)]
-        struct ShortPaths {
-            manager: PathBuf,
-            game: PathBuf,
-        }
         let f = fixture()?;
         let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
-        let output = Command::new(
-            PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-        )
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $fs=New-Object -ComObject Scripting.FileSystemObject; try { @{manager=$fs.GetFile($env:TWILIGHT_MANAGER).ShortPath; game=$fs.GetFile($env:TWILIGHT_GAME).ShortPath} | ConvertTo-Json -Compress } finally { $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($fs) }",
-        ])
-        .env("TWILIGHT_MANAGER", &f.manager)
-        .env("TWILIGHT_GAME", &f.game)
-        .creation_flags(0x08000000)
-        .output()?;
+        let output = Command::new(PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $fs=New-Object -ComObject Scripting.FileSystemObject; try { $fs.GetFile($env:TWILIGHT_MANAGER).ShortPath | ConvertTo-Json -Compress } finally { $null=[Runtime.InteropServices.Marshal]::FinalReleaseComObject($fs) }"])
+            .env("TWILIGHT_MANAGER", &f.manager).creation_flags(0x08000000).output()?;
         ensure!(
             output.status.success(),
-            "Cannot resolve fixture short paths"
+            "Cannot resolve the fixture's short path"
         );
-        let paths: ShortPaths = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(paths.manager.canonicalize()?, f.manager.canonicalize()?);
-        assert_eq!(paths.game.canonicalize()?, f.game.canonicalize()?);
-        let shortcut = create(&f.root, &f.desktop, &paths.manager, &paths.game)?;
-        assert!(shortcut.is_file());
+        let manager: PathBuf = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(manager.canonicalize()?, f.manager.canonicalize()?);
+        let path = create(&f.root, &f.desktop, &manager)?;
+        verify_link(&link_details(&path, None)?, &f.manager)?;
         Ok(())
     }
 
     #[test]
-    fn user_modified_shortcut_is_not_overwritten() -> Result<()> {
-        let f = fixture()?;
-        let path = create(&f.root, &f.desktop, &f.manager, &f.game)?;
-        let custom = b"user modified shortcut";
-        fs::write(&path, custom)?;
-        let error = create(&f.root, &f.desktop, &f.manager, &f.game)
-            .err()
-            .context("Expected modified-shortcut rejection")?;
-        assert!(format!("{error:#}").contains("was modified"));
-        assert_eq!(fs::read(path)?, custom);
-        Ok(())
-    }
-
-    #[test]
-    fn a_deleted_managed_shortcut_is_recreated() -> Result<()> {
-        let f = fixture()?;
-        let path = create(&f.root, &f.desktop, &f.manager, &f.game)?;
-        fs::remove_file(&path)?;
-        assert_eq!(create(&f.root, &f.desktop, &f.manager, &f.game)?, path);
-        let receipt: Receipt = serde_json::from_slice(&fs::read(f.root.join(RECEIPT_NAME))?)?;
-        assert_eq!(receipt.sha256, sha256(&fs::read(path)?));
-        Ok(())
-    }
-
-    #[test]
-    fn unrelated_desktop_shortcut_is_not_overwritten() -> Result<()> {
+    fn installer_created_master_is_adopted_without_rewriting_it() -> Result<()> {
         let f = fixture()?;
         let path = f.desktop.join(SHORTCUT_NAME);
-        let original = b"unrelated shortcut";
-        fs::write(&path, original)?;
-        let error = create(&f.root, &f.desktop, &f.manager, &f.game)
+        link_details(&path, Some(&f.manager))?;
+        let bytes = fs::read(&path)?;
+        create(&f.root, &f.desktop, &f.manager)?;
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(&path)?;
+        link_details(&path, Some(&f.manager))?;
+        let recreated = fs::read(&path)?;
+        create(&f.root, &f.desktop, &f.manager)?;
+        assert_eq!(fs::read(path)?, recreated);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_removes_only_unchanged_receipt_owned_game_icons() -> Result<()> {
+        let f = fixture()?;
+        for (name, receipt) in LEGACY {
+            legacy(&f, name, receipt)?;
+        }
+        let unrelated = f.desktop.join("My own game shortcut.lnk");
+        fs::write(&unrelated, b"user shortcut")?;
+        create(&f.root, &f.desktop, &f.manager)?;
+        for (name, receipt) in LEGACY {
+            assert!(!f.desktop.join(name).try_exists()?);
+            assert!(!f.root.join(receipt).try_exists()?);
+        }
+        assert_eq!(fs::read(unrelated)?, b"user shortcut");
+        Ok(())
+    }
+
+    #[test]
+    fn modified_or_unreceipted_legacy_icons_are_preserved() -> Result<()> {
+        let f = fixture()?;
+        let owned = legacy(&f, LEGACY[0].0, LEGACY[0].1)?;
+        fs::write(&owned, b"customized link")?;
+        let unmanaged = f.desktop.join(LEGACY[1].0);
+        fs::write(&unmanaged, b"unmanaged link")?;
+        let unchanged = legacy(&f, LEGACY[2].0, LEGACY[2].1)?;
+        let error = create(&f.root, &f.desktop, &f.manager)
             .err()
-            .context("Expected unmanaged-shortcut rejection")?;
-        assert!(format!("{error:#}").contains("unmanaged"));
-        assert_eq!(fs::read(path)?, original);
-        assert!(!f.root.join(RECEIPT_NAME).try_exists()?);
+            .context("Expected customized icon warning")?;
+        assert!(format!("{error:#}").contains("was modified and was preserved"));
+        assert!(f.desktop.join(SHORTCUT_NAME).is_file());
+        assert_eq!(fs::read(owned)?, b"customized link");
+        assert_eq!(fs::read(unmanaged)?, b"unmanaged link");
+        assert!(!unchanged.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_or_modified_master_is_never_overwritten() -> Result<()> {
+        let f = fixture()?;
+        let path = f.desktop.join(SHORTCUT_NAME);
+        fs::write(&path, b"unmanaged shortcut")?;
+        assert!(create(&f.root, &f.desktop, &f.manager).is_err());
+        assert_eq!(fs::read(&path)?, b"unmanaged shortcut");
+        fs::remove_file(&path)?;
+        create(&f.root, &f.desktop, &f.manager)?;
+        fs::write(&path, b"customized shortcut")?;
+        assert!(create(&f.root, &f.desktop, &f.manager).is_err());
+        assert_eq!(fs::read(path)?, b"customized shortcut");
         Ok(())
     }
 }

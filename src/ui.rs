@@ -1206,6 +1206,7 @@ impl Controller {
             Action::RefreshTextures => self.dispatch(Command::RefreshTextures),
             Action::CancelTextures => self.dispatch(Command::CancelTextures),
             Action::OpenData => open_path(&self.data_directory()?),
+            Action::CreateDesktopShortcut => self.dispatch(Command::CreateDesktopShortcut),
             Action::ProjectLink => match index {
                 0 => open_url("https://github.com/false00"),
                 1 => open_url(env!("CARGO_PKG_REPOSITORY")),
@@ -1518,6 +1519,7 @@ impl Controller {
         ui.set_can_manage(model::configuration_available(snapshot));
         ui.set_can_locate(model::can_locate(snapshot, game));
         ui.set_operation_busy(snapshot.install_busy);
+        ui.set_desktop_shortcut_busy(snapshot.desktop_shortcut_busy);
         ui.set_preferences_valid(snapshot.source.preferences_valid);
         if !snapshot.source.preferences_valid
             && let Some(error) = &snapshot.source.error

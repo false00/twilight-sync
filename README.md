@@ -17,8 +17,6 @@ handheld with private, encrypted save sharing over your home network.
 &nbsp;·&nbsp; [Get started](#up-and-playing)
 &nbsp;·&nbsp; [Report a problem](https://github.com/false00/twilight-sync/issues)
 
-<a href="https://slint.dev"><img src="assets/slint-attribution.png" width="160" alt="Made with Slint"></a>
-
 **Windows 10/11 x64** · **Desktop + handheld** · **Encrypted LAN** · **Offline play**
 
 <picture>
@@ -65,7 +63,7 @@ irm https://raw.githubusercontent.com/false00/twilight-sync/main/install.ps1 | i
 ```
 
 The installer downloads the latest stable app, checks its published SHA-256,
-adds a Start-menu shortcut, and opens Twilight Sync. Existing saves, pairing,
+adds one Twilight Sync desktop icon and a Start-menu entry, and opens Twilight Sync. Existing saves, pairing,
 texture libraries, and startup preferences stay in place.
 
 You do **not** need Rust, Visual Studio, Python, or .NET to run the downloaded
@@ -129,8 +127,11 @@ Open **Play**, select a game, and choose **Play**. The app detects supported
 save locations automatically and explains when a session, transfer, or
 verification needs attention.
 
-Use the protected game shortcuts created by Twilight Sync when you want its
-play checks. Launching a game directly is outside the manager's control.
+Use the single **Twilight Sync** desktop icon and choose a game from **Play**
+for protected play checks. **Settings > Desktop shortcut > Create / repair desktop
+shortcut** restores it at any time. App startup (including after updates) restores
+a missing icon; separate game icons are no longer created. Launching a game
+directly is outside the manager's control.
 
 ### 3. Bring your other PC along
 
@@ -307,10 +308,12 @@ history, and protected-play checks are independent of the UI.
 - [Development and validation](docs/development.md)
 - [Detailed user and technical guide](docs/guide.md)
 - [Supported native save details](docs/totk-save-details.md)
+- [Third-party acknowledgements](docs/acknowledgements.md)
 - [Project license](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.txt)
 
 Original project code is MIT-licensed. Slint and other dependencies retain
-their own licenses; the required Slint attribution badge appears beside the
-download links above. Third-party licenses remain available from **About**.
+their own licenses; required attribution is on the
+[acknowledgements page](docs/acknowledgements.md), not a sponsorship.
+Third-party licenses remain available from **About**.
 Twilight Sync is not affiliated with Nintendo or the upstream game
 projects. Supply only game files you are legally entitled to use.

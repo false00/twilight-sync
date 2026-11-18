@@ -223,27 +223,48 @@ param(
     }
 
     function New-TwilightShortcut {
-        param([string]$Executable)
-        $programs = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
-        $path = Join-Path $programs 'Twilight Sync.lnk'
-        $null = Assert-TwilightPath $path
+        param(
+            [string]$Executable,
+            [string]$ProgramsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs),
+            [string]$DesktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        )
+        $null = Assert-TwilightPath $Executable
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $null
         try {
-            $shortcut = $shell.CreateShortcut($path)
-            if ((Test-Path -LiteralPath $path) -and -not [string]::Equals($shortcut.TargetPath, $Executable, [StringComparison]::OrdinalIgnoreCase)) {
-                throw 'A different Start-menu shortcut already uses the Twilight Sync name.'
+            foreach ($folder in @($ProgramsDirectory, $DesktopDirectory)) {
+                if ([string]::IsNullOrWhiteSpace($folder)) { throw 'Windows did not return a shortcut folder.' }
+                $path = Join-Path $folder 'Twilight Sync.lnk'
+                $null = Assert-TwilightPath $path
+                $shortcut = $shell.CreateShortcut($path)
+                $working = [IO.Path]::GetDirectoryName($Executable)
+                if (Test-Path -LiteralPath $path) {
+                    $icon = $shortcut.IconLocation
+                    $separator = $icon.LastIndexOf(',')
+                    if ($separator -lt 0 -or
+                        -not [string]::Equals($shortcut.TargetPath, $Executable, [StringComparison]::OrdinalIgnoreCase) -or
+                        -not [string]::IsNullOrEmpty($shortcut.Arguments) -or
+                        -not [string]::Equals($shortcut.WorkingDirectory, $working, [StringComparison]::OrdinalIgnoreCase) -or
+                        -not [string]::Equals($icon.Substring(0, $separator).Trim('"'), $Executable, [StringComparison]::OrdinalIgnoreCase) -or
+                        $icon.Substring($separator + 1) -cne '0') {
+                        throw 'A different or customized shortcut already uses the Twilight Sync name; it was not overwritten.'
+                    }
+                } else {
+                    $shortcut.TargetPath = $Executable
+                    $shortcut.Arguments = ''
+                    $shortcut.WorkingDirectory = $working
+                    $shortcut.Description = 'Open Twilight Sync to manage and safely play your games'
+                    $shortcut.IconLocation = "$Executable,0"
+                    $shortcut.Save()
+                }
+                $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+                $shortcut = $null
             }
-            $shortcut.TargetPath = $Executable
-            $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($Executable)
-            $shortcut.Description = 'Private-LAN save sync and texture management for Dusklight'
-            $shortcut.IconLocation = "$Executable,0"
-            $shortcut.Save()
         } finally {
             if ($null -ne $shortcut) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
             $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
         }
-        return $path
+        return (Join-Path $DesktopDirectory 'Twilight Sync.lnk')
     }
 
     function Install-TwilightSync {
@@ -371,7 +392,7 @@ param(
     $result = Install-TwilightSync -Version $Options.Version -InstallDirectory $Options.InstallDirectory -NoLaunch:$Options.NoLaunch -NoShortcut:$Options.NoShortcut
     Write-Host "Twilight Sync $($result.Version) is ready."
     Write-Host "Installed for your user: $($result.Executable)"
-    if (-not $result.Changed) { Write-Host 'Already up to date. Open Twilight Sync from the Start menu.' }
+    if (-not $result.Changed) { Write-Host 'Already up to date. Open Twilight Sync from its desktop or Start-menu icon.' }
     elseif (-not $result.Launched) { Write-Host 'No app was launched. Open Twilight Sync when you are ready.' }
     Write-Host 'Saves, pairing keys, texture libraries, and startup preferences were not changed by this installer.'
 } @{ Version = $Version; InstallDirectory = $InstallDirectory; NoLaunch = [bool]$NoLaunch; NoShortcut = [bool]$NoShortcut }

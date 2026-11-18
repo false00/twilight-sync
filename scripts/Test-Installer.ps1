@@ -154,6 +154,34 @@ try {
     Assert-Installer ($updated.Changed -and $updated.Version -eq 'v0.2.1') 'verified upgrades keep the executable path stable'
     Assert-Installer (@(Get-ChildItem -LiteralPath $directory -Directory -Force).Count -eq 0) 'successful and rolled-back stages are cleaned up'
 
+    $programs = Join-Path $root 'test Start menu'
+    $desktop = Join-Path $root 'test desktop'
+    $null = [IO.Directory]::CreateDirectory($programs)
+    $null = [IO.Directory]::CreateDirectory($desktop)
+    $link = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    Assert-Installer ($link -ceq (Join-Path $desktop 'Twilight Sync.lnk')) 'installer creates the single master desktop shortcut'
+    Assert-Installer ((Test-Path -LiteralPath (Join-Path $programs 'Twilight Sync.lnk')) -and @(Get-ChildItem -LiteralPath $desktop).Count -eq 1) 'Start-menu entry does not add per-game desktop icons'
+    $linkHash = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
+    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    Assert-Installer ((Get-FixtureHash ([IO.File]::ReadAllBytes($link))) -ceq $linkHash) 'repeat installer preserves a matching app link and its private receipt hash'
+    Remove-Item -LiteralPath $link
+    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    Assert-Installer (Test-Path -LiteralPath $link) 'app update recreates a deleted master desktop shortcut'
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $null
+    try {
+        $shortcut = $shell.CreateShortcut($link)
+        Assert-Installer ($shortcut.TargetPath -ceq $updated.Executable -and $shortcut.Arguments -ceq '' -and $shortcut.IconLocation -ceq "$($updated.Executable),0") 'master opens only Twilight Sync and uses its app icon'
+        $shortcut.Arguments = '--custom-user-option'
+        $shortcut.Save()
+    } finally {
+        if ($null -ne $shortcut) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+    $customHash = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
+    Assert-InstallerThrows { New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop } 'customized shortcut'
+    Assert-Installer ((Get-FixtureHash ([IO.File]::ReadAllBytes($link))) -ceq $customHash) 'customized master desktop shortcuts are never overwritten'
+
     [IO.File]::WriteAllText($updated.Executable, 'user-modified executable')
     Assert-InstallerThrows { Install-TwilightSync -InstallDirectory $directory -NoLaunch -NoShortcut } 'existing executable was modified'
     Assert-Installer ([IO.File]::ReadAllText($updated.Executable) -ceq 'user-modified executable') 'modified files are never overwritten'

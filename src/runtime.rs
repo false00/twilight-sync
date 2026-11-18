@@ -68,6 +68,7 @@ pub struct Snapshot {
     pub latest_totk_release: Option<ReleaseInfo>,
     pub selected_release: Option<String>,
     pub texture_busy: bool,
+    pub desktop_shortcut_busy: bool,
     pub textures: textures::State,
     pub history: history::Page,
     pub history_preview: Option<HistoryPreview>,
@@ -130,6 +131,7 @@ pub struct HistoryPreview {
 }
 
 pub enum Command {
+    CreateDesktopShortcut,
     SetSourcePreference {
         game: protocol::GameId,
         preference: source_build::Preference,
@@ -292,7 +294,8 @@ enum Input {
         id: u64,
         reason: String,
     },
-    Installed(Result<(Installed, PathBuf)>),
+    Installed(Result<Installed>),
+    DesktopShortcutCreated(Result<PathBuf>),
     ReleaseChecked {
         game: protocol::GameId,
         result: Result<ReleaseInfo>,
@@ -499,6 +502,7 @@ struct Engine {
     latest_totk_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
     texture_busy: bool,
+    desktop_shortcut_busy: bool,
     texture_cancel: Arc<AtomicBool>,
     texture_state: textures::State,
     textures_loaded: bool,
@@ -609,6 +613,9 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
         .name("twilight-manager".into())
         .spawn(move || {
             let _instance = instance;
+            if desktop && let Err(error) = engine.command(Command::CreateDesktopShortcut) {
+                engine.report(error);
+            }
             if let Err(error) = engine.refresh_default_save() {
                 engine.report(error);
             }
@@ -630,26 +637,6 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
             }
             if let Err(error) = engine.triforce.refresh() {
                 engine.report(error);
-            }
-            if desktop
-                && let Some(install) = engine.totk.status.install_path.clone()
-                && engine.totk.status.installed
-                && let Err(error) =
-                    crate::desktop::install_totk_shortcut(&engine.root, &install.join("totk.exe"))
-            {
-                engine.report(error);
-            }
-            if desktop && engine.triforce.status.installed {
-                let result = engine.triforce.executable().and_then(|executable| {
-                    crate::desktop::install_game_shortcut(
-                        &engine.root,
-                        &executable,
-                        protocol::GameId::Triforce,
-                    )
-                });
-                if let Err(error) = result {
-                    engine.report(error);
-                }
             }
             engine.message = "Local stores checked. Checking your private LAN...".into();
             engine.publish();
@@ -918,6 +905,7 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         latest_totk_release: None,
         selected_release: None,
         texture_busy: false,
+        desktop_shortcut_busy: false,
         textures: textures::State::default(),
         history: history::Page::default(),
         history_preview: None,
@@ -1013,6 +1001,7 @@ impl Engine {
             latest_totk_release: None,
             selected_release: None,
             texture_busy: false,
+            desktop_shortcut_busy: false,
             texture_cancel: Arc::new(AtomicBool::new(false)),
             texture_state: textures::State::default(),
             textures_loaded: false,
@@ -1198,20 +1187,13 @@ impl Engine {
             }
             Input::Installed(result) => {
                 self.install_busy = false;
-                let (installed, shortcut) = result?;
+                let installed = result?;
                 self.audit.record(
                     "dusklight-installed",
                     Some(&installed.executable),
                     Some(&installed.sha256),
                     None,
                     &installed.tag,
-                )?;
-                self.audit.record(
-                    "dusklight-desktop-shortcut",
-                    Some(&shortcut),
-                    None,
-                    None,
-                    "Opens Twilight Sync protected Play controls; does not launch the game directly",
                 )?;
                 self.selected_release = Some(installed.tag.clone());
                 if self.latest_release.as_ref().is_some_and(|release| {
@@ -1222,13 +1204,29 @@ impl Engine {
                 self.store(|s| s.game_exe = Some(installed.executable))?;
                 self.refresh_default_save()?;
                 self.message = format!(
-                    "Dusklight {} {}. Desktop shortcut opens protected Play controls. Saves, profile, and texture selection were preserved; nothing was launched.",
+                    "Dusklight {} {}. Open Play in Twilight Sync to start safely. Saves, profile, and texture selection were preserved; nothing was launched.",
                     installed.tag,
                     if installed.reused {
                         "is already installed; managed files re-verified"
                     } else {
                         "installed side-by-side"
                     },
+                );
+                Ok(())
+            }
+            Input::DesktopShortcutCreated(result) => {
+                self.desktop_shortcut_busy = false;
+                let path = result?;
+                self.audit.record(
+                    "app-desktop-shortcut",
+                    Some(&path),
+                    None,
+                    None,
+                    "Single app shortcut; unchanged receipt-owned game shortcuts retired",
+                )?;
+                self.message = format!(
+                    "Twilight Sync desktop shortcut is ready: {}. Open all games from Play.",
+                    path.display()
                 );
                 Ok(())
             }
@@ -1303,11 +1301,6 @@ impl Engine {
                     updated.log.display()
                 );
                 self.totk.status.message = self.message.clone();
-                if updated.fresh {
-                    crate::desktop::install_totk_shortcut(&self.root, &updated.executable).context(
-                        "TotK files are ready, but the protected desktop shortcut could not be updated",
-                    )?;
-                }
                 Ok(())
             }
             Input::SourceChecked { game, result } => {
@@ -2134,8 +2127,6 @@ impl Engine {
                 .native_channel(game)?
                 .activate_verified_executable(&built.executable, built.expected_save.as_deref())?,
         }
-        crate::desktop::install_game_shortcut(&self.root, &built.executable, built.game)
-            .context("Source-built game was selected, but its protected desktop shortcut could not be updated")?;
         if self.ready() {
             self.send_state()?;
         }
@@ -2195,8 +2186,7 @@ impl Engine {
             }
             NativeCommand::SetExecutable(path) => {
                 self.native_channel(game)?.set_executable(&path)?;
-                let executable = self.native_channel(game)?.executable()?;
-                crate::desktop::install_game_shortcut(&self.root, &executable, game)?;
+                self.native_channel(game)?.executable()?;
                 Vec::new()
             }
             NativeCommand::Launch { local_only } => {
@@ -2250,6 +2240,22 @@ impl Engine {
             self.error = None;
         }
         match command {
+            Command::CreateDesktopShortcut => {
+                ensure!(
+                    !self.desktop_shortcut_busy,
+                    "Desktop shortcut repair is already running"
+                );
+                self.desktop_shortcut_busy = true;
+                self.message = "Creating or repairing the Twilight Sync desktop shortcut...".into();
+                let root = self.root.clone();
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let result = crate::desktop::install_shortcut(&root);
+                    if sender.send(Input::DesktopShortcutCreated(result)).is_err() {
+                        eprintln!("Twilight Sync stopped before desktop shortcut repair completed");
+                    }
+                });
+            }
             Command::SetSourcePreference { game, preference } => {
                 ensure!(
                     self.source.preferences_valid && !self.source.busy,
@@ -3112,16 +3118,11 @@ impl Engine {
                 )?;
                 self.install_busy = true;
                 self.message = "Downloading and verifying the official Windows release...".into();
-                let root = self.root.clone();
                 let sender = self.sender.clone();
                 thread::spawn(move || {
                     let result = (|| {
                         let directory = install::default_directory(protocol::GameId::Dusklight)?;
-                        let installed = install::install_official(&directory)?;
-                        let shortcut =
-                            crate::desktop::install_dusklight_shortcut(&root, &installed.executable)
-                                .context("Dusklight files were installed/verified, but its desktop shortcut could not be created")?;
-                        Ok((installed, shortcut))
+                        install::install_official(&directory)
                     })();
                     if sender.send(Input::Installed(result)).is_err() {
                         eprintln!("Twilight Sync stopped before installation completed");
@@ -5933,6 +5934,7 @@ impl Engine {
             latest_totk_release: self.latest_totk_release.clone(),
             selected_release: self.selected_release.clone(),
             texture_busy: self.texture_busy,
+            desktop_shortcut_busy: self.desktop_shortcut_busy,
             textures: self.texture_state.clone(),
             history: self.history_page.clone(),
             history_preview: self.history_preview.clone(),
@@ -6958,6 +6960,35 @@ mod tests {
             assert_eq!(harness.left.current_hash()?, before);
             assert_eq!(fs::read(harness.left.root.join("settings.json"))?, settings);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_shortcut_results_release_the_busy_guard_on_success_and_failure() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        harness.left.desktop_shortcut_busy = true;
+        assert!(
+            harness
+                .left
+                .command(Command::CreateDesktopShortcut)
+                .is_err()
+        );
+        assert!(
+            harness
+                .left
+                .input(Input::DesktopShortcutCreated(Err(anyhow::anyhow!(
+                    "Synthetic shortcut conflict"
+                ))))
+                .is_err()
+        );
+        assert!(!harness.left.desktop_shortcut_busy);
+        harness.left.desktop_shortcut_busy = true;
+        harness.left.input(Input::DesktopShortcutCreated(Ok(harness
+            .left
+            .root
+            .join("Twilight Sync.lnk"))))?;
+        assert!(!harness.left.desktop_shortcut_busy);
+        assert!(harness.left.message.contains("desktop shortcut is ready"));
         Ok(())
     }
 

@@ -359,14 +359,22 @@ semantic safety or replace game updates, OS security, or an independent review.
 
 ## Offline play and online coordination
 
-The **Dusklight (Twilight Sync)** desktop shortcut is created or refreshed by
-managed Dusklight installs and updates, including verification/reuse of an
-existing installation. It opens the manager's Play controls with
-`--open-dusklight`; an already-running manager is shown instead of starting a
-second instance. It does not launch the game directly or bypass local checks.
-Its icon follows the selected installed version. A private hash receipt prevents
-overwriting unrelated or independently modified shortcuts; deleting an owned
-shortcut allows the next install/update to recreate it.
+The single **Twilight Sync** desktop shortcut opens the app's library, reusing
+the running manager instead of starting a second instance. Choose any game in
+**Play**; the shortcut never launches games directly or bypasses local checks.
+It uses the Twilight Sync icon, not a game's icon. **Settings > Desktop shortcut >
+Create / repair desktop shortcut** restores it without reinstalling a game.
+App startup, including the restart after an app update, repairs a missing link
+in a worker without blocking the GUI. The installer also creates/restores the
+master desktop icon and keeps the Start-menu entry.
+
+Separate per-game shortcuts are no longer created by game installs, updates,
+source activation or executable selection. On startup/repair, old app-generated
+game links are removed only when their private receipts match their exact paths
+and unchanged contents. Unrelated or customized icons are preserved; conflicts
+are reported instead of silently overwritten. A matching installer-created
+master link can be adopted without rewriting it. Legacy `--open-dusklight`,
+`--open-totk` and `--open-triforce` arguments still work for existing custom links.
 
 There is no lease TTL that could expire during a long game or network partition.
 An offline launch does not request a partner lease. It validates the detected
@@ -726,9 +734,8 @@ The shared native channel supplies approvals, safe common-base fast-forward,
 retained divergent branches, explicit reconciliation, history preview/restore,
 durable online play grants, release and bilateral recovery. Managed launch selects
 the actual `bin\Triforce.exe` when present, suppresses the game's own update check
-for that launch, and refuses a Setup-only folder. The managed desktop shortcut
-opens `--open-triforce` in the manager. Direct game launches remain outside
-manager control.
+for that launch, and refuses a Setup-only folder. Open **Play** from the single
+Twilight Sync desktop icon. Direct game launches remain outside manager control.
 
 Triforce slot/file comparisons are complete-snapshot comparisons. Its recognized
 native table schema (`0x002D80EB`, progress boundary `0x175D8`, caption boundary

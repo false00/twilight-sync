@@ -236,6 +236,32 @@ fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> 
 }
 
 #[test]
+fn desktop_shortcut_settings_route_repair_and_disable_duplicate_requests() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_section(5);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    flush();
+    activate(&ui, "Create / repair desktop shortcut")?;
+    assert_eq!(&*actions.borrow(), &[(Action::CreateDesktopShortcut, 0)]);
+    ui.set_desktop_shortcut_busy(true);
+    flush();
+    activate(&ui, "Repairing desktop shortcut…")?;
+    assert_eq!(actions.borrow().len(), 1);
+    ui.set_desktop_shortcut_busy(false);
+    ui.set_demo_mode(true);
+    flush();
+    activate(&ui, "Create / repair desktop shortcut")?;
+    assert_eq!(
+        actions.borrow().len(),
+        1,
+        "Preview mode created a real desktop link"
+    );
+    Ok(())
+}
+
+#[test]
 fn game_file_setup_routes_each_games_inputs_and_clear_actions() -> Result<()> {
     let ui = fixture()?;
     ui.window()
@@ -528,6 +554,8 @@ fn compared_saves_show_verified_details_and_metadata_warnings() -> Result<()> {
 #[test]
 fn settings_cards_expand_with_their_content_instead_of_overlapping() -> Result<()> {
     let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 1400.0));
     ui.set_section(5);
     flush();
     let toggle =

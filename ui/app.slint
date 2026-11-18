@@ -11,7 +11,7 @@ export enum Action {
     check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso, offer-game-file,
     open-texture-site, import-texture-zip, import-texture-folder, cancel-textures, activate-texture,
     disable-textures, recover-textures, refresh-textures, open-data, open-licenses,
-    app-release-notes, official-help, project-link, preview-scenario, export-preview, quit
+    app-release-notes, official-help, project-link, preview-scenario, export-preview, create-desktop-shortcut, quit
 }
 export enum Toggle { source-mode, source-consent, managed-tools, renodx, fsr, nvidia, shaders, startup, updates, disc-sharing, texture-consent, game-file-sharing, key-sharing }
 export enum AppearanceMode { system, light, dark }
@@ -204,6 +204,7 @@ export component MainWindow inherits Window {
     in property <string> build-result-detail;
     in-out property <bool> build-result-dismissed: false;
     in property <bool> operation-busy;
+    in property <bool> desktop-shortcut-busy;
     in property <bool> preferences-valid: true;
     in property <bool> has-built;
     in property <bool> sdk-busy;
@@ -792,7 +793,7 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Install / update"; primary: true; available: root.can-install; clicked => { root.action(Action.install-release, 0); } }
                                     ActionButton { text: "Check latest"; available: root.can-manage; clicked => { root.action(Action.check-release, 0); } }
                                 }
-                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. The protected desktop shortcut opens this manager's play controls." : "The official setup runs inside this managed workflow. Inputs stay on your PCs unless you explicitly approve paired transfer; saves, settings and mods are preserved."; }
+                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. Open every game through the single Twilight Sync desktop shortcut and Play." : "The official setup runs inside this managed workflow. Inputs stay on your PCs unless you explicitly approve paired transfer; saves, settings and mods are preserved."; }
                                 if root.selected-game == 1: ActionButton { text: "Optional manual setup download"; subtle: true; clicked => { root.action(Action.official-help, 0); } }
                             }
                         }
@@ -1025,6 +1026,18 @@ export component MainWindow inherits Window {
                     if root.section == 5: VerticalLayout {
                         spacing: 20px;
                         PageHeading { title: "Settings & security"; description: "Your appearance, your privacy, your rules."; }
+                        Surface {
+                            VerticalLayout {
+                                padding: 22px; spacing: 12px;
+                                SectionTitle { text: "Desktop shortcut"; }
+                                Muted { text: "One Twilight Sync icon for your whole library. It opens the app, not a game. Missing shortcuts are restored when the app starts after an update; separate game icons are no longer created."; }
+                                ActionButton {
+                                    text: root.desktop-shortcut-busy ? "Repairing desktop shortcut…" : "Create / repair desktop shortcut";
+                                    available: !root.desktop-shortcut-busy && !root.demo-mode;
+                                    clicked => { root.action(Action.create-desktop-shortcut, 0); }
+                                }
+                            }
+                        }
                         Surface {
                             VerticalLayout {
                                 padding: 22px; spacing: 14px;
