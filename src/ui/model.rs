@@ -281,6 +281,9 @@ pub(super) fn source_blocker(snapshot: &Snapshot) -> Option<&'static str> {
 }
 
 fn native_session_blocker<'a>(snapshot: &Snapshot, state: &'a totk::Status) -> Option<&'a str> {
+    if snapshot.layout_recovery {
+        return Some("Game folder recovery needs attention before playing or syncing.");
+    }
     if state.updating {
         Some("Game files are being installed or built. Play and save replacement are paused.")
     } else if let Some(error) = &state.verification_error {
@@ -313,6 +316,9 @@ fn native_session_blocker<'a>(snapshot: &Snapshot, state: &'a totk::Status) -> O
 }
 
 pub(super) fn play_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
+    if snapshot.layout_recovery {
+        return Some("Game folder recovery needs attention before playing or syncing.");
+    }
     if let Some(state) = native(snapshot, game) {
         native_session_blocker(snapshot, state).or({
             if snapshot.ready
@@ -358,6 +364,9 @@ pub(super) fn play_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
 }
 
 pub(super) fn sync_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
+    if snapshot.layout_recovery {
+        return Some("Game folder recovery needs attention before playing or syncing.");
+    }
     if let Some(state) = native(snapshot, game) {
         native_session_blocker(snapshot, state).or_else(|| {
             if !snapshot.ready {
@@ -785,6 +794,12 @@ mod tests {
         };
         snapshot.triforce = snapshot.totk.clone();
         assert!(play_blocker(&snapshot, GameId::Totk).is_none());
+        snapshot.layout_recovery = true;
+        for game in GAMES {
+            assert!(play_blocker(&snapshot, game).is_some());
+            assert!(sync_blocker(&snapshot, game).is_some());
+        }
+        snapshot.layout_recovery = false;
         snapshot.triforce.updating = true;
         assert!(play_blocker(&snapshot, GameId::Triforce).is_some());
         assert!(can_continue(&snapshot, GameId::Totk));

@@ -110,16 +110,19 @@ First-time official TotK setup runs **inside the managed workflow**. Select
 your local inputs and choose **Install / update**—there is no separate manual
 installer to run first.
 
-To copy inputs from your paired PC, open the game's **Game setup** on both PCs,
-enable its file-sharing permission, and offer a selected file. The receiver
+To copy inputs from your paired PC, open **Settings > Game-file transfers** on both PCs,
+select the game, enable its file-sharing permission, and offer a selected file. The receiver
 approves a new destination; existing files are never overwritten. Received
 files become setup inputs, not automatic installations. Console-key transfers
 require separate approval and save an unencrypted local file. Only share your
 own games and keys with your own trusted paired PC.
 
-New game builds go under your own `Games` folder. Existing custom installations
-are respected. Source builds are installed side-by-side, not over your working
-copy.
+Managed games use stable `Games\Dusklight`, `Games\TotKRecomp`, and `Games\Triforce`
+folders. Existing managed version folders migrate when games, reservations and
+transfers are idle; previous containers are retained for recovery. Custom
+installations and occupied unmanaged destinations are never overwritten.
+**Game setup** shows the recorded installed version, whether a candidate is newer
+or older, and source-to-source comparison links when both revisions are known.
 
 ### 2. Play here
 

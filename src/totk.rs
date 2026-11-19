@@ -842,6 +842,25 @@ impl Channel {
         self.select_executable(executable, false)
     }
 
+    pub(crate) fn reload_installation(&mut self) -> Result<()> {
+        self.require_update_idle()?;
+        let session = Session::load(&self.root)?;
+        ensure!(
+            session.lock.is_none()
+                && session.release.is_none()
+                && session.base == self.session.base
+                && session.peer == self.session.peer,
+            "Game safety state changed during layout migration"
+        );
+        if let Some(install) = &session.install {
+            self.game.installation(&self.game.executable(install)?)?;
+            self.install = Ok(install.clone());
+        }
+        self.session = session;
+        self.history_hash = None;
+        self.refresh()
+    }
+
     pub fn activate_verified_executable(
         &mut self,
         executable: &Path,

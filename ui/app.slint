@@ -4,12 +4,12 @@ import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile,
 export enum Action {
     play, sync-save, setup, locate-game, refresh, compare, continue-local,
     use-local, use-remote, accept-save, decline-save, recover, approve-recovery, decline-recovery,
-    check-source, reset-source, review-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
+    check-source, reset-source, review-source, compare-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
     setup-dotnet, setup-msys, setup-visual-studio, copy-dotnet, copy-msys, copy-visual-studio, check-release, install-release,
     trust-network, open-pairing, connect-device, reconnect, approve-pairing, reject-pairing, unpair, view-game,
     history-refresh, history-older, history-preview, history-restore, close-preview,
     check-app-update, update-app, choose-iso, send-iso, accept-iso, decline-iso, offer-game-file,
-    open-texture-site, import-texture-zip, import-texture-folder, cancel-textures, activate-texture,
+    open-texture-site, import-texture-zip, import-texture-folder, import-existing-textures, cancel-textures, activate-texture,
     disable-textures, recover-textures, refresh-textures, open-data, open-licenses,
     app-release-notes, official-help, project-link, preview-scenario, export-preview, create-desktop-shortcut, quit
 }
@@ -181,6 +181,8 @@ export component MainWindow inherits Window {
     background: Theme.canvas;
     icon: @image-url("../assets/app-icon-256.png");
     in-out property <int> section: 0;
+    property <[length]> page-scroll: [0px, 0px, 0px, 0px, 0px, 0px];
+    out property <length> scroll-position: main-scroll.content-y;
     in-out property <int> selected-game: 0;
     in-out property <bool> dark-mode: true;
     in property <AppearanceMode> appearance-mode: AppearanceMode.system;
@@ -201,7 +203,6 @@ export component MainWindow inherits Window {
     in property <[ToolRow]> tools;
     in property <bool> tools-missing;
     in-out property <bool> show-tool-details: true;
-    property <bool> game-transfers-expanded: false;
     in property <[PackCard]> packs;
     in property <string> game-title;
     in property <string> game-subtitle;
@@ -265,6 +266,9 @@ export component MainWindow inherits Window {
     in property <bool> shaders;
     in property <string> source-tag;
     in property <string> source-commit;
+    in property <string> source-comparison;
+    in property <string> release-comparison;
+    in property <bool> can-compare-source;
     in property <string> source-message;
     in property <string> source-error;
     in property <string> source-log;
@@ -343,6 +347,7 @@ export component MainWindow inherits Window {
     in property <bool> can-import-textures;
     in property <bool> can-change-textures;
     in property <bool> textures-active;
+    in property <bool> textures-unmanaged;
     in property <string> texture-profile;
     in-out property <bool> texture-picker-open: false;
     in-out property <bool> texture-details-open: false;
@@ -370,14 +375,19 @@ export component MainWindow inherits Window {
         Theme.dark = root.dark-mode;
         Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
     }
-    changed section => { main-scroll.content-y = 0px; }
+    public function navigate(next: int) {
+        if next != root.section && next >= 0 && next < 6 {
+            root.page-scroll[root.section] = main-scroll.content-y;
+            root.section = next;
+        }
+    }
+    changed section => { main-scroll.content-y = root.page-scroll[root.section]; }
     changed build-complete => { root.build-result-dismissed = false; }
     changed build-needs-activation => { root.build-result-dismissed = false; }
     changed selected-game => {
         if root.section != 5 { main-scroll.content-y = 0px; }
         root.setup-step = 0;
         root.extra-game-inputs = false;
-        root.game-transfers-expanded = false;
         root.show-other-saves = false; root.comparison-open = false;
     }
     changed setup-step => { if root.section == 1 { main-scroll.content-y = 0px; } }
@@ -439,7 +449,7 @@ export component MainWindow inherits Window {
                     text: !root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? "Go to Play" : "View build";
                     primary: true; horizontal-stretch: 0;
                     clicked => {
-                        root.section = !root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? 0 : 1;
+                        root.navigate(!root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? 0 : 1);
                         root.selected-game = root.build-result-game;
                         root.game-selected(root.build-result-game);
                     }
@@ -456,7 +466,7 @@ export component MainWindow inherits Window {
                     Text { text: "WORKSPACE"; color: Theme.muted; font-size: 9px; letter-spacing: 1px; min-height: 24px; }
                     for label[index] in ["Play", "Game setup", "Devices", "Save history", "Textures", "Settings"]: NavigationItem {
                         text: label; icon: index; selected: root.section == index;
-                        clicked => { root.section = index; }
+                        clicked => { root.navigate(index); }
                     }
                     Rectangle { vertical-stretch: 1; background: transparent; }
                     Rectangle { height: 1px; background: Theme.line; }
@@ -572,9 +582,9 @@ export component MainWindow inherits Window {
                                 }
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.section = 1; } } }
+                                    ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.navigate(1); } } }
                                     ActionButton { text: "Sync progress"; available: root.can-sync; clicked => { root.action(Action.sync-save, 0); } }
-                                    ActionButton { text: "History"; subtle: true; clicked => { root.section = 3; root.action(Action.history-refresh, 0); } }
+                                    ActionButton { text: "History"; subtle: true; clicked => { root.navigate(3); root.action(Action.history-refresh, 0); } }
                                     ActionButton { text: "Refresh"; subtle: true; min-width: 76px; clicked => { root.action(Action.refresh, 0); } }
                                 }
                                 if root.game-message != "" && !root.saves-match && root.game-message != root.play-reason: Muted { text: root.game-message; }
@@ -584,7 +594,7 @@ export component MainWindow inherits Window {
                                 if root.connection-setup != "": HorizontalLayout {
                                     spacing: 12px;
                                     Muted { text: root.connection-setup; color: Theme.warning; horizontal-stretch: 1; }
-                                    ActionButton { text: "Open Devices"; subtle: true; clicked => { root.section = 2; } }
+                                    ActionButton { text: "Open Devices"; subtle: true; clicked => { root.navigate(2); } }
                                 }
                             }
                         }
@@ -723,7 +733,9 @@ export component MainWindow inherits Window {
                                         ActionButton { text: "Prepare build tools"; available: root.can-manage; clicked => { root.action(Action.prepare-tools, 0); } }
                                     }
                                     if root.source-tag != "": Muted { text: "Source " + root.source-tag + " · " + root.source-commit; }
+                                    if root.source-tag != "": Muted { text: root.source-comparison; }
                                     if root.source-tag != "": ActionButton { text: "Review this source revision"; available: root.can-manage; clicked => { root.action(Action.review-source, 0); } }
+                                    if root.can-compare-source: ActionButton { text: "Compare with installed source"; clicked => { root.action(Action.compare-source, 0); } }
                                     if root.tools.length > 0: HorizontalLayout {
                                         Text { text: root.tools-missing ? "Build prerequisites" : "All build prerequisites found"; color: root.tools-missing ? Theme.text : Theme.success; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; min-width: 0px; }
                                         ActionButton { text: root.show-tool-details ? "Hide checks" : "Show checks"; clicked => { root.show-tool-details = !root.show-tool-details; } }
@@ -812,6 +824,9 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 22px; spacing: 14px;
                                 SectionTitle { text: root.selected-game == 0 ? "2   Build your copy" : "3   Build your copy"; }
+                                if root.source-tag != "": Muted { text: "Source " + root.source-tag + " · " + root.source-commit; }
+                                if root.source-tag != "": Muted { text: root.source-comparison; }
+                                if root.can-compare-source: ActionButton { text: "Compare with installed source"; clicked => { root.action(Action.compare-source, 0); } }
                                 SwitchRow { title: "Prepare missing official build tools"; description: "Download verified tool archives after approval."; checked: root.managed-tools; available: root.can-manage; toggled(value) => { root.toggle(Toggle.managed-tools, value); } }
                                 if root.selected-game == 2: ActionButton { text: root.advanced-source ? "Hide graphics options" : "Graphics options"; available: root.can-manage; clicked => { root.advanced-source = !root.advanced-source; } }
                                 if root.selected-game == 2 && root.advanced-source: VerticalLayout {
@@ -836,6 +851,7 @@ export component MainWindow inherits Window {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Ready when you are"; }
                                 Muted { text: root.release-tag == "" ? "Install the latest verified official release using your local game inputs." : "Latest official release: " + root.release-tag; }
+                                if root.release-comparison != "": Muted { text: root.release-comparison; }
                                 if root.release-detail != "": DetailBlock { title: "OFFICIAL DOWNLOAD VERIFICATION"; text: root.release-detail; }
                                 if root.install-reason != "": Muted { text: root.install-reason; color: Theme.warning; }
                                 HorizontalLayout {
@@ -843,7 +859,7 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Install / update"; primary: true; available: root.can-install; clicked => { root.action(Action.install-release, 0); } }
                                     ActionButton { text: "Check latest"; available: root.can-manage; clicked => { root.action(Action.check-release, 0); } }
                                 }
-                                Muted { text: root.selected-game == 0 ? "Installs side-by-side and preserves your profile, saves and textures. Open every game through the single Twilight Sync desktop shortcut and Play." : "The official setup runs inside this managed workflow. Inputs stay on your PCs unless you explicitly approve paired transfer; saves, settings and mods are preserved."; }
+                                Muted { text: root.selected-game == 0 ? "Installs in Games/Dusklight and retains previous managed folders for recovery. Your profile, saves and textures are preserved. Open games through the single Twilight Sync desktop shortcut and Play." : "The official setup runs inside this managed workflow. Inputs stay on your PCs unless you explicitly approve paired transfer; saves, settings and mods are preserved."; }
                                 if root.selected-game == 1: ActionButton { text: "Optional manual setup download"; subtle: true; clicked => { root.action(Action.official-help, 0); } }
                             }
                         }
@@ -851,19 +867,10 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Transfer inputs to your paired PC"; }
-                                Muted { text: "Also available in Settings > Game-file transfers, alongside Dusklight ISO/RVZ transfers."; }
+                                Muted { text: "All transfer permissions and manual file offers live in Settings > Game-file transfers. Your selected build inputs are reused there."; }
                                 ActionButton {
-                                    text: root.game-transfers-expanded ? "Hide transfer controls" : "Show transfer controls";
-                                    clicked => { root.game-transfers-expanded = !root.game-transfers-expanded; }
-                                }
-                                if root.game-transfers-expanded: GameInputTransfers {
-                                    game: root.selected-game; sharing: root.game-file-sharing; key-sharing: root.key-sharing;
-                                    can-choose: root.can-manage; can-offer: root.can-offer-game-file; can-offer-update: root.can-offer-update; can-offer-keys: root.can-offer-keys;
-                                    input: root.source-input; update: root.source-update; keys: root.source-keys; reason: root.game-file-transfer-reason;
-                                    choose(kind) => { root.choose-input(kind); }
-                                    offer(kind) => { root.action(Action.offer-game-file, kind); }
-                                    sharing-toggled(value) => { root.toggle(Toggle.game-file-sharing, value); }
-                                    keys-toggled(value) => { root.toggle(Toggle.key-sharing, value); }
+                                    text: "Open game-file transfers";
+                                    clicked => { root.navigate(5); }
                                 }
                             }
                         }
@@ -1007,7 +1014,12 @@ export component MainWindow inherits Window {
                                 padding: 22px; spacing: 12px;
                                 SectionTitle { text: "Installed packs"; }
                                 Muted { text: "One pack is active at a time. Changes apply on your next Dusklight launch."; }
-                                if root.packs.length == 0: Muted { text: "No packs installed yet. Choose a pack and install its ZIP or folder below."; }
+                                if root.textures-unmanaged: VerticalLayout {
+                                    spacing: 10px;
+                                    StatusBadge { text: "Existing textures detected"; tint: Theme.warning; }
+                                    Muted { text: "Texture files are already in your Dusklight profile, but were installed outside this library. They have not been removed. Choose their creator and confirm permission below, then add them to the library to track and switch versions. The existing files are backed up unchanged."; }
+                                }
+                                if root.packs.length == 0 && !root.textures-unmanaged: Muted { text: "No packs installed yet. Choose a pack and install its ZIP or folder below."; }
                                 for pack[index] in root.packs: pack-card := Surface {
                                     property <bool> expanded: false;
                                     VerticalLayout {
@@ -1058,6 +1070,7 @@ export component MainWindow inherits Window {
                                     ActionButton { text: "Install ZIP"; primary: true; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-zip, 0); } }
                                     ActionButton { text: "Install folder"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-texture-folder, 0); } }
                                 }
+                                if root.textures-unmanaged: ActionButton { text: "Add existing textures to library"; available: root.texture-consent && root.can-import-textures; clicked => { root.action(Action.import-existing-textures, 0); } }
                                 Muted { text: "Twilight Sync does not download packs for you or share them with your paired PC. Only validated texture images are installed; creator access restrictions are never bypassed."; }
                             }
                         }

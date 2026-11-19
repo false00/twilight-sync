@@ -35,9 +35,9 @@ It does not include game assets, saves, disc images, or a copy of Dusklight.
 | Private audit trail | Rotating JSON-lines logs under your home `.twilight-sync` directory |
 | Optional disc transfer | Separate, disabled-by-default, per-transfer consent for verified GameCube ISO / RVZ images |
 | Optional game-input transfer | Explicit paired-PC approval for OOT `.nup`, TotK base/update `.nsp`, and separately opted-in console `prod.keys` |
-| Dusklight updates | Check the latest official release; install/update side-by-side and verify existing managed files before reuse |
+| Dusklight updates | Verified releases, stable Games folders, recorded versions and retained previous installations |
 | TotK Recomp updates | Verify the official setup and automatically rebuild an existing native installation, with play and save sync paused |
-| Source builds | Stable-tag/commit review, approved official tool archives, per-game local inputs and side-by-side builds for Dusklight, TotK and Triforce |
+| Source builds | Stable-tag/commit review, installed-version comparisons, upstream diffs, approved tools and local inputs |
 | Triforce saves | Separate native save channel with common-base sync, branches, history, restore and durable protected play |
 | Texture library | Creator-download workflow for Henriko's 4K/1080p packs, authorized local HD imports, and safe per-user switching |
 
@@ -129,9 +129,11 @@ directories or the whole home folder.
 Sync follows Dusklight's own `data_location.json` precedence: beside the selected
 game executable, then the normal profile, then the legacy `TwilitRealm\Dusk`
 profile descriptor. Native portable mode uses the executable's `data` folder;
-native custom mode uses its recorded safe local profile. Sync does not rewrite
-those descriptors, force a different game profile, reset game settings/textures,
-or move existing saves. Dusklight remains responsible for its own migrations.
+native custom mode uses its recorded safe local profile. Sync does not force a
+different game profile or reset game settings/textures. When relocating a managed
+installation, it remaps paths inside the moved folders in the selected descriptor,
+profile configuration and manager preferences; portable data moves with its game.
+Dusklight remains responsible for migrations between its own profile formats.
 Pending game migrations are reported rather than treated as an empty save.
 
 The `save_file` settings value is derived metadata, not a directory override;
@@ -423,8 +425,9 @@ integration inside Dusklight itself.
 
 Open **Settings > Game-file transfers** on both paired PCs. This replaces the
 old ISO-only section: choose **Dusklight** for ISO/RVZ, **TotK** for base/update
-NSP and console keys, or **OOT** for NUP. Native game transfer controls also
-remain in **Game setup**. Enable **I own this game and allow game-file
+NSP and console keys, or **OOT** for NUP. This is the single location for
+transfer permissions and manual offers; **Game setup** only links here.
+Enable **I own this game and allow game-file
 transfers** on each PC, select the local input on the sender, and choose
 **Offer OOT .nup**, **Offer TotK base .nsp**, or **Offer TotK update .nsp**.
 Both managers must support `twilightProto/4` discovery (v0.16.2 or later);
@@ -519,16 +522,16 @@ local-only networking:
   beyond 512 MiB.
 - The verified installation is moved into `%USERPROFILE%\Games\Dusklight`
   and selected locally. **It is not automatically run.**
-- Each release gets a version-and-archive-hash directory, so updating does not
-  overwrite an existing executable or change the game profile, texture selection,
-  save path, pairing, or play lock.
+- Releases are verified in separate staging folders before selection, then moved
+  into the stable Games folder when all games, reservations and transfers are idle.
+  The prior container is retained rather than overwritten.
 - A protected installation receipt records every extracted file's SHA-256.
   Selecting an already-installed build rechecks the receipt and file inventory;
   changed or untracked files cause an explicit error instead of being overwritten.
   Earlier v0.1 installs are left intact; the updater creates a separate managed build.
-- Older builds under `.twilight-sync\apps` remain recognized and are never moved
-  automatically. New installs and updates use the user's `Games\Dusklight`
-  directory; existing custom selections remain unchanged until explicitly replaced.
+- Selected managed builds under `.twilight-sync\apps` or old version subfolders
+  migrate automatically when idle. Unmanaged selections are not relocated.
+  An occupied unmanaged destination produces an explicit conflict, not an overwrite.
 
 The published digest is integrity metadata obtained from GitHub over HTTPS, not
 an independent publisher signature. This flow still trusts the official
@@ -566,8 +569,10 @@ alternative. Existing custom install folders are respected; updates do not move 
 - Existing installations with a supported `totk-install.json` receipt update in
   place. Without that receipt, local inputs are required before any download.
   First setup adds `--base`, `--update`, `--keys` and optional `--firmware`, and
-  uses a stable `Games\TotKRecomp\release-<tag>-<sha>-<id>\game` target. It is not
-  prepopulated or renamed because upstream rebuild commands can embed its path.
+  uses a separate staging target, promoted to `Games\TotKRecomp` after completion.
+  Relocation updates the destination argument in the upstream argument-per-line
+  `build-cache/rebuild.txt`, retaining its pinned setup and Python paths.
+  Unknown rebuild-command formats stop relocation before any folder is moved.
   Existing profile/mods/fonts/settings are copied and saves verified before the
   new executable is selected. Unmanaged previous files are not overwritten.
   No game assets, console keys or optional DLSS library are downloaded by this flow.
@@ -684,10 +689,19 @@ The flow:
    scripts**. Copies, downloads or archive verification may take time to finish
    after a cancellation request.
 7. Built Windows x64 headers, executable hashes and preserved save hashes are
-   checked before selection. Output is kept under a distinct
-   `Games\<game>\source-<tag>-<commit>-<id>\game` folder. Profiles/settings/mods are
-   copied, not removed from the previous installation. Verified nonempty
-   source-build activation retains its existing common sync base.
+   checked before selection. Output is prepared separately, then promoted to
+   `Games\Dusklight`, `Games\TotKRecomp`, or `Games\Triforce` when idle.
+   Previous containers, saves and mods remain in a uniquely named
+   `.twilight-sync-backup-*` sibling directory; selected input paths into retained
+   containers are remapped. A durable journal resumes an interrupted promotion
+   before play or transfers are allowed. Conflicting metadata is never overwritten.
+   Verified nonempty source-build activation retains its existing common sync base.
+8. **Game setup** shows recorded installed official/source versions. Source checks
+   distinguish a newer release, downgrade, same revision, changed revision under
+   the same tag, or unknown ordering. **Compare with installed source** opens the
+   upstream comparison between the two recorded full commits. Unrecorded installs
+   are explicitly labelled unknown; version labels do not imply binary verification.
+   Returning to a page restores its scroll position, including while a build runs.
 
 Only the selected game's build recipe runs. Dusklight uses its documented MSVC
 CMake preset/install target. TotK compiles hactool and the shader translator,
@@ -787,6 +801,13 @@ and import only assets you are authorized to use. The preset does not verify a
 downloaded archive's release version, and no pack assets are bundled or rehosted.
 
 ### Install or update a texture pack
+
+Textures already installed outside the manager, including nested `GZ2` folders,
+appear as **Existing textures detected**, not as an empty installation. Choose
+their creator and confirm permission, then use **Add existing textures to library**.
+The existing folder is used directly as the import source; validated images are
+catalogued and the original folder is preserved unchanged for restoration. The
+version is a user-supplied label, not an automatically verified creator release.
 
 The **Textures** page is always Dusklight's library, even when another game is
 selected. Installed packs appear first; the active pack is marked **Active**.
@@ -1003,11 +1024,10 @@ New game installations default to `%USERPROFILE%\Games`:
 
 ```text
 Games\
-    Dusklight\
-        <tag>-<hash>\      Side-by-side managed build and file-hash receipt
+    Dusklight\            Selected Dusklight game and installation receipt
     TotKRecomp\            Native TotK game, profile, settings and mods
     Triforce\              Native OoT game, user saves and local graphics settings
-    <game>\source-<tag>-<commit>-<id>\game\  Side-by-side source-built game
+    .twilight-sync-backup-<id>\  Retained previous container; not automatically deleted
 ```
 
 Updater caches and application settings remain in `.twilight-sync`; they are not

@@ -310,7 +310,7 @@ pub(super) fn valid_tag(tag: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
 }
 
-fn valid_commit(commit: &str) -> bool {
+pub(crate) fn valid_commit(commit: &str) -> bool {
     commit.len() == 40
         && commit
             .bytes()
@@ -701,20 +701,28 @@ pub(super) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn preserve_dusklight(executable: &Path, output: &Path) -> Result<()> {
+    let directory = executable
+        .parent()
+        .context("Previous Dusklight executable has no directory")?;
+    if directory == output {
+        return Ok(());
+    }
+    for relative in ["data_location.json", "data"] {
+        let source = directory.join(relative);
+        ensure_safe_path(&source)?;
+        if source.try_exists()? {
+            copy_tree(&source, &output.join(relative))?;
+        }
+    }
+    Ok(())
+}
+
 fn preserve(request: &Request, previous: &Path, output: &Path) -> Result<()> {
     let game = request.plan.game;
     if game == GameId::Dusklight {
         if let Some(executable) = &request.previous_executable {
-            let directory = executable
-                .parent()
-                .context("Previous Dusklight executable has no directory")?;
-            for relative in ["data_location.json", "data"] {
-                let source = directory.join(relative);
-                ensure_safe_path(&source)?;
-                if source.try_exists()? {
-                    copy_tree(&source, &output.join(relative))?;
-                }
-            }
+            preserve_dusklight(executable, output)?;
         }
     } else {
         let native = native_game(game)?;
@@ -749,10 +757,10 @@ fn preserve(request: &Request, previous: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn games_stopped() -> Result<()> {
+pub(crate) fn games_stopped() -> Result<()> {
     ensure!(
         !crate::play::ProcessMonitor::default().game_running(),
-        "Close Dusklight before building"
+        "Close Dusklight before changing managed game files"
     );
     native::Game::Totk.ensure_stopped()?;
     native::Game::Triforce.ensure_stopped()
@@ -1002,7 +1010,7 @@ pub fn build(
         check_cancelled(cancel)?;
         let sha256 = install::digest_file(&executable, executable.metadata()?.len())?;
         files::atomic_write(
-            &output_stage.path().join("twilight-source.json"),
+            &output.join("twilight-source.json"),
             &serde_json::to_vec_pretty(&Receipt {
                 version: 1,
                 game,
@@ -1041,7 +1049,13 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn selected_version(path: &Path, game: GameId) -> Result<String> {
+#[derive(Clone, Debug)]
+pub struct Revision {
+    pub tag: String,
+    pub commit: String,
+}
+
+pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
     #[derive(Deserialize)]
     struct Label {
         version: u8,
@@ -1059,12 +1073,68 @@ pub fn selected_version(path: &Path, game: GameId) -> Result<String> {
             && valid_hash(&label.sha256),
         "Invalid source-build installation receipt"
     );
-    Ok(format!("{} (source {})", label.tag, &label.commit[..12]))
+    Ok(Revision {
+        tag: label.tag,
+        commit: label.commit,
+    })
+}
+
+pub fn selected_version(path: &Path, game: GameId) -> Result<String> {
+    let revision = selected_revision(path, game)?;
+    Ok(format!(
+        "{} (source {})",
+        revision.tag,
+        &revision.commit[..12]
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dusklight_updates_keep_the_portable_profile_and_its_original_copy() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let previous = temp.path().join("previous");
+        let next = temp.path().join("next");
+        fs::create_dir_all(previous.join("data"))?;
+        fs::create_dir_all(&next)?;
+        fs::write(previous.join("dusklight.exe"), b"fixture, never executed")?;
+        fs::write(next.join("dusklight.exe"), b"fixture, never executed")?;
+        fs::write(
+            previous.join("data_location.json"),
+            br#"{"version":1,"mode":"portable"}"#,
+        )?;
+        fs::write(
+            previous.join("data").join("config.json"),
+            br#"{"game.enableTextureReplacements":true}"#,
+        )?;
+        fs::write(
+            previous.join("data").join("user-save"),
+            b"existing portable progress",
+        )?;
+        preserve_dusklight(&previous.join("dusklight.exe"), &next)?;
+        assert_eq!(
+            save_location::profile(
+                &temp.path().join("default"),
+                Some(&next.join("dusklight.exe"))
+            )?,
+            next.join("data")
+        );
+        assert_eq!(
+            fs::read(next.join("data").join("user-save"))?,
+            b"existing portable progress"
+        );
+        assert_eq!(
+            fs::read(previous.join("data").join("user-save"))?,
+            b"existing portable progress"
+        );
+        assert_eq!(
+            fs::read(previous.join("data").join("config.json"))?,
+            fs::read(next.join("data").join("config.json"))?
+        );
+        Ok(())
+    }
 
     #[test]
     fn compiler_worker_limit_accounts_for_cpu_and_available_memory() {

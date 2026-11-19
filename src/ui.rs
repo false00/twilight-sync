@@ -1,5 +1,6 @@
 use crate::{
     game_file::{Format as TransferFormat, Kind as GameFileKind},
+    install,
     protocol::GameId,
     runtime::{Backend, Command, HistoryPreviewData, NativeCommand, Snapshot},
     source_build::{self, Method, Preference, SdkSetup},
@@ -621,7 +622,7 @@ impl Controller {
                 }
             }
             Action::Setup => {
-                ui.set_section(1);
+                ui.invoke_navigate(1);
                 Ok(())
             }
             Action::LocateGame => {
@@ -645,12 +646,12 @@ impl Controller {
             }
             Action::Refresh => self.refresh_game(),
             Action::Compare => {
-                ui.set_section(0);
+                ui.invoke_navigate(0);
                 ui.set_comparison_open(true);
                 self.refresh_game()
             }
             Action::ViewGame => {
-                ui.set_section(0);
+                ui.invoke_navigate(0);
                 self.select_game(index)
             }
             Action::ContinueLocal => {
@@ -817,6 +818,24 @@ impl Controller {
                     .filter(|plan| plan.game == self.game)
                     .context("Check the source first")?;
                 open_url(&plan.review_url)
+            }
+            Action::CompareSource => {
+                let plan = self
+                    .snapshot
+                    .source
+                    .plan
+                    .as_ref()
+                    .filter(|plan| plan.game == self.game)
+                    .context("Check the source first")?;
+                let url = self.snapshot.installed_versions
+                    [usize::try_from(model::index(self.game))?]
+                .installed
+                .as_ref()
+                .and_then(|version| version.compare_url(self.game, &plan.commit))
+                .context(
+                    "A recorded, different installed source revision is required for a diff",
+                )?;
+                open_url(&url)
             }
             Action::ToolHelp => {
                 let index = usize::try_from(index).context("Invalid prerequisite selection")?;
@@ -1140,7 +1159,9 @@ impl Controller {
                     .context("Unknown texture creator")?;
                 self.dispatch(Command::OpenTextureCreator(entry.id.into()))
             }
-            Action::ImportTextureZip | Action::ImportTextureFolder => {
+            Action::ImportTextureZip
+            | Action::ImportTextureFolder
+            | Action::ImportExistingTextures => {
                 ensure!(
                     self.texture_consent,
                     "Confirm that you have permission to use these textures"
@@ -1153,7 +1174,20 @@ impl Controller {
                     .get(usize::try_from(ui.get_texture_creator())?)
                     .context("Choose a texture creator")?;
                 let dialog = rfd::FileDialog::new().set_title("Authorized texture pack");
-                let selected = if action == Action::ImportTextureFolder {
+                let selected = if action == Action::ImportExistingTextures {
+                    ensure!(
+                        self.snapshot.textures.unmanaged,
+                        "Existing textures changed; refresh the library before importing"
+                    );
+                    Some(
+                        self.snapshot
+                            .settings
+                            .texture_profile
+                            .as_ref()
+                            .context("The Dusklight profile is not available")?
+                            .join("texture_replacements"),
+                    )
+                } else if action == Action::ImportTextureFolder {
                     dialog.pick_folder()
                 } else {
                     dialog.add_filter("Texture archive", &["zip"]).pick_file()
@@ -1486,13 +1520,25 @@ impl Controller {
                 .unwrap_or_default()
                 .into(),
         );
+        let version_state = &snapshot.installed_versions[usize::try_from(model::index(game))?];
+        let installed_version = version_state.installed.as_ref();
         ui.set_installed_release(
-            if game == GameId::Dusklight {
-                snapshot.selected_release.as_deref().unwrap_or_default()
-            } else {
-                ""
-            }
-            .into(),
+            version_state
+                .error
+                .clone()
+                .unwrap_or_else(|| {
+                    installed_version.map_or_else(
+                        || {
+                            if selected_executable.is_some() {
+                                "Version not recorded for this installation".into()
+                            } else {
+                                String::new()
+                            }
+                        },
+                        install::Version::label,
+                    )
+                })
+                .into(),
         );
         ui.set_can_play(model::play_blocker(snapshot, game).is_none());
         ui.set_can_sync(model::sync_blocker(snapshot, game).is_none());
@@ -1617,6 +1663,17 @@ impl Controller {
                 .unwrap_or_default()
                 .into(),
         );
+        ui.set_source_comparison(plan.map_or_else(String::new, |plan| {
+            installed_version.map_or_else(
+                || "Installed version is unrecorded; cannot determine whether this is an upgrade.".into(),
+                |version| version.comparison(&plan.tag, Some(&plan.commit)).into(),
+            )
+        }).into());
+        ui.set_can_compare_source(plan.is_some_and(|plan| {
+            installed_version
+                .and_then(|version| version.compare_url(game, &plan.commit))
+                .is_some()
+        }));
         let same_game = snapshot.source.game == Some(game);
         ui.set_source_building(snapshot.source.building);
         let completion_current = match snapshot.source.completion {
@@ -1782,6 +1839,12 @@ impl Controller {
             GameId::Totk => snapshot.latest_totk_release.as_ref(),
             GameId::Triforce => None,
         };
+        ui.set_release_comparison(release.map_or_else(String::new, |release| {
+            installed_version.map_or_else(
+                || "Installed version is unrecorded; cannot determine whether this is an upgrade.".into(),
+                |version| version.comparison(&release.tag, None).into(),
+            )
+        }).into());
         ui.set_release_tag(
             release
                 .map(|release| release.tag.as_str())
@@ -2107,6 +2170,7 @@ impl Controller {
         ui.set_can_import_textures(model::can_import_textures(snapshot));
         ui.set_can_change_textures(model::can_change_textures(snapshot));
         ui.set_textures_active(snapshot.textures.active.is_some());
+        ui.set_textures_unmanaged(snapshot.textures.unmanaged);
         ui.set_texture_profile(
             snapshot
                 .settings
@@ -2196,7 +2260,7 @@ impl Controller {
             && let Some(game) = background.take_open_game_controls()
         {
             self.select_game(model::index(game))?;
-            ui.set_section(0);
+            ui.invoke_navigate(0);
         }
         let mut interaction = None;
         if let Ok(event) = MenuEvent::receiver().try_recv() {

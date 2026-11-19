@@ -50,6 +50,169 @@ pub struct ReleaseInfo {
     pub(crate) url: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct Version {
+    pub tag: String,
+    pub commit: Option<String>,
+}
+
+impl Version {
+    pub fn label(&self) -> String {
+        self.commit.as_ref().map_or_else(
+            || format!("{} (official)", self.tag),
+            |commit| format!("{} (source {})", self.tag, &commit[..12]),
+        )
+    }
+
+    pub fn comparison(&self, tag: &str, commit: Option<&str>) -> &'static str {
+        if self
+            .commit
+            .as_deref()
+            .is_some_and(|old| Some(old) == commit)
+        {
+            return "This source revision is already installed.";
+        }
+        let parse = |value: &str| semver::Version::parse(value.strip_prefix('v').unwrap_or(value));
+        match (parse(&self.tag), parse(tag)) {
+            (Ok(old), Ok(new)) if new.cmp_precedence(&old).is_gt() => "Newer release available.",
+            (Ok(old), Ok(new)) if new.cmp_precedence(&old).is_lt() => {
+                "This candidate is an older release (downgrade)."
+            }
+            (Ok(_), Ok(_)) if self.commit.is_some() != commit.is_some() => {
+                "Same release version, different build method."
+            }
+            _ if self.tag == tag && self.commit.is_none() && commit.is_none() => {
+                "This official release is already installed."
+            }
+            _ if self.tag == tag && self.commit.is_some() && commit.is_some() => {
+                "Same release tag, different source revision; review the diff."
+            }
+            (Ok(_), Ok(_)) => "Same release version, different build identity.",
+            _ => "Different build; version ordering is not established.",
+        }
+    }
+
+    pub fn compare_url(&self, game: GameId, commit: &str) -> Option<String> {
+        let previous = self.commit.as_ref()?;
+        (previous != commit
+            && crate::source_build::valid_commit(previous)
+            && crate::source_build::valid_commit(commit))
+        .then(|| {
+            format!(
+                "{}/compare/{}...{}",
+                crate::source_build::source_url(game),
+                previous,
+                commit
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VersionState {
+    pub installed: Option<Version>,
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct VersionCache {
+    stamp: Option<VersionStamp>,
+    pub state: VersionState,
+}
+
+type VersionStamp = Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>;
+
+impl VersionCache {
+    pub fn refresh(&mut self, game: GameId, directory: Option<&Path>) {
+        let result = (|| -> Result<()> {
+            let Some(directory) = directory else {
+                self.stamp = None;
+                self.state = VersionState::default();
+                return Ok(());
+            };
+            let mut candidates = vec![directory.join("twilight-source.json")];
+            if directory.file_name().is_some_and(|name| name == "game")
+                && let Some(parent) = directory.parent()
+            {
+                candidates.push(parent.join("twilight-source.json"));
+            }
+            candidates.push(directory.join(if game == GameId::Totk {
+                "totk-install.json"
+            } else {
+                "twilight-install.json"
+            }));
+            let stamp = candidates
+                .iter()
+                .map(|path| -> Result<_> {
+                    ensure_safe_path(path)?;
+                    let metadata = match fs::metadata(path) {
+                        Ok(metadata) => Some((metadata.modified()?, metadata.len())),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    };
+                    Ok((path.clone(), metadata))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if self.stamp.as_ref() == Some(&stamp) {
+                return Ok(());
+            }
+            let found = stamp.iter().find(|(_, metadata)| metadata.is_some());
+            let installed = if let Some((path, Some((_, size)))) = found {
+                ensure!(
+                    *size <= 1024 * 1024,
+                    "Installed version receipt exceeds its limit"
+                );
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == "twilight-source.json")
+                {
+                    let revision = crate::source_build::selected_revision(path, game)?;
+                    Some(Version {
+                        tag: revision.tag,
+                        commit: Some(revision.commit),
+                    })
+                } else if game == GameId::Totk {
+                    Some(Version {
+                        tag: crate::totk_update::installed_release(directory)?,
+                        commit: None,
+                    })
+                } else if game == GameId::Dusklight {
+                    let receipt: Receipt = serde_json::from_slice(&fs::read(path)?)?;
+                    ensure!(
+                        receipt.version == 1 && valid_hash(&receipt.archive_sha256),
+                        "Invalid installed release receipt"
+                    );
+                    ensure!(
+                        crate::source_build::valid_tag(&receipt.tag),
+                        "Invalid installed release tag"
+                    );
+                    Some(Version {
+                        tag: receipt.tag,
+                        commit: None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.stamp = Some(stamp);
+            self.state = VersionState {
+                installed,
+                error: None,
+            };
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.stamp = None;
+            self.state = VersionState {
+                installed: None,
+                error: Some(format!("Installed version unavailable: {error:#}")),
+            };
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstalledFile {
@@ -337,39 +500,21 @@ pub fn selected_release(
         return Ok(None);
     };
     let legacy = root.join("apps");
-    let Some(directory) = [install_directory, legacy.as_path()]
-        .into_iter()
-        .find(|directory| executable.starts_with(directory))
-    else {
+    if !executable.starts_with(install_directory) && !executable.starts_with(legacy) {
         return Ok(None);
-    };
-    let relative = executable.strip_prefix(directory)?;
-    let Some(std::path::Component::Normal(version)) = relative.components().next() else {
-        return Ok(None);
-    };
-    let receipt = directory.join(version).join("twilight-install.json");
-    ensure_safe_path(&receipt)?;
-    if !receipt.try_exists()? {
-        let source_receipt = directory.join(version).join("twilight-source.json");
-        ensure_safe_path(&source_receipt)?;
-        if source_receipt.try_exists()? {
-            return Ok(Some(crate::source_build::selected_version(
-                &source_receipt,
-                GameId::Dusklight,
-            )?));
-        }
-        return Ok(Some(format!(
-            "{} (legacy install)",
-            version.to_string_lossy()
-        )));
     }
-    ensure!(
-        receipt.metadata()?.len() <= 256 * 1024,
-        "Installation receipt exceeds limit"
-    );
-    let receipt: Receipt = serde_json::from_slice(&fs::read(receipt)?)?;
-    ensure!(receipt.version == 1, "Unsupported installation receipt");
-    Ok(Some(receipt.tag))
+    let mut cache = VersionCache::default();
+    cache.refresh(GameId::Dusklight, executable.parent());
+    if let Some(error) = cache.state.error {
+        anyhow::bail!(error);
+    }
+    Ok(cache.state.installed.map(|version| {
+        if version.commit.is_some() {
+            version.label()
+        } else {
+            version.tag
+        }
+    }))
 }
 
 pub fn install_official(directory: &Path) -> Result<Installed> {
@@ -549,6 +694,109 @@ pub(crate) fn extract_files(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn installed_revisions_report_upgrades_downgrades_and_safe_source_diffs() {
+        let version = Version {
+            tag: "v1.2.0".into(),
+            commit: Some("a".repeat(40)),
+        };
+        assert_eq!(
+            version.comparison("v1.3.0", Some(&"b".repeat(40))),
+            "Newer release available."
+        );
+        assert!(version.comparison("v1.1.0", None).contains("downgrade"));
+        assert!(
+            version
+                .comparison("v1.2.0", Some(&"a".repeat(40)))
+                .contains("already installed")
+        );
+        assert!(
+            version
+                .comparison("v1.2.0", Some(&"b".repeat(40)))
+                .contains("different source revision")
+        );
+        assert!(
+            version
+                .comparison("nightly", None)
+                .contains("not established")
+        );
+        assert!(
+            version
+                .comparison("v1.2.0", None)
+                .contains("different build method")
+        );
+        assert!(
+            version
+                .comparison("v1.2.0+build2", None)
+                .contains("Same release version")
+        );
+        for game in [GameId::Dusklight, GameId::Totk, GameId::Triforce] {
+            assert_eq!(
+                version.compare_url(game, &"b".repeat(40)),
+                Some(format!(
+                    "{}/compare/{}...{}",
+                    crate::source_build::source_url(game),
+                    "a".repeat(40),
+                    "b".repeat(40)
+                ))
+            );
+        }
+        assert!(
+            version
+                .compare_url(GameId::Triforce, &"a".repeat(40))
+                .is_none()
+        );
+        assert!(
+            version
+                .compare_url(GameId::Triforce, "invalid?url")
+                .is_none()
+        );
+        assert!(
+            Version {
+                tag: "v1.2.0".into(),
+                commit: None
+            }
+            .compare_url(GameId::Totk, &"b".repeat(40))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn version_cache_handles_legacy_and_canonical_receipts_and_surfaces_corruption() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stage = temp.path().join("source-v1");
+        let game = stage.join("game");
+        fs::create_dir_all(&game)?;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "version":1,"game":GameId::Triforce,"tag":"v1.0.0",
+            "commit":"a".repeat(40),"sha256":"b".repeat(64)
+        }))?;
+        let mut cache = VersionCache::default();
+        cache.refresh(GameId::Triforce, Some(&game));
+        assert!(cache.state.installed.is_none() && cache.state.error.is_none());
+        fs::write(stage.join("twilight-source.json"), &receipt)?;
+        cache.refresh(GameId::Triforce, Some(&game));
+        assert_eq!(
+            cache
+                .state
+                .installed
+                .as_ref()
+                .map(|version| version.tag.as_str()),
+            Some("v1.0.0")
+        );
+        fs::write(game.join("twilight-source.json"), &receipt)?;
+        fs::remove_file(stage.join("twilight-source.json"))?;
+        cache.refresh(GameId::Triforce, Some(&game));
+        assert!(cache.state.error.is_none());
+        fs::write(game.join("twilight-source.json"), b"broken receipt")?;
+        cache.refresh(GameId::Triforce, Some(&game));
+        assert!(cache.state.installed.is_none() && cache.state.error.is_some());
+        fs::write(game.join("twilight-source.json"), &receipt)?;
+        cache.refresh(GameId::Triforce, Some(&game));
+        assert!(cache.state.installed.is_some() && cache.state.error.is_none());
+        Ok(())
+    }
 
     fn release_fixture() -> Release {
         let arch = if cfg!(target_arch = "aarch64") {

@@ -4,6 +4,7 @@ use crate::{
     disc::{self, Verified as VerifiedDisc},
     files::{self, CHUNK_SIZE, ensure_safe_path, valid_hash},
     game_file::{self, Format as DiscFormat, Kind as GameFileKind},
+    game_layout,
     history::{self, History},
     install::{self, Installed, ReleaseInfo},
     lan::{self, Advertisement, Discovered, Network},
@@ -19,7 +20,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
@@ -64,9 +65,11 @@ pub struct Snapshot {
     pub pending_recovery: bool,
     pub transfer: String,
     pub install_busy: bool,
+    pub layout_recovery: bool,
     pub latest_release: Option<ReleaseInfo>,
     pub latest_totk_release: Option<ReleaseInfo>,
     pub selected_release: Option<String>,
+    pub installed_versions: [install::VersionState; 3],
     pub texture_busy: bool,
     pub desktop_shortcut_busy: bool,
     pub textures: textures::State,
@@ -498,9 +501,13 @@ struct Engine {
     iso_verifying: Option<DiscVerification>,
     cancel_transfer: Arc<AtomicBool>,
     install_busy: bool,
+    layout_recovery: bool,
     latest_release: Option<ReleaseInfo>,
     latest_totk_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
+    installed_versions: [install::VersionCache; 3],
+    versions_checked: Option<Instant>,
+    layout_checked: HashSet<PathBuf>,
     texture_busy: bool,
     desktop_shortcut_busy: bool,
     texture_cancel: Arc<AtomicBool>,
@@ -901,9 +908,11 @@ fn initial_snapshot(settings: &Settings, key: &str) -> Snapshot {
         pending_recovery: false,
         transfer: String::new(),
         install_busy: false,
+        layout_recovery: false,
         latest_release: None,
         latest_totk_release: None,
         selected_release: None,
+        installed_versions: Default::default(),
         texture_busy: false,
         desktop_shortcut_busy: false,
         textures: textures::State::default(),
@@ -944,6 +953,14 @@ impl Engine {
         );
         triforce.identify(&identity.public, audit.username());
         let source = source_build::State::load(&root);
+        let (layout_pending, layout_error) = match game_layout::pending(&root) {
+            Ok(pending) => (pending, None),
+            Err(error) => (
+                true,
+                Some(format!("Game layout recovery needs attention: {error:#}")),
+            ),
+        };
+        let layout_fatal = layout_error.is_some();
         Self {
             maintenance: false,
             root,
@@ -996,10 +1013,14 @@ impl Engine {
             game_file_permissions: game_file::Permissions::default(),
             iso_verifying: None,
             cancel_transfer: Arc::new(AtomicBool::new(false)),
-            install_busy: false,
+            install_busy: layout_pending,
+            layout_recovery: layout_pending,
             latest_release: None,
             latest_totk_release: None,
             selected_release: None,
+            installed_versions: Default::default(),
+            versions_checked: None,
+            layout_checked: HashSet::new(),
             texture_busy: false,
             desktop_shortcut_busy: false,
             texture_cancel: Arc::new(AtomicBool::new(false)),
@@ -1021,8 +1042,8 @@ impl Engine {
             source_cancel: Arc::new(AtomicBool::new(false)),
             transfer: String::new(),
             message: "Loading compact history and checking your private LAN...".into(),
-            error: None,
-            fatal: false,
+            error: layout_error,
+            fatal: layout_fatal,
             shutdown: false,
             discovery_rejections: 0,
             last_rejection_log: past,
@@ -1100,6 +1121,12 @@ impl Engine {
     }
 
     fn input(&mut self, input: Input) -> Result<()> {
+        ensure!(
+            !self.layout_recovery
+                || !matches!(&input, Input::Frame { .. } | Input::Command(_))
+                || matches!(&input, Input::Command(Command::Shutdown)),
+            "Finish game folder recovery before playing, transferring, or changing settings"
+        );
         if matches!(
             &input,
             Input::SourceChecked { .. }
@@ -3119,10 +3146,40 @@ impl Engine {
                 self.install_busy = true;
                 self.message = "Downloading and verifying the official Windows release...".into();
                 let sender = self.sender.clone();
+                let previous = self.settings.game_exe.clone();
+                let default_profile = self.default_profile.clone();
                 thread::spawn(move || {
                     let result = (|| {
                         let directory = install::default_directory(protocol::GameId::Dusklight)?;
-                        install::install_official(&directory)
+                        let installed = install::install_official(&directory)?;
+                        if let Some(previous) = &previous {
+                            ensure!(
+                                !ProcessMonitor::default().game_running(),
+                                "Close Dusklight before selecting the installed update"
+                            );
+                            let profile = save_location::profile(&default_profile, Some(previous))?;
+                            let before = files::save_hash(&save_location::discover(&profile)?)?;
+                            source_build::preserve_dusklight(
+                                previous,
+                                installed
+                                    .executable
+                                    .parent()
+                                    .context("Installed game has no parent")?,
+                            )?;
+                            let next = save_location::profile(
+                                &default_profile,
+                                Some(&installed.executable),
+                            )?;
+                            ensure!(
+                                !ProcessMonitor::default().game_running()
+                                    && files::save_hash(&save_location::discover(&profile)?)?
+                                        == before
+                                    && files::save_hash(&save_location::discover(&next)?)?
+                                        == before,
+                                "Dusklight progress changed during installation; the previous game remains selected"
+                            );
+                        }
+                        Ok(installed)
                     })();
                     if sender.send(Input::Installed(result)).is_err() {
                         eprintln!("Twilight Sync stopped before installation completed");
@@ -3216,7 +3273,7 @@ impl Engine {
                     "Stop Dusklight before quitting; close the window to the tray instead"
                 );
                 ensure!(
-                    !self.install_busy
+                    (!self.install_busy || self.layout_recovery)
                         && !self.texture_busy
                         && !self.self_updates.preparing
                         && !self.iso_preparing,
@@ -5192,6 +5249,17 @@ impl Engine {
     }
 
     fn tick(&mut self) -> Result<()> {
+        if self.layout_recovery {
+            if self.link.is_some() {
+                self.stop_network("Game folder recovery is pending; play locks were preserved");
+            }
+            self.install_busy = false;
+            let idle = self.require_source_idle();
+            self.install_busy = true;
+            idle?;
+            let migration = game_layout::load(&self.root)?;
+            self.complete_game_layout(&migration)?;
+        }
         if self.should_check_for_app_update(self_update::CHECK_INTERVAL) {
             self.begin_self_update_check()?;
         }
@@ -5288,6 +5356,124 @@ impl Engine {
                             format!("{game:?} sync needs attention: {error:#}");
                     }
                 }
+            }
+            self.try_game_layout()?;
+        }
+        Ok(())
+    }
+
+    fn complete_game_layout(&mut self, migration: &game_layout::Migration) -> Result<()> {
+        migration.apply(source_build::games_stopped)?;
+        self.settings = Settings::load(&self.root)?;
+        self.source.preferences = source_build::Preferences::load(&self.root)?;
+        if let Some(built) = &mut self.source.built {
+            built.directory = migration.mapped_path(&built.directory);
+            built.executable = migration.mapped_path(&built.executable);
+        }
+        match migration.game {
+            protocol::GameId::Totk => self.totk.reload_installation()?,
+            protocol::GameId::Triforce => self.triforce.reload_installation()?,
+            protocol::GameId::Dusklight => self.refresh_default_save()?,
+        }
+        self.textures_loaded = false;
+        self.versions_checked = None;
+        self.audit.record(
+            "managed-game-relocated",
+            Some(&migration.destination),
+            None,
+            None,
+            &format!(
+                "{:?}; prior folder retained at {}",
+                migration.game,
+                migration
+                    .backup()
+                    .map_or_else(|| "not needed".into(), |path| path.display().to_string())
+            ),
+        )?;
+        migration.finish(&self.root)?;
+        self.layout_recovery = false;
+        self.install_busy = false;
+        self.message = format!(
+            "{:?} is now installed in {}. Saves, mods, inputs and settings were retained.",
+            migration.game,
+            migration.destination.display()
+        );
+        self.send_state()
+    }
+
+    fn try_game_layout(&mut self) -> Result<()> {
+        if self.maintenance
+            || self.install_busy
+            || self.texture_busy
+            || self.source.busy
+            || !self.source.preferences_valid
+            || self.self_updates.preparing
+            || !self.no_transfer()
+            || self.game_running
+            || self
+                .remote
+                .as_ref()
+                .is_some_and(|state| state.game || state.lock.is_some())
+            || self.settings.play_lock.is_some()
+            || self.child.is_some()
+            || self.launch_pending.is_some()
+            || self.pending_recovery.is_some()
+            || self.requested_recovery.is_some()
+            || [&self.totk.status, &self.triforce.status]
+                .iter()
+                .any(|state| {
+                    state.running
+                        || state.remote_running
+                        || state.updating
+                        || state.busy
+                        || state.pending
+                        || state.lock.is_some()
+                        || state.remote_lock.is_some()
+                        || state.launch_pending
+                        || state.release_pending
+                        || state.recovery_pending
+                })
+        {
+            return Ok(());
+        }
+        for game in [
+            protocol::GameId::Dusklight,
+            protocol::GameId::Totk,
+            protocol::GameId::Triforce,
+        ] {
+            let (Some(directory), Some(executable)) = self.source_paths(game) else {
+                continue;
+            };
+            if match game {
+                protocol::GameId::Dusklight => self.save_location_error.is_some(),
+                protocol::GameId::Totk => self.totk.status.verification_error.is_some(),
+                protocol::GameId::Triforce => self.triforce.status.verification_error.is_some(),
+            } {
+                continue;
+            }
+            if self.layout_checked.contains(&directory) {
+                continue;
+            }
+            self.require_source_idle()?;
+            let destination = install::default_directory(game)?;
+            let planned = game_layout::prepare(
+                &self.root,
+                game,
+                &directory,
+                &executable,
+                &destination,
+                self.save_profile.as_deref(),
+                &self.default_profile,
+            );
+            self.layout_checked.insert(directory);
+            if let Some(migration) = planned? {
+                self.layout_recovery = true;
+                self.install_busy = true;
+                let result = self.complete_game_layout(&migration);
+                if result.is_err() {
+                    self.install_busy = game_layout::pending(&self.root)?;
+                }
+                return result;
             }
         }
         Ok(())
@@ -5920,6 +6106,23 @@ impl Engine {
     fn publish(&mut self) {
         self.totk.expire();
         self.triforce.expire();
+        if self
+            .versions_checked
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            self.versions_checked = Some(Instant::now());
+            for (index, game) in [
+                protocol::GameId::Dusklight,
+                protocol::GameId::Totk,
+                protocol::GameId::Triforce,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (directory, _) = self.source_paths(game);
+                self.installed_versions[index].refresh(game, directory.as_deref());
+            }
+        }
         let link = self.link.as_ref();
         let snapshot = Snapshot {
             settings: self.settings.clone(),
@@ -5951,9 +6154,14 @@ impl Engine {
             pending_recovery: self.pending_recovery.is_some(),
             transfer: self.transfer.clone(),
             install_busy: self.install_busy,
+            layout_recovery: self.layout_recovery,
             latest_release: self.latest_release.clone(),
             latest_totk_release: self.latest_totk_release.clone(),
             selected_release: self.selected_release.clone(),
+            installed_versions: self
+                .installed_versions
+                .each_ref()
+                .map(|cache| cache.state.clone()),
             texture_busy: self.texture_busy,
             desktop_shortcut_busy: self.desktop_shortcut_busy,
             textures: self.texture_state.clone(),
@@ -6900,6 +7108,91 @@ mod tests {
         assert_eq!(harness.left.current_hash()?, before);
         assert!(!harness.left.root.join("build-tools").try_exists()?);
         assert!(!harness.left.root.join("source-builds").try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_game_relocation_is_deferred_during_builds_reservations_and_transfers() -> Result<()>
+    {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        let engine = &mut harness.left;
+        engine.maintenance = false;
+        let directory = engine.root.join("unmanaged-fixture");
+        engine.settings.game_exe = Some(directory.join("dusklight.exe"));
+        engine.source.busy = true;
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.source.busy = false;
+        engine.game_running = true;
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.game_running = false;
+        engine.settings.play_lock = Some(PlayLock {
+            owner: engine.identity.public.clone(),
+            token: "a".repeat(64),
+        });
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.settings.play_lock = None;
+        engine.iso_preparing = true;
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.iso_preparing = false;
+        engine.totk.status.remote_lock = Some(PlayLock {
+            owner: engine.identity.public.clone(),
+            token: "a".repeat(64),
+        });
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.totk.status.remote_lock = None;
+        engine.source.preferences_valid = false;
+        engine.try_game_layout()?;
+        assert!(!engine.layout_checked.contains(&directory));
+        engine.source.preferences_valid = true;
+        engine.try_game_layout()?;
+        assert!(engine.layout_checked.contains(&directory));
+        assert!(!game_layout::pending(&engine.root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn game_layout_recovery_blocks_commands_and_incoming_frames_until_complete() -> Result<()> {
+        let mut harness = Harness::new(Some(variant(1)), None)?;
+        harness.left.layout_recovery = true;
+        let before = harness.left.current_hash()?;
+        assert!(
+            harness
+                .left
+                .input(Input::Command(Command::Native {
+                    game: protocol::GameId::Triforce,
+                    command: NativeCommand::Refresh,
+                }))
+                .is_err()
+        );
+        assert!(
+            harness
+                .left
+                .input(Input::Frame {
+                    id: 1,
+                    event: Event::Ping
+                })
+                .is_err()
+        );
+        assert_eq!(harness.left.current_hash()?, before);
+        harness.left.publish();
+        let snapshot = harness
+            .left
+            .view
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Snapshot lock poisoned"))?
+            .clone();
+        assert!(snapshot.layout_recovery);
+        harness.left.install_busy = true;
+        harness.left.input(Input::Command(Command::Shutdown))?;
+        assert!(
+            harness.left.shutdown,
+            "A durable layout recovery must not trap the user in the app"
+        );
         Ok(())
     }
 

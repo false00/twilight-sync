@@ -393,6 +393,117 @@ fn texture_library_routes_install_switch_and_restore_actions() -> Result<()> {
 }
 
 #[test]
+fn legacy_textures_are_visible_and_cataloguing_requires_consent_and_idle_state() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 3000.0));
+    ui.set_section(4);
+    ui.set_textures_unmanaged(true);
+    ui.set_can_import_textures(true);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    flush();
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Existing textures detected")
+            .next()
+            .is_some()
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(
+            &ui,
+            "No packs installed yet. Choose a pack and install its ZIP or folder below."
+        )
+        .next()
+        .is_none()
+    );
+    activate(&ui, "Add existing textures to library")?;
+    assert!(actions.borrow().is_empty());
+    ui.set_texture_consent(true);
+    activate(&ui, "Add existing textures to library")?;
+    assert_eq!(&*actions.borrow(), &[(Action::ImportExistingTextures, 0)]);
+    ui.set_can_import_textures(false);
+    activate(&ui, "Add existing textures to library")?;
+    assert_eq!(actions.borrow().len(), 1);
+    ui.set_textures_unmanaged(false);
+    flush();
+    assert!(button(&ui, "Add existing textures to library").is_err());
+    Ok(())
+}
+
+#[test]
+fn build_page_scroll_survives_navigation_and_progress_refreshes() -> Result<()> {
+    let ui = fixture()?;
+    ui.window().set_size(slint::LogicalSize::new(900.0, 720.0));
+    ui.set_section(1);
+    ui.set_source_building(true);
+    ui.set_source_busy(true);
+    ui.set_operation_busy(true);
+    ui.set_source_progress_visible(true);
+    ui.set_show_source_activity(true);
+    ui.set_source_activity("Compiling source\nPreparing shaders".into());
+    flush();
+    let scroll = ElementHandle::find_by_element_type_name(&ui, "ScrollView")
+        .next()
+        .context("Missing main scroll view")?;
+    scroll.scroll(0.0, -250.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+    flush();
+    let before = ui.get_scroll_position();
+    assert!(before < -20.0, "The build page did not scroll");
+    for progress in [0.2, 0.3, 0.4] {
+        ui.set_source_progress(progress);
+        ui.set_source_elapsed(format!("{} seconds", progress * 100.0).into());
+        ui.set_source_activity(format!("Compiling module {}", progress * 100.0).into());
+        flush();
+        assert!((ui.get_scroll_position() - before).abs() <= 1.0);
+    }
+    ui.invoke_navigate(1);
+    flush();
+    assert!((ui.get_scroll_position() - before).abs() <= 1.0);
+    ui.invoke_navigate(5);
+    flush();
+    ui.invoke_navigate(1);
+    flush();
+    assert!(
+        (ui.get_scroll_position() - before).abs() <= 1.0,
+        "Returning to the running build lost its scroll position: {before} -> {}",
+        ui.get_scroll_position()
+    );
+    Ok(())
+}
+
+#[test]
+fn source_diff_is_available_in_tools_and_build_review_without_approving_a_build() -> Result<()> {
+    let ui = fixture()?;
+    ui.window()
+        .set_size(slint::LogicalSize::new(1200.0, 1800.0));
+    ui.set_section(1);
+    ui.set_source_mode(true);
+    ui.set_source_tag("v1.2.0".into());
+    ui.set_source_commit("b".repeat(40).into());
+    ui.set_source_comparison("Newer release available.".into());
+    ui.set_can_compare_source(true);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    for step in [0, 2] {
+        ui.set_setup_step(step);
+        flush();
+        activate(&ui, "Compare with installed source")?;
+        assert!(!ui.get_source_consent());
+    }
+    assert_eq!(
+        &*actions.borrow(),
+        &[(Action::CompareSource, 0), (Action::CompareSource, 0)]
+    );
+    ui.set_can_compare_source(false);
+    flush();
+    assert!(button(&ui, "Compare with installed source").is_err());
+    Ok(())
+}
+
+#[test]
 fn themed_confirmation_blocks_background_actions_and_delivers_the_choice() -> Result<()> {
     let ui = fixture()?;
     let answers = Rc::new(RefCell::new(Vec::new()));
@@ -474,7 +585,7 @@ fn slint_navigation_game_selection_and_build_gates_route_real_component_actions(
 }
 
 #[test]
-fn paired_game_file_controls_are_available_in_both_setup_methods() -> Result<()> {
+fn both_setup_methods_link_to_the_single_transfer_permissions_hub() -> Result<()> {
     let ui = fixture()?;
     ui.window()
         .set_size(slint::LogicalSize::new(1200.0, 3000.0));
@@ -486,12 +597,24 @@ fn paired_game_file_controls_are_available_in_both_setup_methods() -> Result<()>
     let recorded = actions.clone();
     ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
     for (game, source) in [(2, true), (1, false), (1, true)] {
+        ui.set_section(1);
         ui.set_selected_game(game);
         ui.set_source_mode(source);
         flush();
-        if button(&ui, "Show transfer controls").is_ok() {
-            activate(&ui, "Show transfer controls")?;
-        }
+        assert!(button(&ui, "Offer prod.keys").is_err());
+        assert!(button(&ui, "Offer OOT .nup").is_err());
+        assert!(button(&ui, "Offer TotK base .nsp").is_err());
+        assert!(
+            ElementHandle::find_by_accessible_label(
+                &ui,
+                "I own this game and allow game-file transfers"
+            )
+            .next()
+            .is_none()
+        );
+        activate(&ui, "Open game-file transfers")?;
+        assert_eq!(ui.get_section(), 5);
+        assert_eq!(ui.get_selected_game(), game);
         if game == 2 {
             activate(&ui, "Offer OOT .nup")?;
             assert_eq!(actions.borrow().last(), Some(&(Action::OfferGameFile, 0)));

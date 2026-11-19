@@ -1439,6 +1439,50 @@ pub(crate) mod tests {
         Ok(source)
     }
 
+    #[test]
+    fn legacy_nested_pack_can_be_catalogued_without_losing_originals_or_settings() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let profile = profile(temp.path())?;
+        let active = profile.join("texture_replacements");
+        let nested = active.join("GZ2").join("Characters");
+        fs::create_dir_all(&nested)?;
+        let name = "tex1_16x16_0123456789abcdef_14.png";
+        let image = png()?;
+        atomic_write(&nested.join(name), &image)?;
+        let before = inventory(temp.path(), Some(&profile))?;
+        assert!(before.unmanaged);
+        assert!(before.packs.is_empty());
+        let pack = import(
+            temp.path(),
+            "tp-definitive-edition-plus",
+            "Existing copy (version unverified)",
+            &active,
+            |_, _| {},
+        )?;
+        let activation = activate(temp.path(), &profile, Some(&pack.id), true, || Ok(()))?;
+        assert_eq!(fs::read(active.join("GZ2").join(name))?, image);
+        assert_eq!(activation.preserved.len(), 1);
+        assert_eq!(
+            fs::read(
+                activation.preserved[0]
+                    .join("GZ2")
+                    .join("Characters")
+                    .join(name)
+            )?,
+            image
+        );
+        let after_restart = inventory(temp.path(), Some(&profile))?;
+        assert_eq!(after_restart.packs.len(), 1);
+        assert_eq!(after_restart.packs[0].source, "tp-definitive-edition-plus");
+        assert_eq!(after_restart.active.as_deref(), Some(pack.id.as_str()));
+        assert!(!after_restart.unmanaged);
+        assert_eq!(read_config(&profile)?.1["game.volume"], 42);
+        activate(temp.path(), &profile, None, false, || Ok(()))?;
+        assert_eq!(fs::read(nested.join(name))?, image);
+        assert!(inventory(temp.path(), Some(&profile))?.unmanaged);
+        Ok(())
+    }
+
     fn profile(root: &Path) -> Result<PathBuf> {
         let profile = root.join("profile");
         fs::create_dir(&profile)?;

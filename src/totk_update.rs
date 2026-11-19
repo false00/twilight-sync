@@ -127,7 +127,7 @@ fn version(value: &str) -> Result<semver::Version> {
         .context("Invalid TotK release version")
 }
 
-fn installed_release(destination: &Path) -> Result<String> {
+pub(crate) fn installed_release(destination: &Path) -> Result<String> {
     let bytes = read_bounded(&destination.join("totk-install.json"), 256 * 1024)
         .context("The TotK installation receipt could not be read; existing program files were not overwritten")?;
     let installation: Installation =
