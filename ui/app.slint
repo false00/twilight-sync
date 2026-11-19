@@ -678,12 +678,17 @@ export component MainWindow inherits Window {
                                 if root.show-source-activity: VerticalLayout {
                                     spacing: 10px;
                                     Muted { text: "LATEST ACTIVITY · NEWEST FIRST"; }
-                                    ScrollView {
+                                    activity-scroll := ScrollView {
                                         height: 170px;
-                                        Text {
-                                            text: root.source-activity == "" ? "Live output will appear here as build tools report it. Vendor SDK installers may use their own windows." : root.source-activity;
-                                            color: Theme.text; font-family: "Consolas"; font-size: 12px;
-                                            wrap: char-wrap; min-width: 0px;
+                                        content-width: self.visible-width;
+                                        VerticalLayout {
+                                            alignment: start;
+                                            padding-right: 16px;
+                                            activity-text := Text {
+                                                text: root.source-activity == "" ? "Live output will appear here as build tools report it. Vendor SDK installers may use their own windows." : root.source-activity;
+                                                color: Theme.text; font-family: "Consolas"; font-size: 12px;
+                                                wrap: char-wrap; min-width: 0px;
+                                            }
                                         }
                                     }
                                     ActionButton { text: "Open full log externally"; available: root.source-log != ""; subtle: true; clicked => { root.action(Action.open-log, 0); } }
@@ -836,7 +841,7 @@ export component MainWindow inherits Window {
                                     SwitchRow { title: "AMD FSR 4"; checked: root.fsr; available: root.can-manage; toggled(value) => { root.toggle(Toggle.fsr, value); } }
                                     SwitchRow { title: "NVIDIA DLSS / frame generation"; description: "Enable only after reviewing and accepting NVIDIA's SDK terms."; checked: root.nvidia; available: root.can-manage; toggled(value) => { root.toggle(Toggle.nvidia, value); } }
                                     ActionButton { text: "Review NVIDIA SDK terms"; clicked => { root.action(Action.nvidia-terms, 0); } }
-                                    SwitchRow { title: "Prepare shaders after compiling"; checked: root.shaders; available: root.can-manage; toggled(value) => { root.toggle(Toggle.shaders, value); } }
+                                    SwitchRow { title: "Prepare shaders after compiling"; description: "Recommended for smoother play. An empty or incompatible cache can take hours to prepare."; checked: root.shaders; available: root.can-manage; toggled(value) => { root.toggle(Toggle.shaders, value); } }
                                 }
                                 SwitchRow { title: "I reviewed the source and approve this build"; description: "I own the required game files and accept running this revision's scripts and dependencies."; checked: root.source-consent; available: root.can-manage && root.source-tag != ""; toggled(value) => { root.toggle(Toggle.source-consent, value); } }
                                 if root.source-blocker != "": Muted { text: root.source-blocker; }

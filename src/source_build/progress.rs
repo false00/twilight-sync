@@ -9,6 +9,9 @@ use std::{
 
 const LIVE_BYTES: usize = 64 * 1024;
 const MAX_LINE: usize = 8192;
+const ACTIVITY_LINES: usize = 12;
+const ACTIVITY_BYTES: usize = 16 * 1024;
+const OMITTED_LINE: &str = "A verbose line was omitted; see the full log for complete output.";
 const STALE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,7 @@ impl std::fmt::Display for Update {
 pub struct Report {
     pub stage: String,
     pub fraction: Option<f64>,
+    pub unmeasurable_progress: bool,
     pub completed: Option<u64>,
     pub total: Option<u64>,
     pub unit: String,
@@ -55,6 +59,9 @@ pub struct Report {
 
 impl Report {
     pub fn work_text(&self) -> String {
+        if self.unmeasurable_progress {
+            return "This phase has no reliable percentage".into();
+        }
         let work = match (self.completed, self.total) {
             (Some(done), Some(total)) if self.unit == "bytes" && total >= 1024 => {
                 let (scale, unit) = if total >= 1024 * 1024 * 1024 {
@@ -108,11 +115,9 @@ impl State {
     pub fn apply(&mut self, update: Update) -> String {
         match update {
             Update::Stage(stage) => {
-                let activity = std::mem::take(&mut self.report.activity);
-                let activity = std::iter::once(stage.chars().take(240).collect::<String>())
-                    .chain(activity.lines().take(11).map(String::from))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let activity = recent_activity(
+                    std::iter::once(stage.as_str()).chain(self.report.activity.lines()),
+                );
                 self.report = Report {
                     stage,
                     activity,
@@ -133,6 +138,26 @@ impl State {
             })
             .unwrap_or_default()
     }
+}
+
+fn recent_activity<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
+    let mut activity = String::new();
+    for line in lines.into_iter().take(ACTIVITY_LINES) {
+        let line = if line.len() > ACTIVITY_BYTES {
+            OMITTED_LINE
+        } else {
+            line
+        };
+        let separator = !activity.is_empty();
+        if activity.len() + usize::from(separator) + line.len() > ACTIVITY_BYTES {
+            break;
+        }
+        if separator {
+            activity.push('\n');
+        }
+        activity.push_str(line);
+    }
+    activity
 }
 
 pub fn duration_text(duration: Duration) -> String {
@@ -181,10 +206,10 @@ impl Tracker {
     }
 
     fn activity(&mut self, line: &str) {
-        if self.lines.len() == 12 {
+        if self.lines.len() == ACTIVITY_LINES {
             self.lines.pop_front();
         }
-        self.lines.push_back(line.chars().take(240).collect());
+        self.lines.push_back(line.into());
     }
 
     fn stage(&mut self, key: &str, title: &str, at: Duration) {
@@ -194,6 +219,8 @@ impl Tracker {
         self.key = key.into();
         self.report = Report {
             stage: title.chars().take(240).collect(),
+            // Triforce reuses weighted progress ranges for different shader passes.
+            unmeasurable_progress: key == "shaders" || key.starts_with("shaders/"),
             ..Report::default()
         };
         self.baseline = None;
@@ -264,12 +291,34 @@ impl Tracker {
             self.stage(key, title, at);
             return;
         }
+        if self.report.unmeasurable_progress
+            && let Some(message) = line.strip_prefix("[hos host] vk: ")
+        {
+            if self.key == "shaders"
+                && ((message.starts_with("prepared ") && message.contains(" shader programs ("))
+                    || message.starts_with("the shaders are prepared, but their driver's part "))
+            {
+                self.stage(
+                    "shaders/pipelines",
+                    "Preparing Vulkan pipeline libraries",
+                    at,
+                );
+            } else if (message.starts_with("warmed ") && message.contains(" stage libraries of "))
+                || message.starts_with("precompile: ")
+            {
+                self.stage("shaders/finalizing", "Finalizing Vulkan pipeline cache", at);
+            }
+            self.activity(line);
+            return;
+        }
         if let Some(value) = line.strip_prefix("@@progress ") {
             if let Ok(fraction) = value.trim().parse::<f64>()
                 && fraction.is_finite()
                 && (0.0..=1.0).contains(&fraction)
             {
-                self.reported_fraction(fraction, at);
+                if !self.report.unmeasurable_progress {
+                    self.reported_fraction(fraction, at);
+                }
             } else {
                 self.activity(line);
             }
@@ -363,13 +412,7 @@ impl Tracker {
         report.quiet_for = at.saturating_sub(self.output_at);
         report.stalled = report.fraction.is_some_and(|fraction| fraction < 1.0)
             && at.saturating_sub(self.advanced_at) >= STALE;
-        report.activity = self
-            .lines
-            .iter()
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
+        report.activity = recent_activity(self.lines.iter().rev().map(String::as_str));
         if let Some((recorded, eta)) = self.supplied_eta
             && at.saturating_sub(recorded) < STALE
         {
@@ -441,9 +484,7 @@ impl Reader {
                 } else {
                     self.pending.clear();
                     self.discard_line = true;
-                    self.tracker.activity(
-                        "A verbose line was omitted; see the full log for complete output.",
-                    );
+                    self.tracker.activity(OMITTED_LINE);
                 }
             }
         }
@@ -488,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn oot_reuses_cached_module_counts_and_prefers_builder_progress_and_eta() -> Result<()> {
+    fn oot_reuses_cached_module_counts_and_prefers_builder_progress_and_eta() {
         let mut tracker = Tracker::new("Building OOT");
         tracker.feed("@@stage compile Compiling", seconds(0));
         tracker.feed("@@plan 142 500", seconds(0));
@@ -506,19 +547,55 @@ mod tests {
         tracker.feed("@@stage shaders Preparing shaders", seconds(10));
         assert!(tracker.snapshot(seconds(10)).total.is_none());
         assert!(tracker.snapshot(seconds(10)).eta.is_none());
-        tracker.feed("@@progress 0.3", seconds(20));
-        tracker.feed("@@progress 0.4", seconds(30));
-        let report = tracker.snapshot(seconds(30));
-        assert!(
-            (report
-                .eta
-                .ok_or_else(|| anyhow::anyhow!("Missing measured shader ETA"))?
-                .as_secs_f64()
-                - 60.0)
-                .abs()
-                < 0.01
+    }
+
+    #[test]
+    fn oot_shader_passes_report_activity_without_a_misleading_percentage_or_eta() {
+        let mut tracker = Tracker::new("Building OOT");
+        tracker.feed("@@stage shaders Preparing shaders", seconds(0));
+        tracker.feed("@@progress 0.001", seconds(1));
+        tracker.feed("@@progress 0.699", seconds(1510));
+        let report = tracker.snapshot(seconds(1510));
+        assert_eq!(report.stage, "Preparing shaders");
+        assert!(report.unmeasurable_progress);
+        assert!(report.fraction.is_none());
+        assert!(report.eta.is_none());
+
+        tracker.feed("@@progress 0.000", seconds(1511));
+        tracker.feed(
+            "[hos host] vk: prepared 38809 shader programs (46579 new, 88 failed) in 1511.0 s",
+            seconds(1511),
         );
-        Ok(())
+        tracker.feed("@@progress 0.001", seconds(1512));
+        tracker.feed("@@progress 0.067", seconds(5600));
+        let report = tracker.snapshot(seconds(5605));
+        assert_eq!(report.stage, "Preparing Vulkan pipeline libraries");
+        assert_eq!(report.quiet_for, seconds(5));
+        assert!(report.fraction.is_none());
+        assert!(report.eta.is_none());
+        tracker.feed(
+            "[hos host] vk: warmed 85048 stage libraries of 42524 kept shader program variants in 13377.4 s",
+            seconds(14888),
+        );
+        tracker.feed("@@progress 0.900", seconds(14902));
+        let report = tracker.snapshot(seconds(14902));
+        assert_eq!(report.stage, "Finalizing Vulkan pipeline cache");
+        assert!(report.fraction.is_none());
+        assert!(report.eta.is_none());
+    }
+
+    #[test]
+    fn oot_rewarming_for_a_different_driver_does_not_require_a_translation_summary() {
+        let mut tracker = Tracker::new("Building OOT");
+        tracker.feed("@@stage shaders Preparing shaders", seconds(0));
+        tracker.feed(
+            "[hos host] vk: the shaders are prepared, but their driver's part was made for another driver or other settings: made again",
+            seconds(1),
+        );
+        assert_eq!(
+            tracker.snapshot(seconds(1)).stage,
+            "Preparing Vulkan pipeline libraries"
+        );
     }
 
     #[test]
@@ -607,6 +684,24 @@ mod tests {
     }
 
     #[test]
+    fn live_reader_preserves_complete_long_lines_within_the_activity_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("build.log");
+        File::create(&path)?;
+        let mut reader = Reader::new(&path, "Compiling")?;
+        let mut writer = OpenOptions::new().append(true).open(&path)?;
+        let lines: Vec<_> = (0..3)
+            .map(|index| format!("Build output {} completion-{index}", "x".repeat(6000)))
+            .collect();
+        for line in &lines {
+            writeln!(writer, "{line}")?;
+        }
+        let report = reader.poll(seconds(1))?;
+        assert_eq!(report.activity, format!("{}\n{}", lines[2], lines[1]));
+        Ok(())
+    }
+
+    #[test]
     fn live_reader_bounds_verbose_output_and_reports_omissions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("build.log");
@@ -624,7 +719,7 @@ mod tests {
         assert_eq!(report.fraction, Some(0.5));
         assert!(report.activity.contains("Older verbose output omitted"));
         assert_eq!(report.stage, "Processing latest build output");
-        assert!(report.activity.len() <= 12 * 960 + 11);
+        assert!(report.activity.len() <= ACTIVITY_BYTES);
         assert!(reader.pending.len() <= MAX_LINE);
         Ok(())
     }

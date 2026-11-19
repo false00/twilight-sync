@@ -947,8 +947,6 @@ pub(super) fn build(
 
 fn stage_triforce_caches(previous: &Path, output: &Path) -> Result<bool> {
     const PROGRAMS: &str = "triforce_programs.bin";
-    const PIPELINES: &str = "mkw_vk_pipelines.bin";
-    const STAMP: &str = "mkw_vk_pipelines.bin.for";
     let size = |name| -> Result<u64> {
         let path = previous.join(name);
         ensure_safe_path(&path)?;
@@ -964,8 +962,13 @@ fn stage_triforce_caches(previous: &Path, output: &Path) -> Result<bool> {
     if (1..=MAX_CACHE).contains(&size(PROGRAMS)?) {
         names.push(PROGRAMS);
     }
-    if (33..=MAX_CACHE).contains(&size(PIPELINES)?) && size(STAMP)? == 16 {
-        names.extend([PIPELINES, STAMP]);
+    for (cache, stamp) in [
+        ("mkw_vk_pipelines.bin", "mkw_vk_pipelines.bin.for"),
+        ("mkw_vk_pipelines_play.bin", "mkw_vk_pipelines_play.bin.for"),
+    ] {
+        if (33..=MAX_CACHE).contains(&size(cache)?) && size(stamp)? == 16 {
+            names.extend([cache, stamp]);
+        }
     }
     if names.is_empty() {
         return Ok(false);
@@ -1399,6 +1402,30 @@ mod tests {
             &b"the shaders were not prepared now (no usable Vulkan here): the game prepares them at its first start\r\n@@done\n"[..],
         );
         assert!(error.is_err_and(|error| error.to_string().contains("no usable Vulkan here")));
+        Ok(())
+    }
+
+    #[test]
+    fn triforce_reuses_the_play_cache_only_with_its_own_stamp() -> Result<()> {
+        let current = tempfile::tempdir()?;
+        let output = tempfile::tempdir()?;
+        let cache = "mkw_vk_pipelines_play.bin";
+        let stamp = "mkw_vk_pipelines_play.bin.for";
+        fs::write(current.path().join(cache), [4; 64])?;
+        fs::write(current.path().join("mkw_vk_pipelines.bin.for"), [1; 16])?;
+        assert!(!stage_triforce_caches(current.path(), output.path())?);
+        fs::write(current.path().join(stamp), [9; 15])?;
+        assert!(!stage_triforce_caches(current.path(), output.path())?);
+        fs::write(current.path().join(stamp), [9; 16])?;
+        assert!(stage_triforce_caches(current.path(), output.path())?);
+        assert_eq!(fs::read(output.path().join(cache))?, [4; 64]);
+        assert_eq!(fs::read(output.path().join(stamp))?, [9; 16]);
+        assert!(
+            !output
+                .path()
+                .join("mkw_vk_pipelines.bin.for")
+                .try_exists()?
+        );
         Ok(())
     }
 

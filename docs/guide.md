@@ -660,13 +660,17 @@ The flow:
    as gameplay, so the paired PC can still reserve and play its existing game.
    Game setup shows live stage progress, completed/total work, elapsed time and
    an estimated time left **for the current stage**, not a fabricated whole-build
-   countdown. OOT's builder estimates use its measurements from this PC when
+   countdown. OOT's compiler estimates use its measurements from this PC when
    available; otherwise estimates use observed progress after enough work has
-   completed. TotK's byte/item counters and CMake/Ninja compiler output are
+   completed. Vulkan shader preparation, pipeline library preparation and cache
+   finalization are shown separately without a percentage or ETA: upstream
+   reuses the same progress ranges for passes that take very different amounts
+   of time. TotK's byte/item counters and CMake/Ninja compiler output are
    recognized too. New phases, reset counters and stalls discard stale estimates;
    silent or unmeasurable phases remain indeterminate. **Show live activity**
-   displays recent output inside the app, newest first. This view is bounded and
-   refreshed in the build worker, so verbose output does not flood the GUI.
+   displays recent output inside the app, newest first. Long lines wrap within
+   the panel, and you can scroll through the recent lines. The view stays bounded
+   and is refreshed in the build worker, so verbose output does not flood the GUI.
    **Open full log externally**, inside that panel, remains an optional diagnostic
    action; omitted verbose lines remain in the full log.
    Build settings, approvals and local game-input selections are locked during
@@ -679,10 +683,14 @@ The flow:
    Actual running games and play reservations remain protected; a completed
    build cannot replace the selected installation until play has finished.
    Triforce prepares shaders before the new installation is
-   selected by default. It seeds rebuilds with shader caches from the previous
-   local install; Triforce checks compatibility and still prepares missing
-   shaders. A cold cache can take hours. The advanced graphics option to skip
-   preparation moves that work to first launch.
+   selected by default to reduce first-use stutter during play. It seeds rebuilds
+   with shader caches from the previous local install, including stamped
+   pipelines compiled during play. Triforce checks compatibility and rebuilds
+   what it cannot reuse. Warming the Vulkan driver's pipeline libraries with a
+   cold cache can take hours. Triforce selects shader workers separately based
+   on CPU and available RAM; the source compiler worker limit does not affect
+   this phase. The advanced graphics option to skip preparation defers the work
+   to the game.
 6. Play, incoming replacement and automatic sync are paused during compilation.
    Windows jobs own build process trees so cancellation or manager termination
    stops those helpers. This is lifecycle control, **not isolation from malicious

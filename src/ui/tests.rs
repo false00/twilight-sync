@@ -131,6 +131,51 @@ fn source_progress_and_live_activity_fit_handhelds_and_keep_actions_in_app() -> 
 }
 
 #[test]
+fn live_build_activity_wraps_long_lines_and_scrolls_to_the_last_line_on_handhelds() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_section(1);
+    ui.set_source_building(true);
+    ui.set_operation_busy(true);
+    ui.set_show_source_activity(true);
+    let folder = r"C:\Builds\";
+    let nested = r"long-library-folder\".repeat(40);
+    let activity = (0..6)
+        .map(|index| format!(r"Compiling {folder}{nested}module_{index}.cpp"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ui.set_source_activity(activity.into());
+    for width in [720.0, 900.0] {
+        ui.window().set_size(slint::LogicalSize::new(width, 720.0));
+        flush();
+        let scroll = ElementHandle::find_by_element_id(&ui, "MainWindow::activity-scroll")
+            .next()
+            .context("Missing live activity scroll view")?;
+        let text = ElementHandle::find_by_element_id(&ui, "MainWindow::activity-text")
+            .next()
+            .context("Missing live activity output")?;
+        ensure!(
+            text.size().width > 0.0 && text.size().width <= scroll.size().width,
+            "Long log lines overflowed the scroll view at {width}px"
+        );
+        ensure!(
+            text.size().height > scroll.size().height,
+            "Wrapped activity was clipped instead of growing the scrollable content at {width}px"
+        );
+        scroll.scroll(0.0, -5000.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        flush();
+        let top = scroll.absolute_position().y;
+        let bottom = text.absolute_position().y + text.size().height;
+        ensure!(
+            text.absolute_position().y < top
+                && (top..=top + scroll.size().height + 1.0).contains(&bottom),
+            "Cannot scroll to the end of the wrapped log at {width}px"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> Result<()> {
     let ui = fixture()?;
     ui.window().set_size(slint::LogicalSize::new(900.0, 2000.0));

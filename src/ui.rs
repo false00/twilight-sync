@@ -1720,7 +1720,9 @@ impl Controller {
                 .eta
                 .map(|eta| format!("About {}", source_build::progress::duration_text(eta)))
                 .unwrap_or_else(|| {
-                    if report.stalled {
+                    if report.unmeasurable_progress {
+                        "Not available".into()
+                    } else if report.stalled {
                         "Re-estimating".into()
                     } else {
                         "Estimating…".into()
