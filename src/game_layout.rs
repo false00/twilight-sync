@@ -158,6 +158,10 @@ pub(crate) fn prepare(
     if from == destination {
         return Ok(None);
     }
+    let legacy = root.join("apps");
+    if !from.starts_with(destination) && !from.starts_with(&legacy) {
+        return Ok(None);
+    }
     ensure_safe_path(from)?;
     ensure_safe_path(destination)?;
     #[cfg(windows)]
@@ -165,10 +169,6 @@ pub(crate) fn prepare(
         from.components().next() == destination.components().next(),
         "The managed game is on a different drive. Automatic folder relocation was deferred; the working installation remains unchanged"
     );
-    let legacy = root.join("apps");
-    if !from.starts_with(destination) && !from.starts_with(&legacy) {
-        return Ok(None);
-    }
     let mut version = install::VersionCache::default();
     version.refresh(game, Some(from));
     if let Some(error) = version.state.error {
@@ -621,6 +621,18 @@ mod tests {
     fn unmanaged_destinations_and_busy_games_are_never_moved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (manager, destination, nested) = setup(temp.path())?;
+        assert!(
+            prepare(
+                &manager,
+                GameId::Triforce,
+                Path::new(r"Z:\unmanaged-game"),
+                Path::new(r"Z:\unmanaged-game\Triforce.exe"),
+                &destination,
+                None,
+                &temp.path().join("profile"),
+            )?
+            .is_none()
+        );
         let from = manager.join("apps").join("managed");
         fs::create_dir_all(from.parent().context("Missing apps parent")?)?;
         fs::rename(&nested, &from)?;
