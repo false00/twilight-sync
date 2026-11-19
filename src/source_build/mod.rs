@@ -723,8 +723,15 @@ pub(crate) fn preserve_dusklight(executable: &Path, output: &Path) -> Result<()>
     Ok(())
 }
 
-fn preserve(request: &Request, previous: &Path, output: &Path) -> Result<()> {
+fn preserve_current_data(
+    request: &Request,
+    previous: &Path,
+    output: &Path,
+    executable: &Path,
+) -> Result<Option<String>> {
     let game = request.plan.game;
+    // Compilation is isolated from saves; take the baseline at the handoff.
+    let expected_save = save_hash(game, previous, request.previous_executable.as_deref())?;
     if game == GameId::Dusklight {
         if let Some(executable) = &request.previous_executable {
             preserve_dusklight(executable, output)?;
@@ -759,7 +766,15 @@ fn preserve(request: &Request, previous: &Path, output: &Path) -> Result<()> {
             files::atomic_write(&path, &environment)?;
         }
     }
-    Ok(())
+    ensure!(
+        save_hash(game, previous, request.previous_executable.as_deref())? == expected_save,
+        "Progress changed while copying saves; the previous installation was not replaced or selected"
+    );
+    ensure!(
+        save_hash(game, output, Some(executable))? == expected_save,
+        "The staged build does not preserve the current save; activation was refused"
+    );
+    Ok(expected_save)
 }
 
 pub(crate) fn games_stopped() -> Result<()> {
@@ -946,7 +961,6 @@ pub fn build(
         .previous_install
         .clone()
         .unwrap_or(install::default_directory(game)?);
-    let before = save_hash(game, &previous, request.previous_executable.as_deref())?;
     let destination = install::default_directory(game)?;
     fs::create_dir_all(&destination)?;
     let minimum = if game == GameId::Dusklight {
@@ -982,7 +996,7 @@ pub fn build(
     let output = output_stage.path().join("game");
     fs::create_dir(&output)?;
     let mut runner = Runner::new(&request.log, cancel, progress)?;
-    let result: Result<(PathBuf, String)> = (|| {
+    let result: Result<(PathBuf, String, Option<String>)> = (|| {
         let mut tools = Toolset::new(root)?;
         let git = tools.ensure(
             Package::Git,
@@ -1037,20 +1051,12 @@ pub fn build(
             );
         }
         games_stopped()?;
-        ensure!(
-            save_hash(game, &previous, request.previous_executable.as_deref())? == before,
-            "Progress changed while building; the previous installation was not replaced or selected"
-        );
         runner.message(if game == GameId::Triforce {
             "Preserving saves, settings and mods; selecting the locally built Vulkan renderer in the new folder (the previous folder is unchanged)..."
         } else {
             "Preserving saves, local settings and mods in the staged build..."
         })?;
-        preserve(&request, &previous, &output)?;
-        ensure!(
-            save_hash(game, &output, Some(&executable))? == before,
-            "The staged build does not preserve the current save; activation was refused"
-        );
+        let expected_save = preserve_current_data(&request, &previous, &output, &executable)?;
         check_cancelled(cancel)?;
         let sha256 = install::digest_file(&executable, executable.metadata()?.len())?;
         files::atomic_write(
@@ -1067,10 +1073,10 @@ pub fn build(
             })?,
         )?;
         runner.message("Cleaning up temporary source build files...")?;
-        Ok((executable, sha256))
+        Ok((executable, sha256, expected_save))
     })();
     let cleanup = finish_workspace(workspace, game, result.is_ok(), &runner);
-    let (executable, sha256) = result
+    let (executable, sha256, expected_save) = result
         .and_then(|verified| cleanup.map(|()| verified))
         .with_context(|| {
             format!(
@@ -1088,7 +1094,7 @@ pub fn build(
         sha256,
         source: rebuild_source.map(Path::to_path_buf),
         log: request.log,
-        expected_save: before,
+        expected_save,
     })
 }
 
@@ -1382,12 +1388,16 @@ mod tests {
     }
 
     #[test]
-    fn source_build_preservation_and_activation_never_replace_changed_progress() -> Result<()> {
+    fn source_build_preserves_latest_progress_but_refuses_changes_before_activation() -> Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let previous = temp.path().join("previous");
         let next = temp.path().join("next");
         crate::triforce::tests::seed(&previous.join("user"), 3)?;
+        let at_build_start = save_hash(GameId::Triforce, &previous, None)?;
         fs::create_dir_all(&next)?;
+        let executable = next.join("Triforce.exe");
+        fs::write(&executable, b"synthetic file, never executed")?;
         fs::write(previous.join("triforce_options.ini"), b"local graphics")?;
         let environment = b"RX_BACKEND=webgpu\r\nRX_VK_NOOPT=1\r\n";
         fs::write(previous.join("triforce_env.txt"), environment)?;
@@ -1404,8 +1414,10 @@ mod tests {
             approved: true,
             log: temp.path().join("log.txt"),
         };
-        preserve(&request, &previous, &next)?;
-        let expected = crate::triforce::snapshot(&previous.join("user"))?.map(|save| save.hash);
+        crate::triforce::tests::seed(&previous.join("user"), 4)?;
+        let expected = preserve_current_data(&request, &previous, &next, &executable)?;
+        assert_ne!(expected, at_build_start);
+        assert_eq!(expected, save_hash(GameId::Triforce, &previous, None)?);
         assert_eq!(
             crate::triforce::snapshot(&next.join("user"))?.map(|save| save.hash),
             expected
@@ -1417,8 +1429,6 @@ mod tests {
         assert_eq!(fs::read(previous.join("triforce_env.txt"))?, environment);
         let copied = fs::read_to_string(next.join("triforce_env.txt"))?;
         assert!(copied.contains("RX_VK_NOOPT=1") && copied.ends_with("RX_BACKEND=vulkan\n"));
-        let executable = next.join("Triforce.exe");
-        fs::write(&executable, b"synthetic file, never executed")?;
         let built = Built {
             game: GameId::Triforce,
             executable,

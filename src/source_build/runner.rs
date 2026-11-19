@@ -14,6 +14,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn totk_update_error(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line.starts_with('{') || !line.contains("check.update_wrong_version") {
+        return None;
+    }
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    if event["type"] != "error" || event["id"] != "check.update_wrong_version" {
+        return None;
+    }
+    let found = event["params"]["found"].as_str()?;
+    let wanted = event["params"]["wanted"].as_str()?;
+    let is_version = |version: &str| semver::Version::parse(version).is_ok();
+    if !wanted.split(" / ").all(is_version) || (found != "unknown" && !is_version(found)) {
+        return None;
+    }
+    let reason = if found == "unknown" {
+        "The approved TotK release could not identify the selected update.".to_owned()
+    } else {
+        format!("The approved TotK release does not support the selected update (version {found}).")
+    };
+    Some(format!(
+        "{reason} Supported updates: {wanted}. In Game setup > TotK, use Choose TotK update (.nsp) to select a separate supported update from your own game files, then retry."
+    ))
+}
+
 fn failure_summary(path: &Path) -> Result<String> {
     let mut errors = VecDeque::new();
     let mut tail = VecDeque::new();
@@ -24,7 +49,9 @@ fn failure_summary(path: &Path) -> Result<String> {
         }
         let lower = line.to_ascii_lowercase();
         let message: String = line.chars().take(1000).collect();
-        if lower.contains("error:")
+        let update_error = totk_update_error(&message);
+        if update_error.is_some()
+            || lower.contains("error:")
             || lower.contains(": error ")
             || lower.contains("fatal error")
             || lower.starts_with("failed:")
@@ -33,7 +60,7 @@ fn failure_summary(path: &Path) -> Result<String> {
             if errors.len() == 6 {
                 errors.pop_front();
             }
-            errors.push_back(message.clone());
+            errors.push_back(update_error.unwrap_or_else(|| message.clone()));
         }
         if tail.len() == 6 {
             tail.pop_front();
@@ -279,6 +306,32 @@ mod tests {
         let summary = failure_summary(&path)?;
         assert!(summary.contains("fatal error C1083"));
         assert!(!summary.contains("Compiled another object"));
+        Ok(())
+    }
+
+    #[test]
+    fn totk_update_failure_identifies_the_selected_input_and_supported_versions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("build.log");
+        for (found, reason) in [
+            ("unknown", "could not identify the selected update"),
+            (
+                "1.4.4",
+                "does not support the selected update (version 1.4.4)",
+            ),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"type":"error","id":"check.update_wrong_version","params":{{"found":"{found}","wanted":"1.2.1 / 1.4.3 / 1.1.0"}},"step":"check"}}"#
+                ),
+            )?;
+            let summary = failure_summary(&path)?;
+            assert!(summary.contains(reason), "{summary}");
+            assert!(summary.contains("Supported updates: 1.2.1 / 1.4.3 / 1.1.0."));
+            assert!(summary.contains("In Game setup > TotK, use Choose TotK update (.nsp)"));
+            assert!(!summary.contains("check.update_wrong_version"));
+        }
         Ok(())
     }
 }

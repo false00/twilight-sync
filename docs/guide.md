@@ -697,7 +697,10 @@ The flow:
    scripts**. Copies, downloads or archive verification may take time to finish
    after a cancellation request.
 7. Built Windows x64 headers, executable hashes and preserved save hashes are
-   checked before selection. Output is prepared separately, then promoted to
+   checked before selection. Saves are copied after compilation so the staged
+   install preserves the latest committed progress. Changes during that copy
+   or before activation still leave the previous installation selected.
+   Output is prepared separately, then promoted to
    `Games\Dusklight`, `Games\TotKRecomp`, or `Games\Triforce` when idle.
    The previous container is moved into a uniquely named
    `.twilight-sync-backup-*` sibling directory; selected input paths into it are
@@ -726,7 +729,11 @@ MacNativeGames shader-reference history is fetched as source; normal gameplay is
 not started, although shader preparation may open a window.
 The installer runs in its Python 3.14 environment with the pinned upstream
 `requirements-installer.txt` packages; Python 3.12 remains separate for the
-development build tools.
+development build tools. If that release cannot identify or does not support
+the selected update, the build failure lists the supported versions. In
+**Game setup > TotK**, use **Choose TotK update (.nsp)** to select a separate
+supported update, not the base game. A successful file transfer does not verify
+the update version.
 
 Triforce uses `python -I -B nx2/make_game.py` against a new output folder, never
 `--update` against the working install. Its game and Vulkan renderer are compiled
