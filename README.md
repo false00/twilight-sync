@@ -178,9 +178,12 @@ compilers, and dependencies run with your Windows account's permissions.
 This is not a sandbox. Use a separate VM for code you do not trust.
 
 Native builds need at least **64 GiB free**, plus room for copied local data;
-the complete process can take an hour or more. Workspaces and old installs
-are retained. Shader preparation may open a window, but normal gameplay does
-not start as part of the build.
+the complete process can take an hour or more. Temporary workspaces are cleaned
+up after the build. TotK keeps the setup it needs for in-game mod rebuilds,
+and verified source updates trim the previous managed build's replaced program,
+regenerable caches and duplicate game data without deleting saves, mods or
+selected inputs. Shader preparation may open a window, but normal gameplay
+does not start as part of the build.
 
 Triforce builds include their required Vulkan/SDL and movie/audio dependencies.
 Optional graphics controls are separate from what the game needs to run.

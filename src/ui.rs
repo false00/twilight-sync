@@ -1692,17 +1692,12 @@ impl Controller {
             Some(source_build::Completion::NeedsActivation(_))
         ));
         if let Some(completion) = snapshot.source.completion {
-            let (completed_game, ready) = match completion {
-                source_build::Completion::Ready(game) => (game, true),
-                source_build::Completion::NeedsActivation(game) => (game, false),
+            let completed_game = match completion {
+                source_build::Completion::Ready(game)
+                | source_build::Completion::NeedsActivation(game) => game,
             };
             ui.set_build_result_game(model::index(completed_game));
-            ui.set_build_result_detail(format!("{} — {}", model::title(completed_game),
-                if ready {
-                    "Your built copy is installed and selected. Open Play when you're ready; the game was not started automatically."
-                } else {
-                    "Game files were built, but activation needs attention before this copy can be used. View the build to resolve it safely."
-                }).into());
+            ui.set_build_result_title(model::title(completed_game).into());
         }
         let progress = &snapshot.source.progress;
         let report = &progress.report;

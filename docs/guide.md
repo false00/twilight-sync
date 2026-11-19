@@ -675,7 +675,7 @@ The flow:
    action; omitted verbose lines remain in the full log.
    Build settings, approvals and local game-input selections are locked during
    the operation; navigation and read-only browsing stay available. After a
-   verified build is selected successfully, a persistent green completion banner
+   verified build is selected successfully, a compact green **Build complete** notice
    appears across pages with **Go to Play** / **View build** actions. It does not
    launch the game or bypass play reservations. If compilation succeeds but
    activation is blocked, an amber banner explicitly says activation is required
@@ -699,11 +699,18 @@ The flow:
 7. Built Windows x64 headers, executable hashes and preserved save hashes are
    checked before selection. Output is prepared separately, then promoted to
    `Games\Dusklight`, `Games\TotKRecomp`, or `Games\Triforce` when idle.
-   Previous containers, saves and mods remain in a uniquely named
-   `.twilight-sync-backup-*` sibling directory; selected input paths into retained
-   containers are remapped. A durable journal resumes an interrupted promotion
-   before play or transfers are allowed. Conflicting metadata is never overwritten.
+   The previous container is moved into a uniquely named
+   `.twilight-sync-backup-*` sibling directory; selected input paths into it are
+   remapped. A durable journal resumes an interrupted promotion before play or
+   transfers are allowed. Conflicting metadata is never overwritten.
    Verified nonempty source-build activation retains its existing common sync base.
+   After an in-session source promotion finishes, Twilight Sync can compact the
+   previous recorded source installation. It removes the verified old executable,
+   named regenerable Triforce caches and copies of extracted game data that still
+   match the active installation byte for byte. Play and settings changes wait
+   while files are checked. Referenced containers, unmatched data, saves, mods and
+   unrecognized files are left intact. A compacted folder is not a full playable
+   rollback; earlier backup folders are not scanned or altered automatically.
 8. **Game setup** shows recorded installed official/source versions. Source checks
    distinguish a newer release, downgrade, same revision, changed revision under
    the same tag, or unknown ordering. **Compare with installed source** opens the
@@ -741,10 +748,16 @@ preparation can be disabled deliberately, rather than silently stripping all
 optional features from every build. Shader preparation is not normal gameplay.
 
 Logs and a `twilight-source.json` receipt record source/tool provenance. No source
-failure falls back to downloading a prebuilt game. Failed workspaces, successful
-workspaces and previous installs are retained for diagnosis/rebuild support and
-are not automatically pruned. Native builds require at least 64 GiB free; the
-portable-data/mod copy is additional. Keep game-derived workspaces private.
+failure falls back to downloading a prebuilt game. Twilight Sync removes the
+current run's temporary workspace after a successful Dusklight or Triforce build,
+and after a failed or cancelled build of any game. Successful TotK builds keep
+the source, tools, Python environment and incremental build files used by the
+in-game mod rebuild command; the package download and restore caches are removed.
+Logs, verified tool archives and the active game's shader caches are kept.
+Older workspaces and files left by a force-quit are not removed
+automatically. If cleanup is blocked, the build log records the path and reason.
+Native builds still require at least 64 GiB free; the portable-data/mod copy is
+additional. Keep game-derived workspaces private.
 
 ### Triforce save channel
 
@@ -1025,7 +1038,7 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
         archives\          Rechecked official tool ZIPs; fresh tool extractions are temporary
     build-logs\            Captured local source-build output
     source-builds\
-        <game>\<tag>-<commit>-<id>\  Retained source, Python environments and game-derived work
+        <game>\<tag>-<commit>-<id>\  Temporary build workspace; retained for successful TotK mod rebuilds
 ```
 
 New game installations default to `%USERPROFILE%\Games`:
@@ -1035,7 +1048,7 @@ Games\
     Dusklight\            Selected Dusklight game and installation receipt
     TotKRecomp\            Native TotK game, profile, settings and mods
     Triforce\              Native OoT game, user saves and local graphics settings
-    .twilight-sync-backup-<id>\  Retained previous container; not automatically deleted
+    .twilight-sync-backup-<id>\  Retained prior data; eligible source backups are compacted
 ```
 
 Updater caches and application settings remain in `.twilight-sync`; they are not

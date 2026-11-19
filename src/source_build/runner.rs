@@ -67,12 +67,18 @@ impl<'a> Runner<'a> {
         })
     }
 
-    pub fn message(&mut self, text: &str) -> Result<()> {
-        check_cancelled(self.cancel)?;
+    pub(super) fn note(&self, text: &str) -> Result<()> {
+        ensure_safe_path(&self.log)?;
         writeln!(
             OpenOptions::new().append(true).open(&self.log)?,
             "\n== {text} =="
         )?;
+        Ok(())
+    }
+
+    pub fn message(&mut self, text: &str) -> Result<()> {
+        check_cancelled(self.cancel)?;
+        self.note(text)?;
         (self.progress)(Update::Stage(text.into()))
     }
 

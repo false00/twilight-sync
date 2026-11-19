@@ -24,6 +24,15 @@ export struct ToolRow { name: string, detail: string, ready: bool, busy: bool, s
 export struct PackCard { title: string, detail: string, metadata: string, active: bool }
 export struct TextureCreator { name: string, description: string, version: string, has-site: bool }
 
+component CompactActionButton inherits ActionButton {
+    min-width: 64px;
+    max-width: self.preferred-width;
+    horizontal-stretch: 0;
+    min-height: 44px;
+    preferred-height: 44px;
+    max-height: 44px;
+}
+
 component BuildPrerequisite inherits VerticalLayout {
     in property <ToolRow> tool;
     in property <bool> available;
@@ -250,7 +259,7 @@ export component MainWindow inherits Window {
     in property <bool> build-complete;
     in property <bool> build-needs-activation;
     in property <int> build-result-game;
-    in property <string> build-result-detail;
+    in property <string> build-result-title;
     in-out property <bool> build-result-dismissed: false;
     in property <bool> operation-busy;
     in property <bool> desktop-shortcut-busy;
@@ -431,30 +440,30 @@ export component MainWindow inherits Window {
         }
         Rectangle { height: 1px; background: Theme.line; }
         if root.build-complete && !root.build-result-dismissed: Rectangle {
+            height: 56px;
             background: root.build-needs-activation ? Theme.warning-fill : Theme.dark ? #74d99a14 : #e9f7ee;
-            border-width: 1px;
-            border-color: root.build-needs-activation ? Theme.warning : Theme.success;
-            HorizontalLayout {
-                padding-left: 24px; padding-right: 24px; padding-top: 12px; padding-bottom: 12px; spacing: 12px;
+            Rectangle { width: 3px; background: root.build-needs-activation ? Theme.warning : Theme.success; }
+            Rectangle { height: 1px; y: parent.height - self.height; background: Theme.line; }
+            build-notice := HorizontalLayout {
+                padding-left: 20px; padding-right: 20px; padding-top: 6px; padding-bottom: 6px; spacing: 10px;
                 VerticalLayout {
-                    horizontal-stretch: 1; spacing: 4px;
+                    horizontal-stretch: 1; min-width: 0px; alignment: center; spacing: 1px;
                     Text {
-                        text: root.build-needs-activation ? "Build finished — activation required" : "Build completed successfully";
+                        text: root.build-needs-activation ? "Build ready — activation required" : "Build complete";
                         color: root.build-needs-activation ? Theme.warning : Theme.success;
-                        font-size: 20px; font-weight: 700; wrap: word-wrap; min-width: 0px;
+                        font-size: 14px; font-weight: 700; overflow: elide; min-width: 0px;
                     }
-                    Muted { text: root.build-result-detail; min-width: 0px; }
+                    Muted { text: root.build-result-title; font-size: 12px; wrap: no-wrap; overflow: elide; min-width: 0px; }
                 }
-                ActionButton {
+                CompactActionButton {
                     text: !root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? "Go to Play" : "View build";
-                    primary: true; horizontal-stretch: 0;
                     clicked => {
                         root.navigate(!root.build-needs-activation && root.section == 1 && root.selected-game == root.build-result-game ? 0 : 1);
                         root.selected-game = root.build-result-game;
                         root.game-selected(root.build-result-game);
                     }
                 }
-                ActionButton { text: "Dismiss"; subtle: true; horizontal-stretch: 0; clicked => { root.build-result-dismissed = true; } }
+                CompactActionButton { text: "Dismiss"; subtle: true; clicked => { root.build-result-dismissed = true; } }
             }
         }
         HorizontalLayout {
@@ -1279,54 +1288,51 @@ export component MainWindow inherits Window {
         Rectangle {
             background: #000a;
             TouchArea { scroll-event(event) => { accept } }
-            Rectangle {
+            about-dialog := Rectangle {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                width: min(parent.width - 48px, 600px); height: min(parent.height - 48px, 670px);
-                background: Theme.dialog; border-radius: 24px; border-width: 1px; border-color: Theme.line;
+                width: min(parent.width - 40px, 480px); height: min(parent.height - 40px, root.demo-mode ? 560px : 320px);
+                background: Theme.dialog; border-radius: 18px; border-width: 1px; border-color: Theme.line;
                 VerticalLayout {
-                    padding: 26px; spacing: 18px;
+                    padding: 20px; spacing: 12px;
                     HorizontalLayout {
-                        spacing: 14px;
-                        Image { source: @image-url("../assets/app-icon-256.png"); width: 60px; height: 60px; }
+                        spacing: 12px;
+                        Image { source: @image-url("../assets/app-icon-256.png"); width: 44px; height: 44px; }
                         VerticalLayout {
                             horizontal-stretch: 1;
-                            spacing: 3px;
+                            spacing: 2px;
                             alignment: center;
-                            SectionTitle { text: "Twilight Sync"; font-size: 24px; }
-                            Muted { text: "Version " + root.version; }
+                            Text { text: "Twilight Sync"; font-size: 20px; font-weight: 700; color: Theme.text; }
+                            Muted { text: "Version " + root.version; font-size: 12px; }
                         }
-                        ActionButton { text: "Done"; subtle: true; modal-control: true; clicked => { root.about-open = false; } }
+                        CompactActionButton { text: "Done"; subtle: true; modal-control: true; clicked => { root.about-open = false; } }
                     }
                     ScrollView {
+                        vertical-stretch: 1;
                         VerticalLayout {
-                            spacing: 14px;
-                            SectionTitle { text: "Your adventures, across your PCs."; }
-                            Muted { text: "A local-first game library with encrypted save sharing. Built by @false00. Not affiliated with Nintendo."; }
+                            spacing: 10px; alignment: start;
+                            SectionTitle { text: "Your adventures, across your PCs."; font-size: 16px; min-height: 22px; }
+                            Muted { text: "A local-first game library with encrypted save sharing. Built by @false00. Not affiliated with Nintendo."; font-size: 13px; }
                             HorizontalLayout {
-                                spacing: 8px;
-                                ActionButton { text: "Developer"; modal-control: true; clicked => { root.action(Action.project-link, 0); } }
-                                ActionButton { text: "Source code"; modal-control: true; clicked => { root.action(Action.project-link, 1); } }
-                                ActionButton { text: "Releases"; modal-control: true; clicked => { root.action(Action.project-link, 2); } }
+                                spacing: 6px; alignment: start;
+                                CompactActionButton { text: "Developer"; modal-control: true; clicked => { root.action(Action.project-link, 0); } }
+                                CompactActionButton { text: "Source code"; modal-control: true; clicked => { root.action(Action.project-link, 1); } }
+                                CompactActionButton { text: "Releases"; modal-control: true; clicked => { root.action(Action.project-link, 2); } }
                             }
-                            Surface {
-                                VerticalLayout {
-                                    padding: 14px; spacing: 4px;
-                                    Muted { text: "BUILD DETAILS"; font-size: 11px; }
-                                    Text { text: root.build-profile + " build · " + root.build-target; color: Theme.text; wrap: word-wrap; }
-                                    Muted { text: "MIT license"; }
-                                }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            Muted { text: root.build-profile + " build · " + root.build-target + " · MIT license"; font-size: 12px; }
+                            HorizontalLayout {
+                                alignment: start;
+                                CompactActionButton { text: "View third-party licenses"; modal-control: true; clicked => { root.action(Action.open-licenses, 0); } }
                             }
-                            Muted { text: "CREDITS & LICENSES"; font-size: 11px; }
-                            ActionButton { text: "View third-party licenses"; modal-control: true; clicked => { root.action(Action.open-licenses, 0); } }
                             if root.demo-mode: VerticalLayout {
-                                spacing: 10px;
+                                spacing: 6px; alignment: start;
                                 Muted { text: "Synthetic preview scenarios. No real saves, pairing or settings are changed."; }
-                                for scenario[index] in ["Synchronized saves", "Divergent saves", "Pairing", "Offline", "Connecting"]: ActionButton {
+                                for scenario[index] in ["Synchronized saves", "Divergent saves", "Pairing", "Offline", "Connecting"]: CompactActionButton {
                                     text: "Preview: " + scenario;
                                     modal-control: true;
                                     clicked => { root.action(Action.preview-scenario, index); }
                                 }
-                                ActionButton { text: "Save example screenshot"; modal-control: true; clicked => { root.action(Action.export-preview, 0); } }
+                                CompactActionButton { text: "Save example screenshot"; modal-control: true; clicked => { root.action(Action.export-preview, 0); } }
                             }
                         }
                     }

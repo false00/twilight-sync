@@ -1,5 +1,5 @@
 use super::{
-    Prerequisite, Request, checkout, copy_tree,
+    Prerequisite, Request, SCRATCH, checkout, copy_tree,
     runner::Runner,
     tools::{Package, Toolset},
 };
@@ -8,6 +8,7 @@ use crate::{
     protocol::GameId,
 };
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use std::{
     ffi::OsString,
     fs,
@@ -407,7 +408,8 @@ impl ContextData<'_> {
             .env("PATH", std::env::join_paths(paths)?)
             .env("UV_PYTHON_PREFERENCE", "only-managed")
             .env("UV_PYTHON_INSTALL_DIR", self.workspace.join("python"))
-            .env("UV_CACHE_DIR", self.workspace.join("uv-cache"))
+            .env("UV_CACHE_DIR", self.workspace.join(SCRATCH).join("uv"))
+            .env("UV_LINK_MODE", "hardlink")
             .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
             .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
             .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
@@ -652,6 +654,13 @@ fn totk_installer(context: &ContextData<'_>, request: &Request, jobs: usize) -> 
     Ok(command)
 }
 
+#[derive(Serialize)]
+pub(super) struct SourceDependency {
+    repository: &'static str,
+    tag: &'static str,
+    commit: &'static str,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build(
     request: &Request,
@@ -662,7 +671,7 @@ pub(super) fn build(
     uv: &Path,
     tools: &mut Toolset,
     runner: &mut Runner<'_>,
-) -> Result<()> {
+) -> Result<Vec<SourceDependency>> {
     let mut context = ContextData {
         workspace,
         source,
@@ -671,6 +680,7 @@ pub(super) fn build(
     };
     let allowed = request.preference.managed_tools;
     let cancel = runner.cancel;
+    let mut source_dependencies = Vec::new();
     match request.plan.game {
         GameId::Dusklight => {
             let cmake = tools.ensure(Package::Cmake, allowed, cancel, &mut |text| {
@@ -781,7 +791,8 @@ pub(super) fn build(
             )?;
             let vs = vs_dev(request.plan.game)?
                 .context("Install Visual Studio C++ Build Tools first")?;
-            let nuget = prepare_nuget(workspace)?;
+            let scratch = workspace.join(SCRATCH);
+            let nuget = prepare_nuget(&scratch)?;
             for (script, label) in [
                 (
                     "call \"%TS_VSDEV%\" -arch=x64 -host_arch=x64 >nul && \"%TS_PYTHON%\" tools\\build_hactool.py",
@@ -793,7 +804,7 @@ pub(super) fn build(
                 ),
             ] {
                 let mut command = context.vs_command(script, &vs, &main)?;
-                configure_nuget(&mut command, workspace, &nuget);
+                configure_nuget(&mut command, &scratch, &nuget);
                 runner.run(&mut command, label)?;
             }
             let jobs = build_jobs(request, runner)?;
@@ -832,7 +843,6 @@ pub(super) fn build(
             let headers = workspace.join("headers");
             fs::create_dir_all(&headers)?;
             let mut locations = Vec::new();
-            let mut dependency_records = Vec::new();
             for (repository, tag, commit, name, environment) in [
                 (
                     "KhronosGroup/Vulkan-Headers",
@@ -866,14 +876,13 @@ pub(super) fn build(
                     false,
                     runner,
                 )?;
-                dependency_records
-                    .push(serde_json::json!({"repository":repository,"tag":tag,"commit":commit}));
+                source_dependencies.push(SourceDependency {
+                    repository,
+                    tag,
+                    commit,
+                });
                 locations.push((environment, target));
             }
-            files::atomic_write(
-                &workspace.join("source-dependencies.json"),
-                &serde_json::to_vec_pretty(&dependency_records)?,
-            )?;
             let no_wgpu = workspace.join("no-webgpu");
             fs::create_dir(&no_wgpu)?;
             let cpm = workspace.join("cpm");
@@ -909,7 +918,6 @@ pub(super) fn build(
                     jobs,
                 )?)
                 .env("HOOKSHOT_MINGW", &llvm.root)
-                .env("HOOKSHOT_KEEP_BUILD_FILES", "1")
                 .env("WGPU_NATIVE", no_wgpu)
                 .env("RX_CPM", cpm)
                 .env("RX_RELEASE", "1");
@@ -942,7 +950,7 @@ pub(super) fn build(
             }
         }
     }
-    Ok(())
+    Ok(source_dependencies)
 }
 
 fn stage_triforce_caches(previous: &Path, output: &Path) -> Result<bool> {
@@ -1283,6 +1291,16 @@ mod tests {
                 .join("Scripts")
                 .join("python.exe")
         );
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        let uv_cache = context.workspace.join(SCRATCH).join("uv");
+        let python = context.workspace.join("python");
+        for (key, value) in [
+            ("UV_CACHE_DIR", uv_cache.as_os_str()),
+            ("UV_PYTHON_INSTALL_DIR", python.as_os_str()),
+            ("UV_LINK_MODE", "hardlink".as_ref()),
+        ] {
+            assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&Some(value)));
+        }
         let args: Vec<_> = command.get_args().collect();
         assert!(args.windows(2).any(|args| args == ["--lang", "en-US"]));
         for (flag, path) in [

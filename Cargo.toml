@@ -1,6 +1,6 @@
 [package]
 name = "twilight-sync"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Local-network save sync and source builds for Dusklight, TotK Recomp and Triforce"

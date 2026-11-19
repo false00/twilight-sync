@@ -1,9 +1,13 @@
+mod backup;
+
 use crate::{
     files::{atomic_write, ensure_safe_path, sha256},
     install,
     protocol::GameId,
+    source_build,
 };
 use anyhow::{Context, Result, ensure};
+pub(crate) use backup::SourceBackup;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -146,6 +150,15 @@ fn rebuild_command(bytes: &[u8], from: &Path, destination: &Path) -> Result<Vec<
     Ok((args.join("\n") + "\n").into_bytes())
 }
 
+fn metadata_paths(root: &Path) -> [PathBuf; 4] {
+    [
+        root.join("settings.json"),
+        root.join("source-builds.json"),
+        root.join("totk-transfers").join("session.json"),
+        root.join("triforce-transfers").join("session.json"),
+    ]
+}
+
 pub(crate) fn prepare(
     root: &Path,
     game: GameId,
@@ -214,12 +227,7 @@ pub(crate) fn prepare(
         had_destination: destination.try_exists()?,
         updates: Vec::new(),
     };
-    let mut metadata = vec![
-        root.join("settings.json"),
-        root.join("source-builds.json"),
-        root.join("totk-transfers").join("session.json"),
-        root.join("triforce-transfers").join("session.json"),
-    ];
+    let mut metadata = metadata_paths(root).to_vec();
     if game == GameId::Dusklight {
         metadata.push(from.join("data_location.json"));
         metadata.push(default_profile.join("data_location.json"));
@@ -383,6 +391,26 @@ impl Migration {
         self.had_destination.then_some(self.backup.as_path())
     }
 
+    pub fn source_backup(&self, built: &source_build::Built) -> Option<SourceBackup> {
+        let name = self.backup.file_name()?.to_str()?;
+        (self.had_destination
+            && self.from.starts_with(&self.destination)
+            && built.game == self.game
+            && built.directory == self.from
+            && built.executable == self.from.join(&self.executable)
+            && built.sha256 == self.digest
+            && !self.updates.iter().any(|update| {
+                update.path.starts_with(&self.backup)
+                    || backup::mentions_backup(&update.after, name)
+            }))
+        .then(|| SourceBackup {
+            directory: self.backup.clone(),
+            destination: self.destination.clone(),
+            executable: self.executable.clone(),
+            game: self.game,
+        })
+    }
+
     pub fn mapped_path(&self, path: &Path) -> PathBuf {
         remap(path, &self.from, &self.destination, &self.backup)
     }
@@ -544,11 +572,148 @@ mod tests {
         .context("The managed installation was not recognized")
     }
 
+    fn staged_source(from: &Path) -> source_build::Built {
+        source_build::Built {
+            game: GameId::Triforce,
+            executable: from.join("Triforce.exe"),
+            directory: from.into(),
+            tag: "v1.0.0".into(),
+            commit: "a".repeat(40),
+            sha256: sha256(b"verified fixture, never executed"),
+            source: None,
+            log: from.join("unused.log"),
+            expected_save: None,
+        }
+    }
+
+    fn seed_previous_source(destination: &Path) -> Result<()> {
+        let program = b"old fixture, never executed";
+        fs::write(destination.join("Triforce.exe"), program)?;
+        atomic_write(
+            &destination.join("twilight-source.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "version":1,"game":GameId::Triforce,"tag":"v0.9.9",
+                "commit":"b".repeat(40),"sha256":sha256(program)
+            }))?,
+        )?;
+        fs::write(
+            destination.join("triforce_programs.bin"),
+            b"regenerable previous shader cache",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_promotion_compacts_only_disposable_old_files_after_finishing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (manager, destination, from) = setup(temp.path())?;
+        fs::remove_file(manager.join("source-builds.json"))?;
+        seed_previous_source(&destination)?;
+        let old_romfs = destination.join("romfs");
+        let new_romfs = from.join("romfs");
+        fs::create_dir(&old_romfs)?;
+        fs::create_dir(&new_romfs)?;
+        fs::write(old_romfs.join("copy.bin"), b"same game data")?;
+        fs::write(new_romfs.join("copy.bin"), b"same game data")?;
+        fs::write(old_romfs.join("different.bin"), b"old")?;
+        fs::write(new_romfs.join("different.bin"), b"new")?;
+        fs::write(old_romfs.join("old-only.bin"), b"unique old data")?;
+        fs::write(old_romfs.join("shared.bin"), b"hard-linked game data")?;
+        fs::hard_link(old_romfs.join("shared.bin"), new_romfs.join("shared.bin"))?;
+        fs::create_dir_all(destination.join("user"))?;
+        fs::write(
+            destination.join("user").join("earlier-save"),
+            b"older progress",
+        )?;
+        fs::create_dir_all(destination.join("mods"))?;
+        fs::write(destination.join("mods").join("mod"), b"old mod")?;
+        fs::create_dir(destination.join("mkw_vk_pipelines.bin"))?;
+        fs::write(
+            destination.join("mkw_vk_pipelines.bin").join("extra"),
+            b"not a regular cache file",
+        )?;
+
+        let migration = plan(temp.path(), &manager, &destination, &from)?;
+        let old = migration
+            .source_backup(&staged_source(&from))
+            .context("Expected an in-session source promotion")?;
+        migration.apply(|| Ok(()))?;
+        assert!(old.compact(&manager).is_err());
+        assert!(old.directory.join("Triforce.exe").is_file());
+        migration.finish(&manager)?;
+        old.compact(&manager)?;
+
+        for path in [
+            "Triforce.exe",
+            "triforce_programs.bin",
+            "romfs\\copy.bin",
+            "romfs\\shared.bin",
+        ] {
+            assert!(!old.directory.join(path).try_exists()?, "{path}");
+        }
+        for (path, expected) in [
+            ("romfs\\different.bin", b"old".as_slice()),
+            ("romfs\\old-only.bin", b"unique old data"),
+            ("user\\earlier-save", b"older progress"),
+            ("mods\\mod", b"old mod"),
+            ("Game\\input.nup", b"local game input"),
+            ("mkw_vk_pipelines.bin\\extra", b"not a regular cache file"),
+        ] {
+            assert_eq!(fs::read(old.directory.join(path))?, expected, "{path}");
+        }
+        assert_eq!(
+            fs::read(destination.join("romfs\\copy.bin"))?,
+            b"same game data"
+        );
+        assert_eq!(
+            fs::read(destination.join("romfs\\shared.bin"))?,
+            b"hard-linked game data"
+        );
+        assert_eq!(fs::read(destination.join("user\\save"))?, b"progress");
+        assert_eq!(
+            fs::read(destination.join("Triforce.exe"))?,
+            b"verified fixture, never executed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_backup_keeps_a_referenced_folder_or_modified_program_intact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (manager, destination, from) = setup(temp.path())?;
+        fs::remove_file(manager.join("source-builds.json"))?;
+        seed_previous_source(&destination)?;
+        let migration = plan(temp.path(), &manager, &destination, &from)?;
+        let old = migration
+            .source_backup(&staged_source(&from))
+            .context("Expected an in-session source promotion")?;
+        migration.apply(|| Ok(()))?;
+        migration.finish(&manager)?;
+        atomic_write(
+            &manager.join("source-builds.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "triforce": { "game_input": old.directory.join("Game\\input.nup") }
+            }))?,
+        )?;
+        assert!(old.compact(&manager)?.contains("still referenced"));
+        assert!(old.directory.join("Triforce.exe").is_file());
+        assert!(old.directory.join("triforce_programs.bin").is_file());
+        fs::remove_file(manager.join("source-builds.json"))?;
+        fs::write(
+            old.directory.join("Triforce.exe"),
+            b"locally modified executable",
+        )?;
+        assert!(old.compact(&manager)?.contains("program was modified"));
+        assert!(old.directory.join("triforce_programs.bin").is_file());
+        Ok(())
+    }
+
     #[test]
     fn nested_install_is_promoted_and_all_other_data_and_input_paths_survive() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (manager, destination, from) = setup(temp.path())?;
         let migration = plan(temp.path(), &manager, &destination, &from)?;
+        assert!(migration.source_backup(&staged_source(&from)).is_none());
         migration.apply(|| Ok(()))?;
         assert_eq!(
             fs::read(destination.join("user").join("save"))?,

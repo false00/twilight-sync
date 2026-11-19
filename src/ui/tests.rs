@@ -26,6 +26,26 @@ fn activate(ui: &MainWindow, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn compact_button(ui: &MainWindow, label: &str, panel: &ElementHandle) -> Result<ElementHandle> {
+    let element = button(ui, label)?;
+    let size = element.size();
+    let position = element.absolute_position();
+    let bounds = panel.size();
+    let origin = panel.absolute_position();
+    ensure!(
+        (44.0..=46.0).contains(&size.height) && size.width >= 44.0,
+        "{label} is not a compact touch target: {size:?}"
+    );
+    ensure!(
+        position.x >= origin.x
+            && position.y >= origin.y
+            && position.x + size.width <= origin.x + bounds.width + 1.0
+            && position.y + size.height <= origin.y + bounds.height + 1.0,
+        "{label} does not fit: {position:?} {size:?} within {origin:?} {bounds:?}"
+    );
+    Ok(element)
+}
+
 fn fixture() -> Result<MainWindow> {
     i_slint_backend_testing::init_no_event_loop();
     let ui = MainWindow::new()?;
@@ -219,9 +239,7 @@ fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> 
     ui.set_can_manage(true);
     ui.set_build_result_game(2);
     ui.set_source_message("Build verified and selected".into());
-    ui.set_build_result_detail(
-        "Ocarina of Time — your built copy is installed and selected.".into(),
-    );
+    ui.set_build_result_title("Ocarina of Time".into());
     ui.set_build_complete(true);
     flush();
     for dark in [false, true] {
@@ -229,19 +247,21 @@ fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> 
         for width in [720.0, 900.0, 1200.0] {
             ui.window().set_size(slint::LogicalSize::new(width, 720.0));
             flush();
-            let success =
-                ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+            ensure!(
+                ElementHandle::find_by_accessible_label(&ui, "Build complete")
                     .next()
-                    .context("Build completion is not visible")?;
-            ensure!(
-                success.absolute_position().y + success.size().height < 720.0,
-                "Completion disappeared below the handheld viewport"
+                    .is_some(),
+                "Build completion is not visible"
             );
-            let action = button(&ui, "Go to Play")?;
+            let notice = ElementHandle::find_by_element_id(&ui, "MainWindow::build-notice")
+                .next()
+                .context("Missing build notice")?;
             ensure!(
-                action.absolute_position().x + action.size().width <= width + 1.0,
-                "Completion action overflows"
+                notice.size().height <= 60.0 && notice.absolute_position().y < 100.0,
+                "The completion notice takes up too much of the viewport"
             );
+            compact_button(&ui, "Go to Play", &notice)?;
+            compact_button(&ui, "Dismiss", &notice)?;
         }
     }
     activate(&ui, "Go to Play")?;
@@ -259,19 +279,19 @@ fn build_settings_stay_locked_while_navigation_and_completion_actions_work() -> 
     assert_eq!(ui.get_selected_game(), 2);
     activate(&ui, "Dismiss")?;
     assert!(
-        ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+        ElementHandle::find_by_accessible_label(&ui, "Build complete")
             .next()
             .is_none()
     );
     ui.set_build_needs_activation(true);
     flush();
     assert!(
-        ElementHandle::find_by_accessible_label(&ui, "Build finished — activation required")
+        ElementHandle::find_by_accessible_label(&ui, "Build ready — activation required")
             .next()
             .is_some()
     );
     assert!(
-        ElementHandle::find_by_accessible_label(&ui, "Build completed successfully")
+        ElementHandle::find_by_accessible_label(&ui, "Build complete")
             .next()
             .is_none()
     );
@@ -626,6 +646,65 @@ fn slint_navigation_game_selection_and_build_gates_route_real_component_actions(
     assert_eq!(ui.get_section(), 5);
     activate(&ui, "Done")?;
     assert!(!ui.get_about_open());
+    Ok(())
+}
+
+#[test]
+fn about_dialog_stays_compact_and_keeps_project_links_in_view() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_build_profile("Release".into());
+    ui.set_build_target("windows / x86_64".into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    for (dark, width, height) in [(false, 720.0, 600.0), (true, 1200.0, 900.0)] {
+        ui.set_dark_mode(dark);
+        ui.window().set_size(slint::LogicalSize::new(width, height));
+        activate(&ui, "About")?;
+        let dialog = ElementHandle::find_by_element_id(&ui, "MainWindow::about-dialog")
+            .next()
+            .context("Missing About dialog")?;
+        let size = dialog.size();
+        ensure!(
+            size.width <= 500.0 && size.height <= 350.0,
+            "The About dialog is too large at {width} × {height}: {size:?}"
+        );
+        for label in [
+            "Done",
+            "Developer",
+            "Source code",
+            "Releases",
+            "View third-party licenses",
+        ] {
+            let control = compact_button(&ui, label, &dialog)?;
+            ensure!(
+                control.size().width < size.width / 2.0,
+                "{label} is stretching across the About dialog"
+            );
+        }
+        activate(&ui, "Done")?;
+        assert!(!ui.get_about_open());
+    }
+
+    activate(&ui, "About")?;
+    for label in [
+        "Developer",
+        "Source code",
+        "Releases",
+        "View third-party licenses",
+    ] {
+        activate(&ui, label)?;
+    }
+    assert_eq!(
+        &*actions.borrow(),
+        &[
+            (Action::ProjectLink, 0),
+            (Action::ProjectLink, 1),
+            (Action::ProjectLink, 2),
+            (Action::OpenLicenses, 0),
+        ]
+    );
     Ok(())
 }
 

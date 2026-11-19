@@ -27,6 +27,8 @@ use tools::{Package, Toolset};
 
 pub const WARNING: &str = "Building from source is slower and may take an hour or more. It reduces reliance on prebuilt game executables, but is NOT confirmed to be safer. Source, build scripts and dependencies run with your Windows account's permissions; this is not a sandbox. Use a separate VM for code you do not trust.";
 
+const SCRATCH: &str = "scratch";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
@@ -617,7 +619,7 @@ pub struct Built {
     pub tag: String,
     pub commit: String,
     pub sha256: String,
-    pub source: PathBuf,
+    pub source: Option<PathBuf>,
     pub log: PathBuf,
     pub expected_save: Option<String>,
 }
@@ -629,8 +631,11 @@ struct Receipt<'a> {
     tag: &'a str,
     commit: &'a str,
     sha256: &'a str,
-    source: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a Path>,
     tools: &'a [tools::Provenance],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    source_dependencies: &'a [recipes::SourceDependency],
 }
 
 pub fn new_log(root: &Path, game: GameId) -> Result<PathBuf> {
@@ -854,6 +859,44 @@ pub fn stage_configured(
     Ok(built)
 }
 
+fn discard_build_files(path: &Path, runner: &Runner<'_>) {
+    let result = (|| -> Result<()> {
+        ensure_safe_path(path)?;
+        if path.try_exists()? {
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let warning = format!(
+            "Could not finish cleaning up temporary build files at {}: {error:#}",
+            path.display()
+        );
+        if let Err(log_error) = runner.note(&warning) {
+            eprintln!("{warning}. Could not write to the build log: {log_error:#}");
+        }
+    }
+}
+
+fn finish_workspace(
+    workspace: tempfile::TempDir,
+    game: GameId,
+    completed: bool,
+    runner: &Runner<'_>,
+) -> Result<()> {
+    if completed && game == GameId::Totk && check_cancelled(runner.cancel).is_ok() {
+        // The game's rebuild command uses the checkout and Python runtime, not the package caches.
+        discard_build_files(&workspace.path().join(SCRATCH), runner);
+        if check_cancelled(runner.cancel).is_ok() {
+            let _retained = workspace.keep();
+            return Ok(());
+        }
+    }
+    // Disarm the guard so deletion is only attempted after rechecking the path.
+    discard_build_files(&workspace.keep(), runner);
+    check_cancelled(runner.cancel)
+}
+
 pub fn build(
     root: &Path,
     request: Request,
@@ -925,9 +968,10 @@ pub fn build(
             request.plan.tag,
             &request.plan.commit[..12]
         ))
-        .tempdir_in(&runs)?
-        .keep();
-    let source = workspace.join("source");
+        .tempdir_in(&runs)?;
+    fs::create_dir(workspace.path().join(SCRATCH))?;
+    let source = workspace.path().join("source");
+    let rebuild_source = (game == GameId::Totk).then_some(source.as_path());
     let output_stage = tempfile::Builder::new()
         .prefix(&format!(
             "source-{}-{}-",
@@ -961,9 +1005,9 @@ pub fn build(
             cancel,
             &mut |message| runner.message(&message),
         )?;
-        recipes::build(
+        let source_dependencies = recipes::build(
             &request,
-            &workspace,
+            workspace.path(),
             &source,
             &output,
             &git.entry,
@@ -1017,13 +1061,23 @@ pub fn build(
                 tag: &request.plan.tag,
                 commit: &request.plan.commit,
                 sha256: &sha256,
-                source: &source,
+                source: rebuild_source,
                 tools: &tools.provenance,
+                source_dependencies: &source_dependencies,
             })?,
         )?;
+        runner.message("Cleaning up temporary source build files...")?;
         Ok((executable, sha256))
     })();
-    let (executable, sha256) = result.with_context(|| format!("Source build did not complete. The previous installation remains selected. Log: {}. Retained workspace: {}", request.log.display(), workspace.display()))?;
+    let cleanup = finish_workspace(workspace, game, result.is_ok(), &runner);
+    let (executable, sha256) = result
+        .and_then(|verified| cleanup.map(|()| verified))
+        .with_context(|| {
+            format!(
+                "Source build did not complete. The previous installation remains selected. Log: {}",
+                request.log.display()
+            )
+        })?;
     let _installed_directory = output_stage.keep();
     Ok(Built {
         game,
@@ -1032,7 +1086,7 @@ pub fn build(
         tag: request.plan.tag,
         commit: request.plan.commit,
         sha256,
-        source,
+        source: rebuild_source.map(Path::to_path_buf),
         log: request.log,
         expected_save: before,
     })
@@ -1053,6 +1107,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
 pub struct Revision {
     pub tag: String,
     pub commit: String,
+    pub(crate) sha256: String,
 }
 
 pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
@@ -1076,6 +1131,7 @@ pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
     Ok(Revision {
         tag: label.tag,
         commit: label.commit,
+        sha256: label.sha256,
     })
 }
 
@@ -1091,6 +1147,94 @@ pub fn selected_version(path: &Path, game: GameId) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_build_cleanup_reclaims_only_disposable_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let previous_install = temp.path().join(".twilight-sync-backup-fixture");
+        fs::create_dir(&previous_install)?;
+        fs::write(previous_install.join("save"), b"previous save")?;
+        let older_build = temp.path().join("older-build");
+        fs::create_dir(&older_build)?;
+        let staged = temp.path().join("game");
+        fs::create_dir(&staged)?;
+        fs::write(staged.join("triforce_programs.bin"), b"game shader cache")?;
+
+        for (index, (game, completed, cancelled, retained)) in [
+            (GameId::Dusklight, true, false, false),
+            (GameId::Triforce, true, false, false),
+            (GameId::Totk, false, false, false),
+            (GameId::Totk, true, true, false),
+            (GameId::Totk, true, false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workspace = tempfile::tempdir_in(temp.path())?;
+            let path = workspace.path().to_path_buf();
+            let scratch = path.join(SCRATCH);
+            fs::create_dir(&scratch)?;
+            let package = scratch.join("package");
+            fs::write(&package, b"installer dependency")?;
+            let source = path.join("source");
+            fs::create_dir(&source)?;
+            // uv installs packages with hardlinks. Removing the cache must not break the venv.
+            let installed_package = source.join("installed-package");
+            fs::hard_link(&package, &installed_package)?;
+            let log = temp.path().join(format!("build-{index}.log"));
+            let cancel = AtomicBool::new(cancelled);
+            let mut progress = |_| Ok(());
+            let runner = Runner::new(&log, &cancel, &mut progress)?;
+            runner.note("Build diagnostics")?;
+
+            let result = finish_workspace(workspace, game, completed, &runner);
+            if cancelled {
+                assert!(result.as_ref().is_err_and(is_cancelled), "{result:?}");
+            } else {
+                result?;
+            }
+            assert!(!scratch.try_exists()?);
+            assert_eq!(path.try_exists()?, retained);
+            if retained {
+                assert_eq!(fs::read(installed_package)?, b"installer dependency");
+            }
+            assert!(fs::read_to_string(log)?.contains("Build diagnostics"));
+        }
+
+        assert_eq!(fs::read(previous_install.join("save"))?, b"previous save");
+        assert_eq!(
+            fs::read(staged.join("triforce_programs.bin"))?,
+            b"game shader cache"
+        );
+        assert!(older_build.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn locked_temporary_build_files_are_reported_without_discarding_the_result() -> Result<()> {
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir_in(temp.path())?;
+        let path = workspace.path().to_path_buf();
+        let file = path.join("locked");
+        fs::write(&file, b"fixture")?;
+        let locked = OpenOptions::new().read(true).share_mode(0).open(&file)?;
+        let log = temp.path().join("build.log");
+        let cancel = AtomicBool::new(false);
+        let mut progress = |_| Ok(());
+        let runner = Runner::new(&log, &cancel, &mut progress)?;
+
+        finish_workspace(workspace, GameId::Triforce, true, &runner)?;
+
+        drop(locked);
+        assert!(file.is_file());
+        let message = fs::read_to_string(log)?;
+        assert!(message.contains("Could not finish cleaning up temporary build files"));
+        assert!(message.contains(&path.display().to_string()));
+        Ok(())
+    }
 
     #[test]
     fn dusklight_updates_keep_the_portable_profile_and_its_original_copy() -> Result<()> {
@@ -1282,7 +1426,7 @@ mod tests {
             tag: "v0.4.0".into(),
             commit: "a".repeat(40),
             sha256: files::sha256(b"synthetic file, never executed"),
-            source: temp.path().join("source"),
+            source: None,
             log: request.log,
             expected_save: expected.clone(),
         };

@@ -325,6 +325,10 @@ enum Input {
         game: protocol::GameId,
         result: Result<source_build::Built>,
     },
+    SourceBackupCleaned {
+        directory: PathBuf,
+        result: Result<String>,
+    },
     SelfUpdateChecked(Result<self_update::Release>),
     SelfUpdatePrepared(Result<self_update::Prepared>),
     SelfUpdateCancelled(Result<()>),
@@ -502,6 +506,7 @@ struct Engine {
     cancel_transfer: Arc<AtomicBool>,
     install_busy: bool,
     layout_recovery: bool,
+    compacting_backup: bool,
     latest_release: Option<ReleaseInfo>,
     latest_totk_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
@@ -1015,6 +1020,7 @@ impl Engine {
             cancel_transfer: Arc::new(AtomicBool::new(false)),
             install_busy: layout_pending,
             layout_recovery: layout_pending,
+            compacting_backup: false,
             latest_release: None,
             latest_totk_release: None,
             selected_release: None,
@@ -1126,6 +1132,11 @@ impl Engine {
                 || !matches!(&input, Input::Frame { .. } | Input::Command(_))
                 || matches!(&input, Input::Command(Command::Shutdown)),
             "Finish game folder recovery before playing, transferring, or changing settings"
+        );
+        ensure!(
+            !self.compacting_backup
+                || !matches!(&input, Input::Command(command) if !matches!(command, Command::Shutdown)),
+            "Wait for cleanup of the previous game installation before playing or changing settings"
         );
         if matches!(
             &input,
@@ -1451,7 +1462,7 @@ impl Engine {
                                     Some(source_build::Completion::Ready(game));
                                 self.source.error = None;
                                 self.source.message = format!(
-                                    "{} built from commit {} and selected. Previous installations were retained; normal gameplay was not started.",
+                                    "{} built from commit {} and selected. Previous user data was preserved; normal gameplay was not started.",
                                     built.tag,
                                     &built.commit[..12]
                                 );
@@ -1484,6 +1495,28 @@ impl Engine {
                         Err(error)
                     }
                 }
+            }
+            Input::SourceBackupCleaned { directory, result } => {
+                ensure!(
+                    self.compacting_backup,
+                    "Unexpected source-backup cleanup result"
+                );
+                self.compacting_backup = false;
+                self.install_busy = false;
+                let (event, detail) = match result {
+                    Ok(detail) => ("source-backup-cleanup", detail),
+                    Err(error) => (
+                        "source-backup-cleanup-stopped",
+                        format!(
+                            "The new game stays installed. Old-file cleanup stopped: {error:#}"
+                        ),
+                    ),
+                };
+                self.message = detail.clone();
+                self.source.message = detail.clone();
+                self.audit
+                    .record(event, Some(&directory), None, None, &detail)?;
+                Ok(())
             }
             Input::SelfUpdateChecked(result) => {
                 self.self_updates.checking = false;
@@ -2124,16 +2157,18 @@ impl Engine {
         self.require_source_idle()?;
         let (previous, executable) = self.source_paths(built.game);
         source_build::verify_activation(built, previous.as_deref(), executable.as_deref())?;
+        let rebuild_source = built.source.as_ref().map_or_else(String::new, |path| {
+            format!("; rebuild source {}", path.display())
+        });
         self.audit.record(
             "source-build-verified",
             Some(&built.executable),
             Some(&built.sha256),
             None,
             &format!(
-                "{} {}; source {}; log {}",
+                "{} {}{rebuild_source}; log {}",
                 built.tag,
                 built.commit,
-                built.source.display(),
                 built.log.display()
             ),
         )?;
@@ -5366,6 +5401,11 @@ impl Engine {
         migration.apply(source_build::games_stopped)?;
         self.settings = Settings::load(&self.root)?;
         self.source.preferences = source_build::Preferences::load(&self.root)?;
+        let old_source = self
+            .source
+            .built
+            .as_ref()
+            .and_then(|built| migration.source_backup(built));
         if let Some(built) = &mut self.source.built {
             built.directory = migration.mapped_path(&built.directory);
             built.executable = migration.mapped_path(&built.executable);
@@ -5398,7 +5438,29 @@ impl Engine {
             migration.game,
             migration.destination.display()
         );
-        self.send_state()
+        self.send_state()?;
+        if let Some(backup) = old_source {
+            self.compacting_backup = true;
+            self.install_busy = true;
+            self.message
+                .push_str(" Checking the previous install for files that can be removed...");
+            self.source.message = self.message.clone();
+            let root = self.root.clone();
+            let sender = self.sender.clone();
+            thread::spawn(move || {
+                let result = backup.compact(&root);
+                if sender
+                    .send(Input::SourceBackupCleaned {
+                        directory: backup.directory,
+                        result,
+                    })
+                    .is_err()
+                {
+                    eprintln!("Twilight Sync stopped before it could report old-file cleanup");
+                }
+            });
+        }
+        Ok(())
     }
 
     fn try_game_layout(&mut self) -> Result<()> {
@@ -7323,7 +7385,7 @@ mod tests {
             tag: "v1.0.0-test".into(),
             commit: "a".repeat(40),
             sha256: "b".repeat(64),
-            source: harness.left.root.join("source"),
+            source: None,
             log: harness.left.root.join("build.log"),
             expected_save: None,
         };
