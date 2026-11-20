@@ -31,6 +31,53 @@ const SCRATCH: &str = "scratch";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OotProject {
+    #[default]
+    Triforce,
+    Longshot,
+}
+
+impl OotProject {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Triforce => "Triforce",
+            Self::Longshot => "Longshot",
+        }
+    }
+
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Triforce => "Triforce.exe",
+            Self::Longshot => "longshot.exe",
+        }
+    }
+
+    pub fn source_url(self) -> &'static str {
+        match self {
+            Self::Triforce => "https://git.triforceproject.com/triforce/source",
+            Self::Longshot => "https://git.magicbean.dev/MagicBeanDev/Longshot",
+        }
+    }
+
+    pub fn directory(self) -> Result<PathBuf> {
+        Ok(install::default_directory(GameId::Triforce)?.with_file_name(self.name()))
+    }
+
+    pub fn from_executable(path: &Path) -> Result<Self> {
+        for project in [Self::Triforce, Self::Longshot] {
+            if path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(project.executable()))
+            {
+                return Ok(project);
+            }
+        }
+        bail!("Select Triforce.exe or longshot.exe from a complete OOT installation")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Method {
     #[default]
     Official,
@@ -40,6 +87,7 @@ pub enum Method {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preference {
+    pub oot_project: OotProject,
     pub method: Method,
     pub managed_tools: bool,
     #[serde(skip_serializing, deserialize_with = "discard_saved_jobs")]
@@ -57,6 +105,7 @@ pub struct Preference {
 impl Default for Preference {
     fn default() -> Self {
         Self {
+            oot_project: OotProject::Triforce,
             method: Method::Official,
             managed_tools: true,
             jobs: 0,
@@ -103,6 +152,8 @@ pub struct Preferences {
     pub dusklight: Preference,
     pub totk: Preference,
     pub triforce: Preference,
+    pub triforce_install: Option<PathBuf>,
+    pub longshot_install: Option<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -115,11 +166,28 @@ impl Default for Preferences {
                 method: Method::Source,
                 ..Preference::default()
             },
+            triforce_install: None,
+            longshot_install: None,
         }
     }
 }
 
 impl Preferences {
+    pub fn oot_install(&self, project: OotProject) -> Result<PathBuf> {
+        let saved = match project {
+            OotProject::Triforce => &self.triforce_install,
+            OotProject::Longshot => &self.longshot_install,
+        };
+        saved.clone().map(Ok).unwrap_or_else(|| project.directory())
+    }
+
+    pub fn remember_oot(&mut self, project: OotProject, directory: PathBuf) {
+        match project {
+            OotProject::Triforce => self.triforce_install = Some(directory),
+            OotProject::Longshot => self.longshot_install = Some(directory),
+        }
+    }
+
     pub fn get(&self, game: GameId) -> &Preference {
         match game {
             GameId::Dusklight => &self.dusklight,
@@ -164,6 +232,16 @@ impl Preferences {
             preferences.triforce.method == Method::Source,
             "Triforce requires the source-build method"
         );
+        for path in [&preferences.triforce_install, &preferences.longshot_install]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                path.is_absolute(),
+                "OOT installation paths must be absolute"
+            );
+            ensure_safe_path(path)?;
+        }
         Ok(preferences)
     }
 
@@ -201,6 +279,7 @@ fn validate_preference(preference: &Preference) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub game: GameId,
+    pub oot_project: OotProject,
     pub tag: String,
     pub commit: String,
     pub review_url: String,
@@ -296,9 +375,13 @@ fn repository(game: GameId) -> &'static str {
 }
 
 pub fn source_url(game: GameId) -> String {
+    project_source_url(game, OotProject::Triforce)
+}
+
+pub fn project_source_url(game: GameId, project: OotProject) -> String {
     match game {
         GameId::Dusklight | GameId::Totk => format!("https://github.com/{}", repository(game)),
-        GameId::Triforce => "https://git.triforceproject.com/triforce/source".into(),
+        GameId::Triforce => project.source_url().into(),
     }
 }
 
@@ -325,7 +408,7 @@ pub(super) fn metadata<T: DeserializeOwned>(url: &str) -> Result<T> {
         parsed.scheme() == "https"
             && matches!(
                 parsed.host_str(),
-                Some("api.github.com" | "git.triforceproject.com")
+                Some("api.github.com" | "git.triforceproject.com" | "git.magicbean.dev")
             )
             && parsed.username().is_empty()
             && parsed.password().is_none()
@@ -442,20 +525,38 @@ fn triforce_tag(tags: Vec<Tag>) -> Result<(String, String)> {
 }
 
 pub fn check(game: GameId) -> Result<(Plan, Vec<Prerequisite>)> {
+    check_project(game, OotProject::Triforce)
+}
+
+pub fn check_project(game: GameId, project: OotProject) -> Result<(Plan, Vec<Prerequisite>)> {
     let (tag, commit) = match game {
         GameId::Dusklight | GameId::Totk => github_latest(repository(game))?,
-        GameId::Triforce => triforce_tag(metadata(
-            "https://git.triforceproject.com/api/v1/repos/triforce/source/tags?limit=50",
-        )?)?,
+        GameId::Triforce => match project {
+            OotProject::Triforce => triforce_tag(metadata(
+                "https://git.triforceproject.com/api/v1/repos/triforce/source/tags?limit=50",
+            )?)?,
+            OotProject::Longshot => {
+                let base = "https://git.magicbean.dev/api/v1/repos/MagicBeanDev/Longshot";
+                let release: GithubRelease = metadata(&format!("{base}/releases/latest"))?;
+                ensure!(valid_tag(&release.tag_name), "Invalid Longshot release tag");
+                let tag: Tag = metadata(&format!("{base}/tags/{}", release.tag_name))?;
+                ensure!(
+                    tag.name == release.tag_name,
+                    "Longshot release/tag identity mismatch"
+                );
+                triforce_tag(vec![tag])?
+            }
+        },
     };
     ensure!(
         valid_tag(&tag) && valid_commit(&commit),
         "Invalid approved source revision"
     );
-    let review_url = format!("{}/commit/{commit}", source_url(game));
+    let review_url = format!("{}/commit/{commit}", project_source_url(game, project));
     Ok((
         Plan {
             game,
+            oot_project: project,
             tag,
             commit,
             review_url,
@@ -628,6 +729,7 @@ pub struct Built {
 struct Receipt<'a> {
     version: u8,
     game: GameId,
+    oot_project: OotProject,
     tag: &'a str,
     commit: &'a str,
     sha256: &'a str,
@@ -745,6 +847,9 @@ fn preserve_current_data(
             "totk.ini",
             "triforce_options.ini",
             "triforce_env.txt",
+            "longshot_options.ini",
+            "longshot_env.txt",
+            "mods.json",
             "language.txt",
         ] {
             let source = previous.join(relative);
@@ -754,7 +859,10 @@ fn preserve_current_data(
             }
         }
         if game == GameId::Triforce {
-            let path = output.join("triforce_env.txt");
+            let path = output.join(match request.plan.oot_project {
+                OotProject::Triforce => "triforce_env.txt",
+                OotProject::Longshot => "longshot_env.txt",
+            });
             ensure_safe_path(&path)?;
             let mut environment = if path.try_exists()? {
                 read_bounded(&path, 1024 * 1024)?
@@ -820,7 +928,7 @@ pub fn stage_configured(
     let _instance = crate::config::acquire_instance(&root)?;
     let settings = crate::config::Settings::load(&root)?;
     let preferences = Preferences::load(&root)?;
-    let (plan, _) = check(game)?;
+    let (plan, _) = check_project(game, preferences.get(game).oot_project)?;
     ensure!(
         plan.commit == approved_commit && valid_commit(approved_commit),
         "The source revision differs from the explicitly approved commit"
@@ -934,10 +1042,14 @@ pub fn build(
         request.plan.review_url
             == format!(
                 "{}/commit/{}",
-                source_url(request.plan.game),
+                project_source_url(request.plan.game, request.plan.oot_project),
                 request.plan.commit
             ),
         "The source review URL is not the selected project's pinned commit"
+    );
+    ensure!(
+        request.plan.oot_project == request.preference.oot_project,
+        "The selected OOT project changed after source approval"
     );
     validate_preference(&request.preference)?;
     recipes::validate_inputs(&request)?;
@@ -961,7 +1073,11 @@ pub fn build(
         .previous_install
         .clone()
         .unwrap_or(install::default_directory(game)?);
-    let destination = install::default_directory(game)?;
+    let destination = if game == GameId::Triforce {
+        request.plan.oot_project.directory()?
+    } else {
+        install::default_directory(game)?
+    };
     fs::create_dir_all(&destination)?;
     let minimum = if game == GameId::Dusklight {
         8 * 1024_u64.pow(3)
@@ -973,7 +1089,13 @@ pub fn build(
         "Source build needs at least {} GiB free on the Games drive, plus room for preserved mods/portable data",
         minimum / 1024_u64.pow(3)
     );
-    let runs = root.join("source-builds").join(key(game));
+    let runs = root
+        .join("source-builds")
+        .join(if game == GameId::Triforce {
+            request.plan.oot_project.name().to_ascii_lowercase()
+        } else {
+            key(game).into()
+        });
     ensure_safe_path(&runs)?;
     fs::create_dir_all(&runs)?;
     let workspace = tempfile::Builder::new()
@@ -1006,7 +1128,7 @@ pub fn build(
         )?;
         checkout(
             &git.entry,
-            &format!("{}.git", source_url(game)),
+            &format!("{}.git", project_source_url(game, request.plan.oot_project)),
             &request.plan.tag,
             &request.plan.commit,
             &source,
@@ -1033,13 +1155,17 @@ pub fn build(
         let executable = output.join(match game {
             GameId::Dusklight => "dusklight.exe",
             GameId::Totk => "totk.exe",
-            GameId::Triforce => "Triforce.exe",
+            GameId::Triforce => request.plan.oot_project.executable(),
         });
         ensure_safe_path(&executable)?;
         crate::self_update::validate_pe(&executable)
             .context("The source build did not produce the expected Windows x64 game")?;
         if game == GameId::Triforce {
-            for name in ["triforce_vk.dll", "SDL2.dll", "SDL3.dll"] {
+            let renderer = match request.plan.oot_project {
+                OotProject::Triforce => "triforce_vk.dll",
+                OotProject::Longshot => "longshot_vk.dll",
+            };
+            for name in [renderer, "SDL2.dll", "SDL3.dll"] {
                 let path = output.join(name);
                 ensure_safe_path(&path)?;
                 crate::self_update::validate_pe(&path)
@@ -1064,6 +1190,7 @@ pub fn build(
             &serde_json::to_vec_pretty(&Receipt {
                 version: 1,
                 game,
+                oot_project: request.plan.oot_project,
                 tag: &request.plan.tag,
                 commit: &request.plan.commit,
                 sha256: &sha256,
@@ -1333,6 +1460,7 @@ mod tests {
             Request {
                 plan: Plan {
                     game: GameId::Triforce,
+                    oot_project: OotProject::Triforce,
                     tag: "v0.4.0".into(),
                     commit: "a".repeat(40),
                     review_url: "not approved".into(),
@@ -1404,6 +1532,7 @@ mod tests {
         let request = Request {
             plan: Plan {
                 game: GameId::Triforce,
+                oot_project: OotProject::Triforce,
                 tag: "v0.4.0".into(),
                 commit: "a".repeat(40),
                 review_url: String::new(),

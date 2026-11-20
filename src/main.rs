@@ -14,6 +14,7 @@ const DEPENDENCY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
 
 fn build_source(
     game: twilight_sync::protocol::GameId,
+    project: twilight_sync::source_build::OotProject,
     commit: &str,
     jobs: Option<u8>,
 ) -> Result<()> {
@@ -39,6 +40,9 @@ fn build_source(
     );
     println!("{}", twilight_sync::source_build::WARNING);
     let backend = twilight_sync::runtime::start_maintenance()?;
+    if game == twilight_sync::protocol::GameId::Triforce {
+        backend.command(Command::SelectOotProject(project))?;
+    }
     backend.command(Command::CheckSource(game))?;
     let started = Instant::now();
     let checked = loop {
@@ -214,15 +218,19 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if first.as_deref().is_some_and(|a| a == "--build-source") {
-        let game = match arguments
+        let selection = arguments
             .next()
-            .context("Choose dusklight, totk or triforce")?
-            .to_str()
-        {
+            .context("Choose dusklight, totk, triforce or longshot")?;
+        let game = match selection.to_str() {
             Some("dusklight") => twilight_sync::protocol::GameId::Dusklight,
             Some("totk") => twilight_sync::protocol::GameId::Totk,
-            Some("triforce") => twilight_sync::protocol::GameId::Triforce,
-            _ => bail!("Choose dusklight, totk or triforce"),
+            Some("triforce" | "longshot") => twilight_sync::protocol::GameId::Triforce,
+            _ => bail!("Choose dusklight, totk, triforce or longshot"),
+        };
+        let project = if selection == "longshot" {
+            twilight_sync::source_build::OotProject::Longshot
+        } else {
+            twilight_sync::source_build::OotProject::Triforce
         };
         if arguments
             .next()
@@ -251,7 +259,7 @@ fn run() -> Result<()> {
         if arguments.next().is_some() {
             bail!("Unexpected source-build arguments");
         }
-        return build_source(game, commit, jobs);
+        return build_source(game, project, commit, jobs);
     }
     if first
         .as_deref()
@@ -259,21 +267,34 @@ fn run() -> Result<()> {
     {
         let game = arguments
             .next()
-            .context("Choose dusklight, totk or triforce")?;
-        let game = match game.to_str().context("Game name must be UTF-8")? {
+            .context("Choose dusklight, totk, triforce or longshot")?;
+        let selection = game.to_str().context("Game name must be UTF-8")?;
+        let game = match selection {
             "dusklight" => twilight_sync::protocol::GameId::Dusklight,
             "totk" => twilight_sync::protocol::GameId::Totk,
-            "triforce" => twilight_sync::protocol::GameId::Triforce,
-            _ => bail!("Choose dusklight, totk or triforce"),
+            "triforce" | "longshot" => twilight_sync::protocol::GameId::Triforce,
+            _ => bail!("Choose dusklight, totk, triforce or longshot"),
         };
         if arguments.next().is_some() {
             bail!("Unexpected source-check arguments");
         }
 
-        let (plan, prerequisites) = twilight_sync::source_build::check(game)?;
+        let project = if selection == "longshot" {
+            twilight_sync::source_build::OotProject::Longshot
+        } else {
+            twilight_sync::source_build::OotProject::Triforce
+        };
+        let (plan, prerequisites) = twilight_sync::source_build::check_project(game, project)?;
         println!(
-            "SOURCE RELEASE\nGame: {game:?}\nTag: {}\nCommit: {}\nReview: {}",
-            plan.tag, plan.commit, plan.review_url
+            "SOURCE RELEASE\nGame: {game:?}\nProject: {}\nTag: {}\nCommit: {}\nReview: {}",
+            if game == twilight_sync::protocol::GameId::Triforce {
+                project.name()
+            } else {
+                twilight_sync::source_build::key(game)
+            },
+            plan.tag,
+            plan.commit,
+            plan.review_url
         );
         for prerequisite in prerequisites {
             println!(

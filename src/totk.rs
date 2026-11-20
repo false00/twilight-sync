@@ -842,6 +842,76 @@ impl Channel {
         self.select_executable(executable, false)
     }
 
+    pub(crate) fn switch_oot_installation(&mut self, directory: &Path) -> Result<()> {
+        ensure!(
+            self.game == crate::native::Game::Triforce,
+            "Only OOT has project selection"
+        );
+        self.require_update_idle()?;
+        self.require_app_update_idle()?;
+        ensure!(
+            self.status.remote_lock.is_none() && !self.status.pending,
+            "Finish the paired device's reservation or incoming save before switching OOT projects"
+        );
+        ensure_safe_path(directory)?;
+        let current = self
+            .install
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        if current == directory {
+            return Ok(());
+        }
+        let source = self.game.snapshot(&current.join("user"))?;
+        let target = self.game.snapshot(&directory.join("user"))?;
+        if let Some(source) = &source {
+            self.game.summary(&source.bytes)?;
+            if target.as_ref().map(|save| &save.hash) != Some(&source.hash) {
+                self.game.apply(
+                    &directory.join("user"),
+                    &source.bytes,
+                    target.as_ref().map(|save| save.hash.as_str()),
+                )?;
+            }
+        }
+        ensure!(
+            self.game
+                .snapshot(&current.join("user"))?
+                .as_ref()
+                .map(|save| &save.hash)
+                == source.as_ref().map(|save| &save.hash),
+            "OOT progress changed during the switch; the previous installation remains selected"
+        );
+        ensure!(
+            self.game
+                .snapshot(&directory.join("user"))?
+                .as_ref()
+                .map(|save| &save.hash)
+                == source.as_ref().or(target.as_ref()).map(|save| &save.hash),
+            "The target OOT progress changed during the switch; the previous installation remains selected"
+        );
+        self.game.ensure_stopped()?;
+        let mut session = self.session.clone();
+        session.install = Some(directory.to_path_buf());
+        if source.is_none() {
+            session.base = None;
+        }
+        ensure!(
+            self.state_error.is_none(),
+            "Game safety metadata needs attention"
+        );
+        ensure_safe_path(&self.root)?;
+        fs::create_dir_all(&self.root)?;
+        crate::files::atomic_write(
+            &self.root.join("session.json"),
+            &serde_json::to_vec(&session)?,
+        )?;
+        self.session = session;
+        self.status.base = self.session.base.clone();
+        self.install = Ok(directory.to_path_buf());
+        self.history_hash = None;
+        self.refresh()
+    }
+
     pub(crate) fn reload_installation(&mut self) -> Result<()> {
         self.require_update_idle()?;
         let session = Session::load(&self.root)?;

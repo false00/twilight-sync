@@ -319,6 +319,23 @@ pub(super) fn play_blocker(snapshot: &Snapshot, game: GameId) -> Option<&str> {
     if snapshot.layout_recovery {
         return Some("Game folder recovery needs attention before playing or syncing.");
     }
+    if game == GameId::Triforce
+        && snapshot.triforce.installed
+        && snapshot.triforce.executable.as_ref().is_none_or(|path| {
+            path.file_name().is_none_or(|name| {
+                !name.eq_ignore_ascii_case(
+                    snapshot
+                        .source
+                        .preferences
+                        .triforce
+                        .oot_project
+                        .executable(),
+                )
+            })
+        })
+    {
+        return Some("Select the OOT project matching this installation before playing.");
+    }
     if let Some(state) = native(snapshot, game) {
         native_session_blocker(snapshot, state).or({
             if snapshot.ready

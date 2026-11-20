@@ -28,7 +28,7 @@ handheld with private, encrypted save sharing over your home network.
 
 | Twilight Princess | Tears of the Kingdom | Ocarina of Time |
 |:---:|:---:|:---:|
-| [Dusklight](https://twilitrealm.dev/) | [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) | [Triforce](https://git.triforceproject.com/triforce/source) |
+| [Dusklight](https://twilitrealm.dev/) | [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) | [Triforce](https://git.triforceproject.com/triforce/source) / [Longshot](https://git.magicbean.dev/MagicBeanDev/Longshot) |
 
 *Original adventure artwork used in the interface. Games, Nintendo artwork,
 ROMs, and console keys are not included.*
@@ -41,6 +41,9 @@ ROMs, and console keys are not included.*
   touch-friendly controls for your desktop or handheld.
 - **Your choice of installation.** Use official releases where supported,
   or review a source revision and build your own copy.
+- **Choose your OOT project.** Switch between Triforce and Longshot beside Play
+  or in Game setup. Both build locally from source and update independently.
+  Switching carries verified progress across, with backups of replaced saves.
 - **Bring your own game files once.** Explicitly approve encrypted transfers of
   OOT `.nup` and TotK base/update `.nsp` files between your paired PCs.
   Console `prod.keys` has a separate, default-off permission and approvals.

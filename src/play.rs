@@ -93,14 +93,24 @@ pub fn launch_game(path: &Path, game: crate::protocol::GameId) -> Result<Child> 
     ensure_safe_path(path)?;
     ensure!(
         path.file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case(executable)),
+            .is_some_and(|name| name.eq_ignore_ascii_case(executable)
+                || (game == crate::protocol::GameId::Triforce
+                    && name.eq_ignore_ascii_case("longshot.exe"))),
         "Select the matching game executable"
     );
     ensure!(path.is_file(), "Game executable was not found");
     let mut command = Command::new(path);
     command.current_dir(path.parent().context("Executable has no directory")?);
     if game == crate::protocol::GameId::Triforce {
-        command.env("HOOKSHOT_NO_UPDATE_CHECK", "1");
+        command
+            .env("HOOKSHOT_NO_UPDATE_CHECK", "1")
+            .env("LONGSHOT_NO_UPDATE_CHECK", "1");
+        // Both projects keep portable saves at the installation root, including bin layouts.
+        let directory = crate::native::Game::Triforce.installation(path)?;
+        command
+            .current_dir(&directory)
+            .arg("--user")
+            .arg(directory.join("user"));
     }
     command.spawn().context(context)
 }

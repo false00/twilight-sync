@@ -67,6 +67,59 @@ fn fixture() -> Result<MainWindow> {
 }
 
 #[test]
+fn oot_project_controls_fit_beside_play_and_select_the_project_in_setup() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_selected_game(2);
+    ui.set_installed(true);
+    ui.set_can_play(true);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let recorded = actions.clone();
+    ui.on_action(move |action, index| recorded.borrow_mut().push((action, index)));
+    for width in [720.0, 900.0, 1200.0] {
+        ui.window().set_size(slint::LogicalSize::new(width, 1200.0));
+        for section in [0, 1] {
+            ui.set_section(section);
+            flush();
+            for label in ["Triforce", "Longshot"] {
+                let element = button(&ui, label)?;
+                let position = element.absolute_position();
+                let size = element.size();
+                ensure!(
+                    position.x >= 0.0 && position.x + size.width <= width + 1.0,
+                    "{label} overflows at {width}px: {position:?} {size:?}"
+                );
+                ensure!(
+                    size.height >= 44.0,
+                    "OOT project selector lost its touch target"
+                );
+            }
+            if section == 0 {
+                let selector = button(&ui, "Longshot")?;
+                ensure!(
+                    ElementHandle::find_by_accessible_label(&ui, "Play").any(|play| {
+                        let distance = play.absolute_position().y - selector.absolute_position().y;
+                        distance > 0.0 && distance <= 70.0
+                    }),
+                    "OOT project selection is not adjacent to Play"
+                );
+            }
+            activate(&ui, "Longshot")?;
+            assert_eq!(
+                actions.borrow_mut().pop(),
+                Some((Action::SelectOotProject, 1))
+            );
+            ui.set_longshot(true);
+            activate(&ui, "Triforce")?;
+            assert_eq!(
+                actions.borrow_mut().pop(),
+                Some((Action::SelectOotProject, 0))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn source_progress_and_live_activity_fit_handhelds_and_keep_actions_in_app() -> Result<()> {
     let ui = fixture()?;
     ui.set_section(1);

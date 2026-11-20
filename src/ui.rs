@@ -602,6 +602,33 @@ impl Controller {
         self.local_error = None;
         let ui = self.ui.upgrade().context("The window has closed")?;
         match action {
+            Action::SelectOotProject => {
+                ensure!(
+                    self.game == GameId::Triforce,
+                    "Select Ocarina of Time first"
+                );
+                let project = match index {
+                    0 => source_build::OotProject::Triforce,
+                    1 => source_build::OotProject::Longshot,
+                    _ => bail!("Unknown OOT project"),
+                };
+                if project == self.snapshot.source.preferences.triforce.oot_project {
+                    return Ok(());
+                }
+                if self.confirm(
+                    "Switch OOT project",
+                    "Carry this installation's current OOT progress to the selected project? Any replaced target save is backed up. Both games must be closed; installations and graphics settings stay separate.",
+                ).await? {
+                    self.approval = None;
+                    if self.demo {
+                        self.snapshot.source.preferences.triforce.oot_project = project;
+                        self.snapshot.source.plan = None;
+                        return self.refresh_view();
+                    }
+                    self.dispatch(Command::SelectOotProject(project))?;
+                }
+                Ok(())
+            }
             Action::Play => {
                 ensure!(
                     model::play_blocker(&self.snapshot, self.game).is_none(),
@@ -629,7 +656,13 @@ impl Controller {
                 let executable = match self.game {
                     GameId::Dusklight => "dusklight.exe",
                     GameId::Totk => "totk.exe",
-                    GameId::Triforce => "Triforce.exe",
+                    GameId::Triforce => self
+                        .snapshot
+                        .source
+                        .preferences
+                        .triforce
+                        .oot_project
+                        .executable(),
                 };
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title(format!("Locate {executable}"))
@@ -639,6 +672,12 @@ impl Controller {
                     if self.game == GameId::Dusklight {
                         self.dispatch(Command::SetExecutable(path))?;
                     } else {
+                        if self.game == GameId::Triforce && !self.confirm(
+                            "Use this OOT installation",
+                            "Carry current OOT progress to this installation? Any replaced save is backed up; its graphics settings stay separate.",
+                        ).await? {
+                            return Ok(());
+                        }
                         self.native(NativeCommand::SetExecutable(path))?;
                     }
                 }
@@ -800,9 +839,13 @@ impl Controller {
                     self.snapshot.source.game = Some(self.game);
                     self.snapshot.source.plan = Some(source_build::Plan {
                         game: self.game,
+                        oot_project: self.snapshot.source.preferences.get(self.game).oot_project,
                         tag: "v1.0.0-example".into(),
                         commit: "a".repeat(40),
-                        review_url: source_build::source_url(self.game),
+                        review_url: source_build::project_source_url(
+                            self.game,
+                            self.snapshot.source.preferences.get(self.game).oot_project,
+                        ),
                     });
                     self.snapshot.source.prerequisites = source_build::prerequisites(self.game)?;
                     return self.refresh_view();
@@ -831,7 +874,9 @@ impl Controller {
                     [usize::try_from(model::index(self.game))?]
                 .installed
                 .as_ref()
-                .and_then(|version| version.compare_url(self.game, &plan.commit))
+                .and_then(|version| {
+                    version.compare_project_url(self.game, plan.oot_project, &plan.commit)
+                })
                 .context(
                     "A recorded, different installed source revision is required for a diff",
                 )?;
@@ -1624,6 +1669,18 @@ impl Controller {
         );
         ui.set_save_state(save_state.into());
         let preference = snapshot.source.preferences.get(game);
+        if game == GameId::Triforce {
+            ui.set_game_subtitle(
+                format!(
+                    "{} · an adventure through time",
+                    preference.oot_project.name()
+                )
+                .into(),
+            );
+        }
+        ui.set_longshot(
+            snapshot.source.preferences.triforce.oot_project == source_build::OotProject::Longshot,
+        );
         ui.set_source_mode(preference.method == Method::Source);
         ui.set_managed_tools(preference.managed_tools);
         ui.set_renodx(preference.renodx_hdr);
@@ -1671,7 +1728,9 @@ impl Controller {
         }).into());
         ui.set_can_compare_source(plan.is_some_and(|plan| {
             installed_version
-                .and_then(|version| version.compare_url(game, &plan.commit))
+                .and_then(|version| {
+                    version.compare_project_url(game, plan.oot_project, &plan.commit)
+                })
                 .is_some()
         }));
         let same_game = snapshot.source.game == Some(game);

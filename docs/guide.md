@@ -601,6 +601,36 @@ Slint interface groups the workflow into **Tools**, **Game files**, and **Build*
 Dusklight/TotK retain their official-release/setup option. Triforce is built from
 source; the manager does not invoke its publisher's Setup.
 
+For Ocarina of Time, choose **Triforce** or **Longshot** in Game setup, or use
+the project switch beside **Play**. Longshot uses
+`https://git.magicbean.dev/MagicBeanDev/Longshot`: its latest stable release is
+resolved to a full tag commit for review, then checked out and compiled locally,
+including the Vulkan renderer. No prebuilt Longshot game or Builder is run.
+The normal verified compiler, SDL, codec and pinned header dependencies are still
+required; building from source is not an assurance those dependencies are safe.
+
+The projects have separate installation folders under `Games\Triforce` and
+`Games\Longshot`, with separate graphics settings. Longshot keeps versioned staged
+builds instead of being relocated over Triforce. Select a project before checking
+for source updates or building; the other installation is not replaced.
+Updates reuse that project's retained `.triforce_exefs` or `.longshot_exefs` plus
+`romfs`, or your selected local `.nup`, and preserve saves, settings and mods.
+
+Both projects use the same OOT account and save layout. After confirmation,
+switching copies the current installation's verified committed progress into the
+target project using the normal transactional save writer. Replaced target saves
+remain in its `user\save-sync-backups`; graphics settings are not copied.
+If the current project has no progress, existing target progress is kept.
+This also prepares saves when the target project has not been built yet.
+Both games must be closed, with no pending transfers or play reservations.
+The selected project uses the existing OOT LAN channel, history and play protection;
+there is no separate simultaneous play session for each project.
+
+For command-line checks use `--check-source-updates longshot` (read-only).
+To approve an exact checked revision and build it use
+`--build-source longshot --approve-commit FULL_SHA`, optionally `--jobs N`.
+This selects Longshot and carries current OOT progress over as above.
+
 Source builds are slower and **not confirmed to be safer**. They reduce reliance
 on prebuilt game executables, not on all prebuilt software. The code, build scripts
 and dependencies run as the user, outside a sandbox. For code you do not trust,

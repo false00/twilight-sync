@@ -2,6 +2,7 @@ import { ScrollView, LineEdit, ProgressIndicator, Palette } from "std-widgets.sl
 import { Theme, ActionButton, SectionTitle, Muted, Surface, SwitchRow, GameTile, NavigationItem, PageHeading, StatusBadge, DetailBlock, SaveProgress } from "components.slint";
 
 export enum Action {
+    select-oot-project,
     play, sync-save, setup, locate-game, refresh, compare, continue-local,
     use-local, use-remote, accept-save, decline-save, recover, approve-recovery, decline-recovery,
     check-source, reset-source, review-source, compare-source, tool-help, nvidia-terms, prepare-tools, build-source, cancel-source, use-built, open-log,
@@ -254,6 +255,7 @@ export component MainWindow inherits Window {
     in-out property <bool> comparison-open: false;
     in-out property <int> branch-choice: -1;
     in property <bool> source-mode;
+    in property <bool> longshot;
     in property <bool> source-busy;
     in property <bool> source-building;
     in property <bool> build-complete;
@@ -589,6 +591,11 @@ export component MainWindow inherits Window {
                                     VerticalLayout { spacing: 4px; horizontal-stretch: 1; SectionTitle { text: root.game-title; } Muted { text: root.game-subtitle; font-size: 12px; } }
                                     StatusBadge { text: root.game-status; tint: root.saves-match ? Theme.success : root.has-conflict || root.recovery-needed || root.pending-save ? Theme.warning : Theme.accent; }
                                 }
+                                if root.selected-game == 2: HorizontalLayout {
+                                    spacing: 10px;
+                                    ActionButton { text: "Triforce"; primary: !root.longshot; available: root.can-manage; clicked => { root.action(Action.select-oot-project, 0); } }
+                                    ActionButton { text: "Longshot"; primary: root.longshot; available: root.can-manage; clicked => { root.action(Action.select-oot-project, 1); } }
+                                }
                                 HorizontalLayout {
                                     spacing: 10px;
                                     ActionButton { text: root.installed ? "Play" : "Set up game"; primary: true; available: root.installed ? root.can-play : root.can-manage; clicked => { if root.installed { root.action(Action.play, 0); } else { root.navigate(1); } } }
@@ -728,6 +735,11 @@ export component MainWindow inherits Window {
                                 if root.installed-release != "": Muted { text: "Installed release: " + root.installed-release; }
                             }
                         }
+                        if root.selected-game == 2: HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton { text: "Triforce"; primary: !root.longshot; available: root.can-manage; clicked => { root.action(Action.select-oot-project, 0); } }
+                            ActionButton { text: "Longshot"; primary: root.longshot; available: root.can-manage; clicked => { root.action(Action.select-oot-project, 1); } }
+                        }
                         if root.source-mode: HorizontalLayout {
                             spacing: 10px;
                             ActionButton { text: "1  Tools"; primary: root.setup-step == 0; available: root.can-manage; clicked => { root.setup-step = 0; } }
@@ -774,7 +786,7 @@ export component MainWindow inherits Window {
                             Muted { text: "Choose your own legally obtained game files. They stay on this PC and are separate from texture packs."; }
                             GameFileInput {
                                 title: root.selected-game == 1 ? "Tears of the Kingdom base game" : "Ocarina of Time game";
-                                description: root.selected-game == 1 ? "Required: your base-game .nsp. Also accepts .xci, .nsz and .xcz. Choose the update separately below." : "Choose your Ocarina of Time .nup game file. Triforce is the PC project that builds it, not the name of your game file.";
+                                description: root.selected-game == 1 ? "Required: your base-game .nsp. Also accepts .xci, .nsz and .xcz. Choose the update separately below." : "Choose your own Ocarina of Time .nup game file. The selected PC project builds it locally from source.";
                                 selected-path: root.source-input;
                                 empty-text: root.selected-game == 2 && root.installed ? "No new input selected. Retained game files from the installed copy are reused when available." : "No game file selected";
                                 choose-label: root.selected-game == 1 ? "Choose TotK base game (.nsp)" : "Choose OOT game (.nup)";
@@ -828,7 +840,7 @@ export component MainWindow inherits Window {
                                 VerticalLayout {
                                     padding: 20px; spacing: 12px;
                                     SectionTitle { text: "Extracted Ocarina of Time files"; }
-                                    Muted { text: "Instead of a .nup, choose the parent folder containing romfs and exefs (or .triforce_exefs in a previously built PC copy). Selecting it replaces the game input above."; }
+                                    Muted { text: "Instead of a .nup, choose the parent folder containing romfs and exefs (or .triforce_exefs/.longshot_exefs in a previously built PC copy). Selecting it replaces the game input above."; }
                                     ActionButton { text: "Choose extracted OOT folder"; available: root.can-manage; clicked => { root.choose-input(4); } }
                                 }
                             }
@@ -846,7 +858,7 @@ export component MainWindow inherits Window {
                                 if root.selected-game == 2 && root.advanced-source: VerticalLayout {
                                     spacing: 6px;
                                     Muted { text: "Vulkan, SDL and movie/audio codecs are included. Codec binaries are supplied by Takoroka/ffmpeg-av1, not FFmpeg.org; checksums do not prove source-to-binary safety."; }
-                                    SwitchRow { title: "RenoDX HDR"; description: "Upstream default; downloads shader/compiler dependencies."; checked: root.renodx; available: root.can-manage; toggled(value) => { root.toggle(Toggle.renodx, value); } }
+                                    if !root.longshot: SwitchRow { title: "RenoDX HDR"; description: "Upstream default; downloads shader/compiler dependencies."; checked: root.renodx; available: root.can-manage; toggled(value) => { root.toggle(Toggle.renodx, value); } }
                                     SwitchRow { title: "AMD FSR 4"; checked: root.fsr; available: root.can-manage; toggled(value) => { root.toggle(Toggle.fsr, value); } }
                                     SwitchRow { title: "NVIDIA DLSS / frame generation"; description: "Enable only after reviewing and accepting NVIDIA's SDK terms."; checked: root.nvidia; available: root.can-manage; toggled(value) => { root.toggle(Toggle.nvidia, value); } }
                                     ActionButton { text: "Review NVIDIA SDK terms"; clicked => { root.action(Action.nvidia-terms, 0); } }

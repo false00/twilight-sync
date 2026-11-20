@@ -135,6 +135,7 @@ pub struct HistoryPreview {
 
 pub enum Command {
     CreateDesktopShortcut,
+    SelectOotProject(source_build::OotProject),
     SetSourcePreference {
         game: protocol::GameId,
         preference: source_build::Preference,
@@ -2155,6 +2156,13 @@ impl Engine {
 
     fn activate_source(&mut self, built: &source_build::Built) -> Result<()> {
         self.require_source_idle()?;
+        if built.game == protocol::GameId::Triforce {
+            ensure!(
+                source_build::OotProject::from_executable(&built.executable)?
+                    == self.source.preferences.triforce.oot_project,
+                "Select the matching OOT project before activating this build"
+            );
+        }
         let (previous, executable) = self.source_paths(built.game);
         source_build::verify_activation(built, previous.as_deref(), executable.as_deref())?;
         let rebuild_source = built.source.as_ref().map_or_else(String::new, |path| {
@@ -2189,6 +2197,12 @@ impl Engine {
                 .native_channel(game)?
                 .activate_verified_executable(&built.executable, built.expected_save.as_deref())?,
         }
+        if built.game == protocol::GameId::Triforce {
+            let mut preferences = self.source.preferences.clone();
+            preferences.remember_oot(preferences.triforce.oot_project, built.directory.clone());
+            preferences.persist(&self.root)?;
+            self.source.preferences = preferences;
+        }
         if self.ready() {
             self.send_state()?;
         }
@@ -2198,7 +2212,7 @@ impl Engine {
     fn native_command(&mut self, game: protocol::GameId, command: NativeCommand) -> Result<()> {
         let name = match game {
             protocol::GameId::Totk => "TotK",
-            protocol::GameId::Triforce => "Triforce",
+            protocol::GameId::Triforce => self.source.preferences.triforce.oot_project.name(),
             protocol::GameId::Dusklight => bail!("Dusklight uses its own save commands"),
         };
         ensure!(
@@ -2247,11 +2261,38 @@ impl Engine {
                 self.native_channel(game)?.accept(approved)?
             }
             NativeCommand::SetExecutable(path) => {
-                self.native_channel(game)?.set_executable(&path)?;
+                if game == protocol::GameId::Triforce {
+                    ensure!(
+                        source_build::OotProject::from_executable(&path)?
+                            == self.source.preferences.triforce.oot_project,
+                        "Select the matching OOT project before locating its executable"
+                    );
+                    self.require_source_idle()?;
+                    let directory = crate::native::Game::Triforce.installation(&path)?;
+                    self.triforce.switch_oot_installation(&directory)?;
+                } else {
+                    self.native_channel(game)?.set_executable(&path)?;
+                }
                 self.native_channel(game)?.executable()?;
+                if game == protocol::GameId::Triforce {
+                    let mut preferences = self.source.preferences.clone();
+                    preferences.remember_oot(
+                        preferences.triforce.oot_project,
+                        crate::native::Game::Triforce.installation(&path)?,
+                    );
+                    preferences.persist(&self.root)?;
+                    self.source.preferences = preferences;
+                }
                 Vec::new()
             }
             NativeCommand::Launch { local_only } => {
+                if game == protocol::GameId::Triforce {
+                    ensure!(
+                        source_build::OotProject::from_executable(&self.triforce.executable()?)?
+                            == self.source.preferences.triforce.oot_project,
+                        "Select the OOT project matching this installation before playing"
+                    );
+                }
                 self.native_channel(game)?.launch(connected, local_only)?
             }
             NativeCommand::Continue { expected } => self
@@ -2318,10 +2359,59 @@ impl Engine {
                     }
                 });
             }
+            Command::SelectOotProject(project) => {
+                ensure!(
+                    self.source.preferences_valid && !self.source.busy,
+                    "Finish the source operation or reset invalid preferences first"
+                );
+                self.require_source_idle()?;
+                let mut preferences = self.source.preferences.clone();
+                if let Some(current) = &self.triforce.status.install_path {
+                    let project = match &self.triforce.status.executable {
+                        Some(executable) if executable.is_file() => {
+                            source_build::OotProject::from_executable(executable)?
+                        }
+                        _ => preferences.triforce.oot_project,
+                    };
+                    preferences.remember_oot(project, current.clone());
+                }
+                let directory = preferences.oot_install(project)?;
+                let executable = crate::native::Game::Triforce.executable(&directory)?;
+                if executable.is_file() {
+                    ensure!(
+                        source_build::OotProject::from_executable(&executable)? == project,
+                        "The saved OOT project folder contains a different project's executable"
+                    );
+                }
+                self.triforce.switch_oot_installation(&directory)?;
+                preferences.triforce.oot_project = project;
+                preferences.remember_oot(project, directory);
+                preferences.persist(&self.root)?;
+                self.source.preferences = preferences;
+                self.source.plan = None;
+                self.source.built = None;
+                self.source.completion = None;
+                self.source.error = None;
+                self.source.message = format!(
+                    "{} selected. Current OOT progress was carried over; any replaced target save was backed up.",
+                    project.name()
+                );
+                self.versions_checked = None;
+                if self.native_supported(protocol::GameId::Triforce) {
+                    let state = self.triforce.state_event()?;
+                    let shared = self.triforce.shared_state();
+                    self.send_native_frames(protocol::GameId::Triforce, vec![shared, state])?;
+                }
+            }
             Command::SetSourcePreference { game, preference } => {
                 ensure!(
                     self.source.preferences_valid && !self.source.busy,
                     "Finish the source operation or reset invalid preferences first"
+                );
+                ensure!(
+                    game != protocol::GameId::Triforce
+                        || preference.oot_project == self.source.preferences.triforce.oot_project,
+                    "Use the OOT project selector to switch installations"
                 );
                 let mut preferences = self.source.preferences.clone();
                 preferences.set(game, preference)?;
@@ -2334,7 +2424,10 @@ impl Engine {
                     !self.source.busy,
                     "Finish or cancel the source operation before resetting preferences"
                 );
-                let preferences = source_build::Preferences::default();
+                let mut preferences = source_build::Preferences::default();
+                preferences.triforce.oot_project = self.source.preferences.triforce.oot_project;
+                preferences.triforce_install = self.source.preferences.triforce_install.clone();
+                preferences.longshot_install = self.source.preferences.longshot_install.clone();
                 preferences.persist(&self.root)?;
                 self.source.preferences = preferences;
                 self.source.preferences_valid = true;
@@ -2347,11 +2440,12 @@ impl Engine {
                 self.source.log = None;
                 self.source.message = "Checking the stable source tag and full commit identity; no project code is being run...".into();
                 let sender = self.sender.clone();
+                let project = self.source.preferences.get(game).oot_project;
                 thread::spawn(move || {
                     if sender
                         .send(Input::SourceChecked {
                             game,
-                            result: source_build::check(game),
+                            result: source_build::check_project(game, project),
                         })
                         .is_err()
                     {
@@ -5506,6 +5600,14 @@ impl Engine {
             let (Some(directory), Some(executable)) = self.source_paths(game) else {
                 continue;
             };
+            // Longshot retains its own versioned builds; never migrate it over Triforce.
+            if game == protocol::GameId::Triforce
+                && executable
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("longshot.exe"))
+            {
+                continue;
+            }
             if match game {
                 protocol::GameId::Dusklight => self.save_location_error.is_some(),
                 protocol::GameId::Totk => self.totk.status.verification_error.is_some(),
@@ -7093,6 +7195,65 @@ mod tests {
     }
 
     #[test]
+    fn oot_selection_persists_each_install_and_invalidates_previous_source_approval() -> Result<()>
+    {
+        let mut h = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        let triforce = h.left.root.join("Triforce");
+        let longshot = h.left.root.join("Longshot");
+        for (root, executable) in [(&triforce, "Triforce.exe"), (&longshot, "longshot.exe")] {
+            fs::create_dir_all(root.join("romfs"))?;
+            fs::write(root.join("image.bin"), b"synthetic game data")?;
+            fs::write(root.join(executable), b"fixture, never executed")?;
+        }
+        crate::triforce::tests::seed(&triforce.join("user"), 7)?;
+        h.left.triforce.refresh()?;
+        h.left.source.preferences.longshot_install = Some(longshot.clone());
+        h.left.source.plan = Some(source_build::Plan {
+            game: protocol::GameId::Triforce,
+            oot_project: source_build::OotProject::Triforce,
+            tag: "v1.0.0".into(),
+            commit: "a".repeat(40),
+            review_url: String::new(),
+        });
+        h.left.command(Command::SelectOotProject(
+            source_build::OotProject::Longshot,
+        ))?;
+        assert!(h.left.source.plan.is_none());
+        assert_eq!(h.left.triforce.executable()?, longshot.join("longshot.exe"));
+        let saved = source_build::Preferences::load(&h.left.root)?;
+        assert_eq!(
+            saved.triforce.oot_project,
+            source_build::OotProject::Longshot
+        );
+        assert_eq!(saved.triforce_install, Some(triforce.clone()));
+        assert_eq!(saved.longshot_install, Some(longshot.clone()));
+        let mut wrong = saved.triforce.clone();
+        wrong.oot_project = source_build::OotProject::Triforce;
+        assert!(
+            h.left
+                .command(Command::SetSourcePreference {
+                    game: protocol::GameId::Triforce,
+                    preference: wrong,
+                })
+                .is_err()
+        );
+        h.left.command(Command::ResetSourcePreferences)?;
+        assert_eq!(
+            h.left.source.preferences.triforce.oot_project,
+            source_build::OotProject::Longshot
+        );
+        h.left.command(Command::SelectOotProject(
+            source_build::OotProject::Triforce,
+        ))?;
+        assert_eq!(h.left.triforce.executable()?, triforce.join("Triforce.exe"));
+        assert_eq!(
+            crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
+            crate::triforce::snapshot(&longshot.join("user"))?.map(|save| save.hash)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_build_approval_and_idle_guards_run_before_tool_or_source_execution() -> Result<()> {
         let mut harness = Harness::new(Some(variant(1)), None)?;
         let before = harness.left.current_hash()?;
@@ -7122,6 +7283,7 @@ mod tests {
         )?;
         harness.left.source.plan = Some(source_build::Plan {
             game: protocol::GameId::Dusklight,
+            oot_project: source_build::OotProject::Triforce,
             tag: "v2.0.3".into(),
             commit: "a".repeat(40),
             review_url: format!(
@@ -7281,6 +7443,7 @@ mod tests {
             harness.left.source.preferences.set(game, changed)?;
             harness.left.source.plan = Some(source_build::Plan {
                 game,
+                oot_project: source_build::OotProject::Triforce,
                 tag: "v1.0.0-test".into(),
                 commit: "a".repeat(40),
                 review_url: source_build::source_url(game),

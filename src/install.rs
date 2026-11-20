@@ -93,6 +93,15 @@ impl Version {
     }
 
     pub fn compare_url(&self, game: GameId, commit: &str) -> Option<String> {
+        self.compare_project_url(game, crate::source_build::OotProject::Triforce, commit)
+    }
+
+    pub fn compare_project_url(
+        &self,
+        game: GameId,
+        project: crate::source_build::OotProject,
+        commit: &str,
+    ) -> Option<String> {
         let previous = self.commit.as_ref()?;
         (previous != commit
             && crate::source_build::valid_commit(previous)
@@ -100,7 +109,7 @@ impl Version {
         .then(|| {
             format!(
                 "{}/compare/{}...{}",
-                crate::source_build::source_url(game),
+                crate::source_build::project_source_url(game, project),
                 previous,
                 commit
             )

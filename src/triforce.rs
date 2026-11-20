@@ -79,6 +79,108 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn oot_projects_carry_progress_both_ways_and_retain_target_backups_and_settings() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let triforce = temp.path().join("Triforce");
+        let longshot = temp.path().join("Longshot");
+        for (root, executable) in [(&triforce, "Triforce.exe"), (&longshot, "longshot.exe")] {
+            fs::create_dir_all(root.join("bin"))?;
+            fs::create_dir(root.join("romfs"))?;
+            fs::write(root.join("image.bin"), b"synthetic game data")?;
+            fs::write(
+                root.join("bin").join(executable),
+                b"fixture, never executed",
+            )?;
+        }
+        seed(&triforce.join("user"), 7)?;
+        seed(&longshot.join("user"), 2)?;
+        let original_target =
+            snapshot(&longshot.join("user"))?.context("Missing target fixture")?;
+        fs::write(longshot.join("longshot_options.ini"), b"Longshot graphics")?;
+        let transfers = temp.path().join("transfers");
+        let mut channel = totk::Channel::for_game(
+            transfers.clone(),
+            Ok(triforce.clone()),
+            native::Game::Triforce,
+        );
+        channel.refresh()?;
+        channel.switch_oot_installation(&longshot)?;
+        assert_eq!(
+            channel.executable()?,
+            longshot.join("bin").join("longshot.exe")
+        );
+        assert_eq!(
+            snapshot(&longshot.join("user"))?.map(|save| save.hash),
+            snapshot(&triforce.join("user"))?.map(|save| save.hash)
+        );
+        assert_eq!(
+            fs::read(longshot.join("longshot_options.ini"))?,
+            b"Longshot graphics"
+        );
+        let backup = fs::read_dir(longshot.join("user").join("save-sync-backups"))?
+            .next()
+            .context("Target save was not backed up")??
+            .path();
+        let backed_up = temp.path().join("backup-profile");
+        fs::create_dir_all(&backed_up)?;
+        fs::rename(&backup, backed_up.join("save"))?;
+        assert_eq!(
+            snapshot(&backed_up)?.map(|save| save.hash),
+            Some(original_target.hash)
+        );
+
+        seed(&longshot.join("user"), 9)?;
+        channel.switch_oot_installation(&triforce)?;
+        assert_eq!(
+            snapshot(&longshot.join("user"))?.map(|save| save.hash),
+            snapshot(&triforce.join("user"))?.map(|save| save.hash)
+        );
+        let restarted = totk::Channel::for_game(transfers, Ok(longshot), native::Game::Triforce);
+        assert_eq!(
+            restarted.executable()?,
+            triforce.join("bin").join("Triforce.exe")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oot_switches_protect_pending_sessions_and_prepare_uninstalled_projects() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let previous = temp.path().join("Triforce");
+        let next = temp.path().join("Longshot");
+        seed(&previous.join("user"), 7)?;
+        let mut channel = totk::Channel::for_game(
+            temp.path().join("transfers"),
+            Ok(previous.clone()),
+            native::Game::Triforce,
+        );
+        channel.status.remote_running = true;
+        assert!(channel.switch_oot_installation(&next).is_err());
+        assert!(!next.try_exists()?);
+        channel.status.remote_running = false;
+        channel.status.pending = true;
+        assert!(channel.switch_oot_installation(&next).is_err());
+        channel.status.pending = false;
+        channel.switch_oot_installation(&next)?;
+        assert!(!channel.status.installed);
+        assert_eq!(
+            snapshot(&previous.join("user"))?.map(|save| save.hash),
+            snapshot(&next.join("user"))?.map(|save| save.hash)
+        );
+
+        let transaction = previous
+            .join("user")
+            .join("save-tx")
+            .join(format!("{ACCOUNT:032x}"))
+            .join("new");
+        fs::create_dir_all(transaction)?;
+        assert!(channel.switch_oot_installation(&previous).is_err());
+        assert_eq!(channel.status.install_path, Some(next));
+        Ok(())
+    }
+
+    #[test]
     fn full_committed_saves_seed_empty_pcs_and_preserve_unrelated_profiles_and_settings()
     -> Result<()> {
         for existing in [false, true] {

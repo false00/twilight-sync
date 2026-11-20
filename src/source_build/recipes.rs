@@ -364,8 +364,9 @@ pub(super) fn validate_input_paths(
                 input.is_file()
                     || (input.join("romfs").is_dir()
                         && (input.join(".triforce_exefs").is_dir()
+                            || input.join(".longshot_exefs").is_dir()
                             || input.join("exefs").is_dir())),
-                "Choose your Ocarina of Time .nup or an extracted game folder with romfs and exefs/.triforce_exefs"
+                "Choose your Ocarina of Time .nup or an extracted game folder with romfs and exefs/.triforce_exefs/.longshot_exefs"
             );
         }
     }
@@ -383,7 +384,9 @@ fn input_paths(preference: &super::Preference, previous: Option<&Path>) -> Resul
     let current =
         previous.context("Choose your own Ocarina of Time .nup or existing game folder")?;
     ensure!(
-        current.join("romfs").is_dir() && current.join(".triforce_exefs").is_dir(),
+        current.join("romfs").is_dir()
+            && (current.join(".triforce_exefs").is_dir()
+                || current.join(".longshot_exefs").is_dir()),
         "This Ocarina of Time installation has no retained build inputs; choose your own .nup or extracted game folder"
     );
     Ok(current.to_path_buf())
@@ -811,6 +814,7 @@ pub(super) fn build(
             runner.run(&mut totk_installer(&context, request, jobs)?, "Compiling and preparing TotK from the checked-out source (shader preparation may open a window)")?;
         }
         GameId::Triforce => {
+            let longshot = request.plan.oot_project == super::OotProject::Longshot;
             let llvm = tools.ensure(Package::Llvm, allowed, cancel, &mut |text| {
                 runner.message(&text)
             })?;
@@ -896,7 +900,9 @@ pub(super) fn build(
                 );
             }
             let input = triforce_input(request)?;
-            if let Some(previous) = &request.previous_install {
+            if let Some(previous) = &request.previous_install
+                && !longshot
+            {
                 match stage_triforce_caches(previous, output) {
                     Ok(true) => runner.message(
                         "Staged local shader caches; Triforce will check their compatibility.",
@@ -918,19 +924,28 @@ pub(super) fn build(
                     jobs,
                 )?)
                 .env("HOOKSHOT_MINGW", &llvm.root)
+                .env("LONGSHOT_MINGW", &llvm.root)
                 .env("WGPU_NATIVE", no_wgpu)
                 .env("RX_CPM", cpm)
                 .env("RX_RELEASE", "1");
             if request.preference.nvidia_dlss {
                 command
                     .env("HOOKSHOT_NGX_SDK", workspace.join("nvidia-ngx"))
+                    .env("LONGSHOT_NGX_SDK", workspace.join("nvidia-ngx"))
                     .env(
                         "HOOKSHOT_STREAMLINE_SDK",
                         workspace.join("nvidia-streamline"),
                     );
             }
             for (environment, location) in locations {
-                command.env(environment, location);
+                command.env(
+                    if longshot {
+                        environment.replace("HOOKSHOT_", "LONGSHOT_")
+                    } else {
+                        environment.into()
+                    },
+                    location,
+                );
             }
             // Vulkan is built locally; the unverified custom wgpu-native binary is not used.
             ensure!(
@@ -942,7 +957,7 @@ pub(super) fn build(
                 "Unexpected prebuilt Triforce launcher in the source workspace"
             );
             let log_start = runner.log.metadata()?.len();
-            runner.run(&mut command, "Building Triforce and its Vulkan renderer from source (this can take an hour or more)")?;
+            runner.run(&mut command, &format!("Building {} and its Vulkan renderer from source (this can take an hour or more)", request.plan.oot_project.name()))?;
             if request.preference.prepare_shaders {
                 let mut log = BufReader::new(fs::File::open(&runner.log)?);
                 log.seek(SeekFrom::Start(log_start))?;
@@ -1029,7 +1044,7 @@ fn triforce_arguments(
     args.push(work.into());
     args.push("--jobs".into());
     args.push(jobs.to_string().into());
-    if !preference.renodx_hdr {
+    if !preference.renodx_hdr && preference.oot_project == super::OotProject::Triforce {
         args.push("--no-renodx".into());
     }
     if preference.amd_fsr4 {
@@ -1048,6 +1063,8 @@ fn triforce_arguments(
     if input.is_dir() {
         let exefs = if input.join(".triforce_exefs").is_dir() {
             input.join(".triforce_exefs")
+        } else if input.join(".longshot_exefs").is_dir() {
+            input.join(".longshot_exefs")
         } else {
             input.join("exefs")
         };
@@ -1069,6 +1086,36 @@ fn triforce_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longshot_updates_reuse_retained_inputs_without_triforce_only_flags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("Longshot");
+        fs::create_dir_all(input.join(".longshot_exefs"))?;
+        fs::create_dir(input.join("romfs"))?;
+        let preference = super::super::Preference {
+            oot_project: super::super::OotProject::Longshot,
+            renodx_hdr: false,
+            ..Default::default()
+        };
+        assert_eq!(input_paths(&preference, Some(&input))?, input);
+        validate_input_paths(GameId::Triforce, &preference, Some(&input))?;
+        let args = triforce_arguments(
+            &input,
+            &temp.path().join("output"),
+            &temp.path().join("work"),
+            &preference,
+            4,
+        )?;
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                OsString::from("--exefs"),
+                input.join(".longshot_exefs").into_os_string()
+            ]));
+        assert!(!args.contains(&OsString::from("--no-renodx")));
+        assert!(!args.contains(&OsString::from("--update")));
+        Ok(())
+    }
 
     #[test]
     #[cfg(windows)]
@@ -1268,6 +1315,7 @@ mod tests {
         let request = Request {
             plan: super::super::Plan {
                 game: GameId::Totk,
+                oot_project: super::super::OotProject::Triforce,
                 tag: "v0.4.1".into(),
                 commit: "a".repeat(40),
                 review_url: String::new(),
@@ -1504,6 +1552,7 @@ mod tests {
             let request = Request {
                 plan: super::super::Plan {
                     game,
+                    oot_project: super::super::OotProject::Triforce,
                     tag: "v1.0.0".into(),
                     commit: "a".repeat(40),
                     review_url: String::new(),
