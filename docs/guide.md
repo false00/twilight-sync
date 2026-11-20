@@ -195,8 +195,10 @@ repeated connections, or network polling.
 
 ### 1. Gate the network
 
-The Windows probe selects a physical, nonvirtual adapter with a private profile,
-resolves the default router's neighbor entry, and computes:
+The Windows probe uses native IP Helper and Network List Manager calls, without
+starting PowerShell or another child process. It selects a physical, nonvirtual
+adapter with a private profile, resolves the default router's neighbor entry,
+and computes:
 
 ```text
 SHA-256("twilight-router/v1|" + gateway_ipv4 + "|" + normalized_gateway_mac
@@ -218,6 +220,14 @@ than twelve seconds disables all network activity, including if the probing
 worker stalls. This is sampled verification, not an instantaneous physical-link
 attestation. The OS may accept a TCP SYN before the application rejects a session;
 preventing that requires OS firewall policy.
+
+When no session, pairing, transfer, build, or game is active, the engine waits
+up to one second; commands wake it immediately and network deadlines still bound
+the wait. Active work retains the 50 ms cadence. Dashboard polling slows from
+250 ms to two seconds while hidden and resumes immediately when shown.
+Periodic Dusklight save observation checks file size and last-write time before
+hashing, with a full check at least every 60 seconds. Transfer and replacement
+safety checks always re-read and hash the save; they never use this cache.
 
 ### 2. Establish an encrypted channel
 

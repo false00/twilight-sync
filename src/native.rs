@@ -125,9 +125,12 @@ impl Game {
     }
 
     pub fn running(self, monitor: &mut ProcessMonitor) -> bool {
-        monitor.named_game_running(self.executable_name())
-            || (self == Self::Triforce && monitor.named_game_running("hookshot.exe"))
-            || (self == Self::Triforce && monitor.named_game_running("longshot.exe"))
+        match self {
+            Self::Totk => monitor.named_game_running(self.executable_name()),
+            Self::Triforce => {
+                monitor.named_games_running(&["Triforce.exe", "hookshot.exe", "longshot.exe"])
+            }
+        }
     }
 
     pub fn ensure_stopped(self) -> Result<()> {

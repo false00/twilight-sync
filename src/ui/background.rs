@@ -13,7 +13,7 @@ use windows_sys::Win32::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             FindWindowW, IsWindow, KillTimer, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-            SW_RESTORE, SendMessageTimeoutW, SetTimer, ShowWindow, WM_NCDESTROY,
+            SW_RESTORE, SendMessageTimeoutW, SetTimer, ShowWindow, WM_NCDESTROY, WM_SHOWWINDOW,
         },
     },
 };
@@ -36,6 +36,7 @@ struct Pump {
     open_message: u32,
     game_message: u32,
     open_game_controls: Cell<Option<crate::protocol::GameId>>,
+    ui_timer: std::rc::Weak<slint::Timer>,
 }
 
 pub(super) struct BackgroundGuard {
@@ -129,6 +130,7 @@ impl BackgroundGuard {
         ui: slint::Weak<MainWindow>,
         backend: Backend,
         tray: Tray,
+        ui_timer: std::rc::Weak<slint::Timer>,
     ) -> std::io::Result<Self> {
         let pump = Rc::new(Pump {
             backend,
@@ -142,6 +144,7 @@ impl BackgroundGuard {
             open_message: open_message()?,
             game_message: register_message("TwilightSync.OpenGameControls.v2")?,
             open_game_controls: Cell::new(None),
+            ui_timer,
         });
         PUMP.with(|cell| *cell.borrow_mut() = Some(pump.clone()));
         if unsafe { SetWindowSubclass(window.get() as HWND, Some(window_message), TIMER_ID, 0) }
@@ -209,6 +212,15 @@ unsafe extern "system" fn window_message(
     _: usize,
 ) -> LRESULT {
     let pump = PUMP.with(|cell| cell.borrow().clone());
+    if message == WM_SHOWWINDOW
+        && let Some(timer) = pump.as_ref().and_then(|pump| pump.ui_timer.upgrade())
+    {
+        timer.set_interval(if wparam == 0 {
+            std::time::Duration::from_secs(2)
+        } else {
+            std::time::Duration::from_millis(250)
+        });
+    }
     if let Some(pump) = &pump
         && message == pump.dashboard_message
     {

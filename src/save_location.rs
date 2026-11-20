@@ -6,6 +6,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const SAVE_NAME: &str = "gczelda2";
@@ -323,6 +324,62 @@ pub fn hash(profile: &Path, path: &Path) -> Result<Option<String>> {
     Ok(Some(files::sha256(&bytes)))
 }
 
+#[derive(Default)]
+pub(crate) struct HashCache(Option<CachedHash>);
+
+struct CachedHash {
+    profile: PathBuf,
+    path: PathBuf,
+    stamp: (u64, SystemTime),
+    checked: Instant,
+    hash: Option<String>,
+}
+
+fn stamp(path: &Path) -> Result<Option<(u64, SystemTime)>> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_file(), "Save must be a regular file");
+            Ok(Some((metadata.len(), metadata.modified()?)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("Inspecting Dusklight save metadata"),
+    }
+}
+
+impl HashCache {
+    // Only periodic observation uses this cache; pre-transfer/write checks always call hash().
+    pub fn refresh(&mut self, profile: &Path, path: &Path, now: Instant) -> Result<Option<String>> {
+        let previous = self.0.take();
+        ensure_safe_path(path)?;
+        let Some(current) = stamp(path)? else {
+            return Ok(None);
+        };
+        if let Some(previous) = previous
+            && previous.profile == profile
+            && previous.path == path
+            && previous.stamp == current
+            && now.saturating_duration_since(previous.checked) < Duration::from_secs(60)
+        {
+            let hash = previous.hash.clone();
+            self.0 = Some(previous);
+            return Ok(hash);
+        }
+        let hash = hash(profile, path)?;
+        ensure!(
+            stamp(path)? == Some(current),
+            "Save changed during inspection; retrying shortly"
+        );
+        self.0 = Some(CachedHash {
+            profile: profile.into(),
+            path: path.into(),
+            stamp: current,
+            checked: now,
+            hash: hash.clone(),
+        });
+        Ok(hash)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -340,6 +397,67 @@ pub(crate) mod tests {
         bytes[8..40].fill(0);
         bytes[8..8 + SAVE_NAME.len()].copy_from_slice(SAVE_NAME.as_bytes());
         bytes
+    }
+
+    #[test]
+    fn periodic_hash_detects_metadata_changes_and_forces_a_full_check() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = discover(root.path())?;
+        prepare(&path)?;
+        let mut bytes = stock_save("GZ2E");
+        fs::write(&path, &bytes)?;
+        let now = Instant::now();
+        let mut cache = HashCache::default();
+        let first = cache.refresh(root.path(), &path, now)?;
+        bytes[0x28] ^= 1;
+        fs::write(&path, &bytes)?;
+        let changed_time = SystemTime::now() + Duration::from_secs(2);
+        File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(changed_time))?;
+        let second = cache.refresh(root.path(), &path, now + Duration::from_secs(1))?;
+        assert_ne!(first, second);
+        bytes[0x28] ^= 2;
+        fs::write(&path, &bytes)?;
+        File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(changed_time))?;
+        assert_eq!(
+            cache.refresh(root.path(), &path, now + Duration::from_secs(60))?,
+            second
+        );
+        assert_ne!(
+            hash(root.path(), &path)?,
+            second,
+            "Safety-critical hashes must not use the periodic cache"
+        );
+        assert_eq!(
+            cache.refresh(root.path(), &path, now + Duration::from_secs(61))?,
+            hash(root.path(), &path)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_hash_invalidates_deleted_or_invalid_saves() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = discover(root.path())?;
+        prepare(&path)?;
+        let bytes = stock_save("GZ2E");
+        fs::write(&path, &bytes)?;
+        let now = Instant::now();
+        let mut cache = HashCache::default();
+        assert!(cache.refresh(root.path(), &path, now)?.is_some());
+        fs::write(&path, b"invalid")?;
+        assert!(cache.refresh(root.path(), &path, now).is_err());
+        assert!(cache.0.is_none());
+        fs::remove_file(&path)?;
+        assert_eq!(cache.refresh(root.path(), &path, now)?, None);
+        fs::write(&path, &bytes)?;
+        assert!(cache.refresh(root.path(), &path, now)?.is_some());
+        Ok(())
     }
 
     #[test]

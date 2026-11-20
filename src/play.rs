@@ -7,17 +7,22 @@ use std::{
     path::Path,
     process::{Child, Command},
 };
-use sysinfo::{ProcessesToUpdate, System};
+#[cfg(not(windows))]
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
+#[cfg_attr(not(test), derive(Default))]
 pub struct ProcessMonitor {
+    #[cfg(not(windows))]
     system: System,
     #[cfg(test)]
     fake_running: Option<bool>,
 }
 
+#[cfg(test)]
 impl Default for ProcessMonitor {
     fn default() -> Self {
         Self {
+            #[cfg(not(windows))]
             system: System::new(),
             #[cfg(test)]
             // Synthetic fixtures must not depend on unrelated games running on the host.
@@ -30,8 +35,9 @@ impl ProcessMonitor {
     #[cfg(test)]
     pub(crate) fn for_test(running: bool) -> Self {
         Self {
+            #[cfg(not(windows))]
+            system: System::new(),
             fake_running: Some(running),
-            ..Self::default()
         }
     }
 
@@ -40,39 +46,82 @@ impl ProcessMonitor {
     }
 
     pub fn named_game_running(&mut self, executable: &str) -> bool {
+        self.named_games_running(&[executable])
+    }
+
+    pub fn named_games_running(&mut self, executables: &[&str]) -> bool {
         #[cfg(test)]
         if let Some(running) = self.fake_running {
             return running;
         }
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.system
-            .processes()
-            .values()
-            .filter(|process| {
-                process
-                    .name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(executable)
+        #[cfg(windows)]
+        match named_process_running(executables) {
+            Ok(running) => running,
+            Err(error) => {
+                eprintln!("Cannot safely check running games: {error:#}");
+                true
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            self.system.processes().values().any(|process| {
+                executables
+                    .iter()
+                    .any(|name| process.name().to_string_lossy().eq_ignore_ascii_case(name))
             })
-            .any(|process| {
-                #[cfg(windows)]
-                match crate::process_job::is_source_build_process(process.pid().as_u32()) {
-                    Ok(build_process) => !build_process,
-                    Err(error) => {
-                        eprintln!(
-                            "Cannot distinguish gameplay from source-build process {}: {error:#}",
-                            process.pid()
-                        );
-                        true
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = process;
-                    true
-                }
-            })
+        }
     }
+}
+
+#[cfg(windows)]
+fn named_process_running(executables: &[&str]) -> Result<bool> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    ensure!(
+        handle != INVALID_HANDLE_VALUE,
+        "Taking process name snapshot: {}",
+        std::io::Error::last_os_error()
+    );
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut present = unsafe { Process32FirstW(handle.as_raw_handle(), &mut entry) };
+    while present != 0 {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        if executables
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            && !crate::process_job::is_source_build_process(entry.th32ProcessID)?
+        {
+            return Ok(true);
+        }
+        present = unsafe { Process32NextW(handle.as_raw_handle(), &mut entry) };
+    }
+    let error = std::io::Error::last_os_error();
+    ensure!(
+        error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32),
+        "Reading process name snapshot: {error}"
+    );
+    Ok(false)
 }
 
 pub fn launch(path: &Path) -> Result<Child> {
@@ -190,11 +239,9 @@ mod tests {
         assert!(crate::process_job::is_source_build_process(child.id())?);
         let descendant_pid = fs::read_to_string(&descendant)?.parse::<u32>()?;
         assert!(crate::process_job::is_source_build_process(descendant_pid)?);
-        let mut monitor = ProcessMonitor {
-            fake_running: None,
-            ..Default::default()
-        };
+        let mut monitor = ProcessMonitor { fake_running: None };
         assert!(!monitor.named_game_running(&name));
+        assert!(!monitor.named_games_running(&["not-a-game.exe", &name]));
         let unrelated_ready = temporary.path().join("unrelated-ready");
         command
             .env_remove("TWILIGHT_PROCESS_DESCENDANT")
@@ -208,7 +255,7 @@ mod tests {
             unrelated.id()
         )?);
         assert!(
-            monitor.named_game_running(&name),
+            monitor.named_games_running(&["not-a-game.exe", &name.to_ascii_uppercase()]),
             "A genuine matching process was hidden by the build"
         );
         drop(unrelated_job);

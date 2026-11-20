@@ -487,6 +487,7 @@ struct Engine {
     local_hash: Option<String>,
     local_save: Option<save_data::Summary>,
     previous_hash: Option<String>,
+    periodic_save_hash: save_location::HashCache,
     save_valid: bool,
     stable: u8,
     stable_since: Instant,
@@ -1001,6 +1002,7 @@ impl Engine {
             local_hash: None,
             local_save: None,
             previous_hash: None,
+            periodic_save_hash: save_location::HashCache::default(),
             save_valid: false,
             stable: 0,
             stable_since: Instant::now(),
@@ -1059,7 +1061,7 @@ impl Engine {
 
     fn run(&mut self, receiver: Receiver<Input>) {
         while !self.shutdown {
-            match receiver.recv_timeout(Duration::from_millis(50)) {
+            match receiver.recv_timeout(self.wait_timeout()) {
                 Ok(input) => {
                     let wire = matches!(&input, Input::Frame { .. });
                     if let Err(error) = self.input(input) {
@@ -1092,6 +1094,48 @@ impl Engine {
         }
         self.shutdown = true;
         self.publish();
+    }
+
+    fn wait_timeout(&self) -> Duration {
+        let native_active = [&self.totk.status, &self.triforce.status]
+            .iter()
+            .any(|status| {
+                status.running
+                    || status.remote_running
+                    || status.updating
+                    || status.busy
+                    || status.pending
+                    || status.launch_pending
+                    || status.recovery_pending
+            });
+        if self.link.is_some()
+            || self.pairing_open()
+            || self.connecting.load(Ordering::Acquire)
+            || !self.no_transfer()
+            || self.game_running
+            || self.child.is_some()
+            || self.launch_pending.is_some()
+            || self.managed_token.is_some()
+            || self.pending_recovery.is_some()
+            || self.requested_recovery.is_some()
+            || self.install_busy
+            || self.layout_recovery
+            || self.texture_busy
+            || self.compacting_backup
+            || self.source.busy
+            || self.self_updates.preparing
+            || native_active
+        {
+            return Duration::from_millis(50);
+        }
+        let mut wait = Duration::from_secs(1).saturating_sub(self.last_process.elapsed());
+        if !self.network_job {
+            wait = wait.min(Duration::from_secs(5).saturating_sub(self.last_network.elapsed()));
+        }
+        if self.network.is_some() {
+            wait = wait.min(Duration::from_secs(12).saturating_sub(self.last_verified.elapsed()));
+        }
+        wait
     }
 
     fn store(&mut self, update: impl FnOnce(&mut Settings)) -> Result<()> {
@@ -5104,16 +5148,31 @@ impl Engine {
     fn refresh_save(&mut self) -> Result<()> {
         self.refresh_default_save()?;
         if self.game_running {
+            self.periodic_save_hash = save_location::HashCache::default();
             self.stable = 0;
             self.stable_since = Instant::now();
             return Ok(());
         }
         if self.settings.save_file.is_none() {
+            self.periodic_save_hash = save_location::HashCache::default();
             self.local_hash = None;
             self.save_valid = false;
             return Ok(());
         }
-        match self.current_hash() {
+        let hash = (|| {
+            let profile = self
+                .save_profile
+                .as_deref()
+                .context("Missing save profile")?;
+            let path = self
+                .settings
+                .save_file
+                .as_deref()
+                .context("Missing save location")?;
+            self.periodic_save_hash
+                .refresh(profile, path, Instant::now())
+        })();
+        match hash {
             Ok(hash) => {
                 let was_valid = self.save_valid;
                 self.save_valid = true;
@@ -8098,6 +8157,32 @@ mod tests {
         h.left.stable_since = Instant::now() - Duration::from_secs(2);
         h.left.refresh_save()?;
         assert_eq!(h.left.stable, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_wait_preserves_poll_and_network_deadlines_and_active_cadence() -> Result<()> {
+        let mut h = Harness::new(None, None)?;
+        assert_eq!(h.left.wait_timeout(), Duration::from_millis(50));
+        h.left.disconnect("Testing offline idle cadence");
+        h.left.pairing_until = None;
+        h.left.last_process = Instant::now();
+        h.left.last_network = Instant::now();
+        h.left.last_verified = Instant::now();
+        assert!(h.left.wait_timeout() > Duration::from_millis(900));
+        assert!(h.left.wait_timeout() <= Duration::from_secs(1));
+        h.left.source.busy = true;
+        assert_eq!(h.left.wait_timeout(), Duration::from_millis(50));
+        h.left.source.busy = false;
+        h.left.last_network = Instant::now() - Duration::from_secs(5);
+        assert_eq!(h.left.wait_timeout(), Duration::ZERO);
+        h.left.network_job = true;
+        assert!(
+            h.left.wait_timeout() > Duration::ZERO,
+            "An in-flight probe must not cause a busy loop"
+        );
+        h.left.last_verified = Instant::now() - Duration::from_secs(12);
+        assert_eq!(h.left.wait_timeout(), Duration::ZERO);
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use crate::{
     files::{sha256, valid_hash},
     protocol::{DISCOVERY_PORT, PORT},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -158,60 +158,11 @@ pub fn decode_advertisement(
 }
 
 #[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
 pub fn probe() -> Result<Network> {
-    use std::{os::windows::process::CommandExt, path::PathBuf, process::Command};
-    #[derive(Deserialize)]
-    struct Probe {
-        address: Ipv4Addr,
-        prefix: u8,
-        gateway: Ipv4Addr,
-        mac: String,
-        adapter: String,
-    }
-    let script = r#"
-$ErrorActionPreference='Stop'
-$routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 |
-    Where-Object { $_.NextHop -ne '0.0.0.0' } |
-    Sort-Object @{Expression={ $_.RouteMetric + (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric }})
-$chosen = $null
-foreach ($route in $routes) {
-    $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop
-    if ($adapter.Status -eq 'Up' -and $adapter.HardwareInterface -and -not $adapter.Virtual) { $chosen = $route; break }
-}
-if ($null -eq $chosen) { throw 'No physical LAN with a default router is available. VPN-only connections are refused.' }
-$profile = Get-NetConnectionProfile -InterfaceIndex $chosen.InterfaceIndex
-if ($profile.NetworkCategory -ne 'Private') { throw 'Set your trusted Windows network profile to Private before enabling sync.' }
-$ip = @(Get-NetIPAddress -InterfaceIndex $chosen.InterfaceIndex -AddressFamily IPv4 |
-    Where-Object { $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource })[0]
-if ($null -eq $ip) { throw 'The selected LAN has no usable IPv4 address.' }
-$ping = [System.Net.NetworkInformation.Ping]::new()
-try { $null = $ping.Send($chosen.NextHop, 300) } finally { $ping.Dispose() }
-$neighbor = @(Get-NetNeighbor -InterfaceIndex $chosen.InterfaceIndex -IPAddress $chosen.NextHop |
-    Where-Object { $_.State -ne 'Unreachable' -and $_.State -ne 'Incomplete' })[0]
-if ($null -eq $neighbor) { throw 'Cannot resolve router MAC. Network trust is refused.' }
-@{ address=$ip.IPAddress; prefix=$ip.PrefixLength; gateway=$chosen.NextHop; mac=$neighbor.LinkLayerAddress; adapter=$chosen.InterfaceAlias } | ConvertTo-Json -Compress
-"#;
-    let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
-    let output = Command::new(
-        PathBuf::from(windows).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-    )
-    .args(["-NoProfile", "-NonInteractive", "-Command", script])
-    .creation_flags(0x08000000)
-    .output()?;
-    ensure!(
-        output.status.success(),
-        "LAN check failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let data: Probe =
-        serde_json::from_slice(&output.stdout).context("Reading Windows network information")?;
-    Network::from_parts(
-        data.address,
-        data.prefix,
-        data.gateway,
-        &data.mac,
-        data.adapter,
-    )
+    windows::probe()
 }
 
 #[cfg(not(windows))]

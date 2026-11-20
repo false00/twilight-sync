@@ -191,6 +191,7 @@ struct Approval {
 }
 
 struct Controller {
+    ui_timer: std::rc::Weak<slint::Timer>,
     ui: slint::Weak<MainWindow>,
     backend: Backend,
     snapshot: Snapshot,
@@ -2300,6 +2301,7 @@ impl Controller {
                         ui.as_weak(),
                         self.backend.clone(),
                         self.tray.clone(),
+                        self.ui_timer.clone(),
                     )?);
                     if self.start_hidden {
                         ui.hide()?;
@@ -2483,7 +2485,9 @@ fn run_window(
     }
     ui.window()
         .set_size(slint::LogicalSize::new(1200.0 / scale, 820.0 / scale));
+    let timer = Rc::new(slint::Timer::default());
     let mut controller = Controller {
+        ui_timer: Rc::downgrade(&timer),
         ui: ui.as_weak(),
         backend,
         snapshot,
@@ -2559,7 +2563,6 @@ fn run_window(
         }
         slint::CloseRequestResponse::HideWindow
     });
-    let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(250),
