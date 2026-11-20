@@ -99,6 +99,8 @@ fn remap_json(
                         | "keys"
                         | "firmware"
                         | "install"
+                        | "triforce_install"
+                        | "longshot_install"
                         | "customPath"
                         | "previousPath"
                         | "backend.isoPath"
@@ -395,6 +397,7 @@ impl Migration {
         let name = self.backup.file_name()?.to_str()?;
         (self.had_destination
             && self.from.starts_with(&self.destination)
+            && self.destination.join(&self.executable).is_file()
             && built.game == self.game
             && built.directory == self.from
             && built.executable == self.from.join(&self.executable)
@@ -408,6 +411,8 @@ impl Migration {
             destination: self.destination.clone(),
             executable: self.executable.clone(),
             game: self.game,
+            replacement: None,
+            extra_metadata: Vec::new(),
         })
     }
 
@@ -703,7 +708,11 @@ mod tests {
             old.directory.join("Triforce.exe"),
             b"locally modified executable",
         )?;
-        assert!(old.compact(&manager)?.contains("program was modified"));
+        let error = old
+            .compact(&manager)
+            .err()
+            .context("A modified program must block cleanup")?;
+        assert!(error.to_string().contains("modified or missing"));
         assert!(old.directory.join("triforce_programs.bin").is_file());
         Ok(())
     }

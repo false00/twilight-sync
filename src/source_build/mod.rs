@@ -385,7 +385,7 @@ pub fn project_source_url(game: GameId, project: OotProject) -> String {
     }
 }
 
-pub(super) fn valid_tag(tag: &str) -> bool {
+pub(crate) fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 64
         && tag.as_bytes()[0].is_ascii_alphanumeric()
@@ -733,11 +733,21 @@ struct Receipt<'a> {
     tag: &'a str,
     commit: &'a str,
     sha256: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    runtime_libraries: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a Path>,
     tools: &'a [tools::Provenance],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     source_dependencies: &'a [recipes::SourceDependency],
+}
+
+pub(crate) fn oot_runtime_libraries(project: OotProject) -> [&'static str; 3] {
+    let renderer = match project {
+        OotProject::Triforce => "triforce_vk.dll",
+        OotProject::Longshot => "longshot_vk.dll",
+    };
+    [renderer, "SDL2.dll", "SDL3.dll"]
 }
 
 pub fn new_log(root: &Path, game: GameId) -> Result<PathBuf> {
@@ -869,8 +879,14 @@ fn preserve_current_data(
             } else {
                 Vec::new()
             };
-            // The final assignment wins; this build has no WebGPU fallback.
-            environment.extend_from_slice(b"\nRX_BACKEND=vulkan\n");
+            // The final assignment wins; do not change a file already set to Vulkan.
+            if environment
+                .rsplit(|byte| *byte == b'\n')
+                .find(|line| line.starts_with(b"RX_BACKEND="))
+                .is_none_or(|line| line.strip_suffix(b"\r").unwrap_or(line) != b"RX_BACKEND=vulkan")
+            {
+                environment.extend_from_slice(b"\nRX_BACKEND=vulkan\n");
+            }
             files::atomic_write(&path, &environment)?;
         }
     }
@@ -1078,7 +1094,12 @@ pub fn build(
     } else {
         install::default_directory(game)?
     };
+    ensure_safe_path(&destination)?;
     fs::create_dir_all(&destination)?;
+    crate::game_layout::SourceBackup::require_no_extra_source_versions(
+        &destination,
+        request.previous_install.as_deref(),
+    )?;
     let minimum = if game == GameId::Dusklight {
         8 * 1024_u64.pow(3)
     } else {
@@ -1160,16 +1181,17 @@ pub fn build(
         ensure_safe_path(&executable)?;
         crate::self_update::validate_pe(&executable)
             .context("The source build did not produce the expected Windows x64 game")?;
+        let mut runtime_libraries = Vec::new();
         if game == GameId::Triforce {
-            let renderer = match request.plan.oot_project {
-                OotProject::Triforce => "triforce_vk.dll",
-                OotProject::Longshot => "longshot_vk.dll",
-            };
-            for name in [renderer, "SDL2.dll", "SDL3.dll"] {
+            for name in oot_runtime_libraries(request.plan.oot_project) {
                 let path = output.join(name);
                 ensure_safe_path(&path)?;
                 crate::self_update::validate_pe(&path)
                     .with_context(|| format!("Required Triforce runtime component was not built or staged correctly: {name}"))?;
+                runtime_libraries.push((
+                    name.to_owned(),
+                    install::digest_file(&path, path.metadata()?.len())?,
+                ));
             }
             ensure!(
                 output.join("image.bin").is_file() && output.join("romfs").is_dir(),
@@ -1194,6 +1216,7 @@ pub fn build(
                 tag: &request.plan.tag,
                 commit: &request.plan.commit,
                 sha256: &sha256,
+                runtime_libraries,
                 source: rebuild_source,
                 tools: &tools.provenance,
                 source_dependencies: &source_dependencies,
@@ -1241,6 +1264,8 @@ pub struct Revision {
     pub tag: String,
     pub commit: String,
     pub(crate) sha256: String,
+    pub(crate) oot_project: OotProject,
+    pub(crate) runtime_libraries: Vec<(String, String)>,
 }
 
 pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
@@ -1248,9 +1273,13 @@ pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
     struct Label {
         version: u8,
         game: GameId,
+        #[serde(default)]
+        oot_project: OotProject,
         tag: String,
         commit: String,
         sha256: String,
+        #[serde(default)]
+        runtime_libraries: Vec<(String, String)>,
     }
     let label: Label = serde_json::from_slice(&read_bounded(path, 1024 * 1024)?)?;
     ensure!(
@@ -1258,13 +1287,21 @@ pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
             && label.game == game
             && valid_tag(&label.tag)
             && valid_commit(&label.commit)
-            && valid_hash(&label.sha256),
+            && valid_hash(&label.sha256)
+            && label.runtime_libraries.len() <= 3
+            && label.runtime_libraries.iter().all(|(name, hash)| {
+                game == GameId::Triforce
+                    && oot_runtime_libraries(label.oot_project).contains(&name.as_str())
+                    && valid_hash(hash)
+            }),
         "Invalid source-build installation receipt"
     );
     Ok(Revision {
         tag: label.tag,
         commit: label.commit,
         sha256: label.sha256,
+        oot_project: label.oot_project,
+        runtime_libraries: label.runtime_libraries,
     })
 }
 

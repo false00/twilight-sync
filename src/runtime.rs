@@ -158,6 +158,7 @@ pub enum Command {
         approved: bool,
     },
     ActivateSourceBuild(protocol::GameId),
+    CleanupSourceInstalls(protocol::GameId, source_build::OotProject),
     CancelSource,
     Native {
         game: protocol::GameId,
@@ -580,14 +581,18 @@ fn texture_profile_stopped(
 }
 
 pub fn start() -> Result<Backend> {
-    start_with_desktop(true)
+    start_manager(true, false)
 }
 
 pub fn start_maintenance() -> Result<Backend> {
-    start_with_desktop(false)
+    start_manager(false, false)
 }
 
-fn start_with_desktop(desktop: bool) -> Result<Backend> {
+pub fn start_storage_cleanup() -> Result<Backend> {
+    start_manager(false, true)
+}
+
+fn start_manager(desktop: bool, storage_cleanup: bool) -> Result<Backend> {
     let root = config::root_directory()?;
     let instance = config::acquire_instance(&root)?;
     let settings = Settings::load(&root)?;
@@ -633,13 +638,13 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
             if let Err(error) = engine.refresh_default_save() {
                 engine.report(error);
             }
-            if let Err(error) = engine.refresh_history() {
+            if !storage_cleanup && let Err(error) = engine.refresh_history() {
                 engine.report(error);
             }
-            if let Err(error) = engine.reload_textures() {
+            if !storage_cleanup && let Err(error) = engine.reload_textures() {
                 engine.report(error);
             }
-            if let Err(error) = engine.initialize_self_updates() {
+            if !storage_cleanup && let Err(error) = engine.initialize_self_updates() {
                 engine.report(error);
             }
             match game_file::Permissions::load(&engine.root) {
@@ -652,9 +657,11 @@ fn start_with_desktop(desktop: bool) -> Result<Backend> {
             if let Err(error) = engine.triforce.refresh() {
                 engine.report(error);
             }
-            engine.message = "Local stores checked. Checking your private LAN...".into();
-            engine.publish();
-            engine.run(receiver);
+            if !storage_cleanup {
+                engine.message = "Local stores checked. Checking your private LAN...".into();
+                engine.publish();
+            }
+            engine.run_loop(receiver, storage_cleanup);
         })?;
     Ok(Backend { sender, view })
 }
@@ -1059,9 +1066,14 @@ impl Engine {
         }
     }
 
-    fn run(&mut self, receiver: Receiver<Input>) {
+    fn run_loop(&mut self, receiver: Receiver<Input>, storage_cleanup: bool) {
         while !self.shutdown {
-            match receiver.recv_timeout(self.wait_timeout()) {
+            let timeout = if storage_cleanup {
+                Duration::from_secs(1)
+            } else {
+                self.wait_timeout()
+            };
+            match receiver.recv_timeout(timeout) {
                 Ok(input) => {
                     let wire = matches!(&input, Input::Frame { .. });
                     if let Err(error) = self.input(input) {
@@ -1074,7 +1086,8 @@ impl Engine {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
-            if !self.fatal
+            if !storage_cleanup
+                && !self.fatal
                 && !self.shutdown
                 && let Err(error) = self.tick()
             {
@@ -1271,6 +1284,7 @@ impl Engine {
             Input::Installed(result) => {
                 self.install_busy = false;
                 let installed = result?;
+                let previous = self.settings.game_exe.clone();
                 self.audit.record(
                     "dusklight-installed",
                     Some(&installed.executable),
@@ -1292,8 +1306,15 @@ impl Engine {
                     if installed.reused {
                         "is already installed; managed files re-verified"
                     } else {
-                        "installed side-by-side"
+                        "installed and selected"
                     },
+                );
+                let replacement = self.settings.game_exe.clone();
+                self.cleanup_replaced_install(
+                    protocol::GameId::Dusklight,
+                    previous.as_deref(),
+                    replacement.as_deref(),
+                    false,
                 );
                 Ok(())
             }
@@ -1348,6 +1369,7 @@ impl Engine {
             Input::TotkUpdated(result) => {
                 self.install_busy = false;
                 self.totk.status.updating = false;
+                let previous = self.totk.status.executable.clone();
                 let refresh = self.totk.refresh();
                 let updated = result?;
                 refresh?;
@@ -1384,6 +1406,14 @@ impl Engine {
                     updated.log.display()
                 );
                 self.totk.status.message = self.message.clone();
+                if updated.fresh {
+                    self.cleanup_replaced_install(
+                        protocol::GameId::Totk,
+                        previous.as_deref(),
+                        Some(&updated.executable),
+                        false,
+                    );
+                }
                 Ok(())
             }
             Input::SourceChecked { game, result } => {
@@ -1512,6 +1542,9 @@ impl Engine {
                                     &built.commit[..12]
                                 );
                                 self.message = self.source.message.clone();
+                                if self.compacting_backup {
+                                    self.note_backup_cleanup();
+                                }
                                 Ok(())
                             }
                             Err(error) => {
@@ -1548,19 +1581,24 @@ impl Engine {
                 );
                 self.compacting_backup = false;
                 self.install_busy = false;
-                let (event, detail) = match result {
-                    Ok(detail) => ("source-backup-cleanup", detail),
+                let (event, detail, failed) = match result {
+                    Ok(detail) => ("source-backup-cleanup", detail, false),
                     Err(error) => (
                         "source-backup-cleanup-stopped",
                         format!(
                             "The new game stays installed. Old-file cleanup stopped: {error:#}"
                         ),
+                        true,
                     ),
                 };
                 self.message = detail.clone();
                 self.source.message = detail.clone();
+                if failed {
+                    self.source.error = Some(detail.clone());
+                }
                 self.audit
                     .record(event, Some(&directory), None, None, &detail)?;
+                ensure!(!failed, "{detail}");
                 Ok(())
             }
             Input::SelfUpdateChecked(result) => {
@@ -2250,7 +2288,95 @@ impl Engine {
         if self.ready() {
             self.send_state()?;
         }
+        self.cleanup_replaced_install(
+            built.game,
+            executable.as_deref(),
+            Some(&built.executable),
+            true,
+        );
         Ok(())
+    }
+
+    fn cleanup_replaced_install(
+        &mut self,
+        game: protocol::GameId,
+        previous: Option<&Path>,
+        replacement: Option<&Path>,
+        source: bool,
+    ) {
+        let Some(replacement) = replacement else {
+            return;
+        };
+        let managed = match game {
+            protocol::GameId::Triforce => source_build::OotProject::from_executable(replacement)
+                .and_then(|project| project.directory()),
+            _ => install::default_directory(game),
+        };
+        let Ok(managed) = managed else {
+            return;
+        };
+        let mut metadata = Vec::new();
+        if game == protocol::GameId::Dusklight {
+            if let Some(directory) = replacement.parent() {
+                metadata.push(directory.join("data_location.json"));
+            }
+            metadata.push(self.default_profile.join("data_location.json"));
+            if let Some(directory) = self.default_profile.parent() {
+                metadata.push(directory.join("Dusk").join("data_location.json"));
+            }
+            if let Some(profile) = &self.save_profile {
+                metadata.push(profile.join("config.json"));
+            }
+        }
+        let backup = previous.and_then(|previous| {
+            game_layout::SourceBackup::previous(
+                &self.root,
+                &managed,
+                game,
+                previous,
+                replacement,
+                metadata.clone(),
+            )
+        });
+        if source || backup.is_some() {
+            let directory = backup
+                .as_ref()
+                .map(|backup| backup.directory.clone())
+                .unwrap_or_else(|| managed.clone());
+            let replacement = replacement.to_path_buf();
+            self.start_backup_cleanup(directory, move |root| {
+                let mut results = Vec::new();
+                if let Some(backup) = &backup {
+                    if !source {
+                        return backup.compact(root);
+                    }
+                    results.push(
+                        backup
+                            .compact(root)
+                            .with_context(|| format!("Retiring {}", backup.directory.display()))?,
+                    );
+                }
+                if source {
+                    results.extend(game_layout::SourceBackup::compact_source_siblings(
+                        root,
+                        &managed,
+                        game,
+                        &replacement,
+                        backup.as_ref().map(|backup| backup.directory.as_path()),
+                        &metadata,
+                    )?);
+                    game_layout::SourceBackup::require_no_extra_source_versions(
+                        &managed,
+                        replacement.parent(),
+                    )?;
+                }
+                if results.is_empty() {
+                    Ok("No superseded managed installations needed cleanup.".into())
+                } else {
+                    Ok(results.join(" "))
+                }
+            });
+        }
     }
 
     fn native_command(&mut self, game: protocol::GameId, command: NativeCommand) -> Result<()> {
@@ -2652,6 +2778,33 @@ impl Engine {
                 self.source.message =
                     "The completed source build is now selected; progress was verified unchanged."
                         .into();
+                if self.compacting_backup {
+                    self.message = self.source.message.clone();
+                    self.note_backup_cleanup();
+                }
+            }
+            Command::CleanupSourceInstalls(game, project) => {
+                ensure!(
+                    !self.install_busy,
+                    "An installation operation is already running"
+                );
+                self.require_source_idle()?;
+                let (_, active) = self.source_paths(game);
+                let active = active.context("Select the source-built game before cleanup")?;
+                if game == protocol::GameId::Triforce {
+                    ensure!(
+                        source_build::OotProject::from_executable(&active)? == project,
+                        "Select {} before requesting storage cleanup",
+                        project.name()
+                    );
+                }
+                self.message =
+                    "Preparing cleanup for the currently selected source installation.".into();
+                self.cleanup_replaced_install(game, None, Some(&active), true);
+                ensure!(
+                    self.compacting_backup,
+                    "Could not locate the managed Games directory"
+                );
             }
             Command::CancelSource => {
                 ensure!(
@@ -5593,27 +5746,36 @@ impl Engine {
         );
         self.send_state()?;
         if let Some(backup) = old_source {
-            self.compacting_backup = true;
-            self.install_busy = true;
-            self.message
-                .push_str(" Checking the previous install for files that can be removed...");
-            self.source.message = self.message.clone();
-            let root = self.root.clone();
-            let sender = self.sender.clone();
-            thread::spawn(move || {
-                let result = backup.compact(&root);
-                if sender
-                    .send(Input::SourceBackupCleaned {
-                        directory: backup.directory,
-                        result,
-                    })
-                    .is_err()
-                {
-                    eprintln!("Twilight Sync stopped before it could report old-file cleanup");
-                }
-            });
+            self.start_backup_cleanup(backup.directory.clone(), move |root| backup.compact(root));
         }
         Ok(())
+    }
+
+    fn note_backup_cleanup(&mut self) {
+        self.message
+            .push_str(" Checking the previous install for files that can be removed...");
+        self.source.message = self.message.clone();
+    }
+
+    fn start_backup_cleanup(
+        &mut self,
+        directory: PathBuf,
+        compact: impl FnOnce(&Path) -> Result<String> + Send + 'static,
+    ) {
+        self.compacting_backup = true;
+        self.install_busy = true;
+        self.note_backup_cleanup();
+        let root = self.root.clone();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = compact(&root);
+            if sender
+                .send(Input::SourceBackupCleaned { directory, result })
+                .is_err()
+            {
+                eprintln!("Twilight Sync stopped before it could report old-file cleanup");
+            }
+        });
     }
 
     fn try_game_layout(&mut self) -> Result<()> {

@@ -224,10 +224,10 @@ impl VersionCache {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InstalledFile {
-    path: PathBuf,
-    size: u64,
-    sha256: String,
+pub(crate) struct InstalledFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -448,6 +448,25 @@ fn installation_files(root: &Path) -> Result<Vec<InstalledFile>> {
 }
 
 fn verify_receipt(root: &Path, release: &ReleaseInfo) -> Result<PathBuf> {
+    let receipt = read_receipt(root)?;
+    ensure!(
+        receipt.tag == release.tag && receipt.archive_sha256 == release.sha256,
+        "Installation receipt differs from the official release"
+    );
+    let mut actual = installation_files(root)?;
+    actual.retain(|file| file.path != Path::new("twilight-install.json"));
+    ensure!(
+        actual.len() == receipt.files.len()
+            && actual
+                .iter()
+                .zip(&receipt.files)
+                .all(|(a, b)| a.path == b.path && a.sha256 == b.sha256 && a.size == b.size),
+        "Program directory contains untracked or changed files; it was not overwritten"
+    );
+    Ok(root.join(receipt.executable))
+}
+
+fn read_receipt(root: &Path) -> Result<Receipt> {
     let path = root.join("twilight-install.json");
     ensure_safe_path(&path)?;
     ensure!(
@@ -457,9 +476,9 @@ fn verify_receipt(root: &Path, release: &ReleaseInfo) -> Result<PathBuf> {
     let receipt: Receipt = serde_json::from_slice(&fs::read(path)?)?;
     ensure!(
         receipt.version == 1
-            && receipt.tag == release.tag
-            && receipt.archive_sha256 == release.sha256,
-        "Installation receipt differs from the official release"
+            && crate::source_build::valid_tag(&receipt.tag)
+            && valid_hash(&receipt.archive_sha256),
+        "Invalid official installation receipt"
     );
     ensure!(
         !receipt.files.is_empty() && receipt.files.len() <= 512,
@@ -479,16 +498,6 @@ fn verify_receipt(root: &Path, release: &ReleaseInfo) -> Result<PathBuf> {
         );
         executable_found |= file.path == receipt.executable;
     }
-    let mut actual = installation_files(root)?;
-    actual.retain(|file| file.path != Path::new("twilight-install.json"));
-    ensure!(
-        actual.len() == receipt.files.len()
-            && actual
-                .iter()
-                .zip(&receipt.files)
-                .all(|(a, b)| a.path == b.path && a.sha256 == b.sha256 && a.size == b.size),
-        "Program directory contains untracked or changed files; it was not overwritten"
-    );
     ensure!(
         executable_found
             && receipt
@@ -497,7 +506,22 @@ fn verify_receipt(root: &Path, release: &ReleaseInfo) -> Result<PathBuf> {
                 .is_some_and(|n| n.eq_ignore_ascii_case("dusklight.exe")),
         "Receipt has no valid Dusklight executable"
     );
-    Ok(root.join(receipt.executable))
+    Ok(receipt)
+}
+
+pub(crate) fn previous_release_files(
+    root: &Path,
+    executable: &Path,
+) -> Result<(Vec<InstalledFile>, bool)> {
+    let receipt = read_receipt(root)?;
+    ensure!(
+        root.join(&receipt.executable) == executable,
+        "The chosen program does not match the previous release receipt"
+    );
+    let versioned = root.file_name().is_some_and(|name| {
+        name == format!("{}-{}", receipt.tag, &receipt.archive_sha256[..12]).as_str()
+    });
+    Ok((receipt.files, versioned))
 }
 
 pub fn selected_release(

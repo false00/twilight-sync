@@ -747,13 +747,25 @@ The flow:
    remapped. A durable journal resumes an interrupted promotion before play or
    transfers are allowed. Conflicting metadata is never overwritten.
    Verified nonempty source-build activation retains its existing common sync base.
-   After an in-session source promotion finishes, Twilight Sync can compact the
-   previous recorded source installation. It removes the verified old executable,
-   named regenerable Triforce caches and copies of extracted game data that still
-   match the active installation byte for byte. Play and settings changes wait
-   while files are checked. Referenced containers, unmatched data, saves, mods and
-   unrecognized files are left intact. A compacted folder is not a full playable
-   rollback; earlier backup folders are not scanned or altered automatically.
+   After successful source activation, Twilight Sync retires the previous verified
+   managed install and checks older versioned siblings of the same project.
+   Triforce and Longshot remain independent: updating one never retires the other.
+   For a verified version folder, cleanup checks the entire old install first.
+   It removes the folder only when every file is an owned program file, a known
+   regenerable cache, or already present in the replacement byte for byte.
+   A different save, setting, mod, unexpected file, or reference into the old
+   install blocks retirement and reports the path to resolve. The new build
+   stays selected. A new source build will not start while an extra managed
+   version folder remains, even if an earlier cleanup removed its executable
+   or receipt. Play and settings changes wait while files are checked.
+   Earlier rollback folders and unrelated manually managed folders are not
+   automatically deleted.
+   To check older siblings without rebuilding, close all games and quit Twilight
+   Sync, then use `twilight-sync --cleanup-source-installs longshot` (or
+   `triforce`, `totk`, `dusklight`) with that source installation already selected.
+   This command does not download, build, launch, or switch projects.
+   Official Dusklight updates apply the same check to versioned releases using
+   their install manifests; normal official TotK updates replace files in place.
 8. **Game setup** shows recorded installed official/source versions. Source checks
    distinguish a newer release, downgrade, same revision, changed revision under
    the same tag, or unknown ordering. **Compare with installed source** opens the

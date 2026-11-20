@@ -89,7 +89,7 @@ fn build_source(
             println!("{}", snapshot.source.message);
             last_message = snapshot.source.message.clone();
         }
-        if !snapshot.source.busy {
+        if !snapshot.source.busy && !snapshot.install_busy {
             if let Some(error) = &snapshot.source.error {
                 bail!("{error}");
             }
@@ -169,6 +169,9 @@ fn run() -> Result<()> {
         println!(
             "\nNative games and source builds:\n  twilight-sync --open-totk       Open protected TotK Play controls\n  twilight-sync --open-triforce   Open protected Ocarina of Time controls\n  twilight-sync --check-totk-updates\n                                 Check official TotK Recomp release metadata\n  twilight-sync --check-source-updates dusklight|totk|triforce\n                                 Check a stable source tag and full commit; executes no upstream code\n  twilight-sync --check-triforce-save\n  twilight-sync --check-totk-save\n  twilight-sync --export-totk-save ABSOLUTE_PATH\n  twilight-sync --import-totk-save ABSOLUTE_PATH --expected HASH|missing\n\nChoose a game on Home, Games, or Save history. Updated PCs share the encrypted protocol, safe automatic sync, branch choices, compact history and game-scoped play protection. Source builds require separate approval and are not confirmed to be safer."
         );
+        println!(
+            "\n  twilight-sync --cleanup-source-installs dusklight|totk|triforce|longshot\n                                 Retire older managed builds without rebuilding"
+        );
         return Ok(());
     }
     #[cfg(windows)]
@@ -217,7 +220,10 @@ fn run() -> Result<()> {
         println!("{PROJECT_LICENSE}\n\n{DEPENDENCY_NOTICES}");
         return Ok(());
     }
-    if first.as_deref().is_some_and(|a| a == "--build-source") {
+    if first
+        .as_deref()
+        .is_some_and(|a| a == "--build-source" || a == "--cleanup-source-installs")
+    {
         let selection = arguments
             .next()
             .context("Choose dusklight, totk, triforce or longshot")?;
@@ -232,6 +238,39 @@ fn run() -> Result<()> {
         } else {
             twilight_sync::source_build::OotProject::Triforce
         };
+        if first
+            .as_deref()
+            .is_some_and(|a| a == "--cleanup-source-installs")
+        {
+            if arguments.next().is_some() {
+                bail!("Unexpected cleanup arguments");
+            }
+            use twilight_sync::runtime::Command;
+            let backend = twilight_sync::runtime::start_storage_cleanup()?;
+            let initial = backend.snapshot()?;
+            backend.command(Command::CleanupSourceInstalls(game, project))?;
+            let started = std::time::Instant::now();
+            let mut observed = false;
+            loop {
+                let snapshot = backend.snapshot()?;
+                observed |= snapshot.install_busy;
+                if snapshot.error != initial.error
+                    && let Some(error) = snapshot.error
+                {
+                    bail!("{error}");
+                }
+                if !snapshot.install_busy && (observed || snapshot.message != initial.message) {
+                    println!("{}", snapshot.message);
+                    backend.command(Command::Shutdown)?;
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    observed || started.elapsed() < std::time::Duration::from_secs(30),
+                    "Storage cleanup could not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
         if arguments
             .next()
             .as_deref()
