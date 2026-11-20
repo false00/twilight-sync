@@ -68,6 +68,9 @@ irm https://raw.githubusercontent.com/false00/twilight-sync/main/install.ps1 | i
 The installer downloads the latest stable app, checks its published SHA-256,
 adds one Twilight Sync desktop icon and a Start-menu entry, and opens Twilight Sync. Existing saves, pairing,
 texture libraries, and startup preferences stay in place.
+Rerunning it also opens an already up-to-date app. Unchanged desktop shortcuts
+owned by Twilight Sync are repaired after an app move; customized shortcuts
+are preserved rather than overwritten.
 
 You do **not** need Rust, Visual Studio, Python, or .NET to run the downloaded
 app. Building games from source has additional requirements, explained in the app.

@@ -94,6 +94,13 @@ function Receive-TwilightFile {
     }
 }
 
+$script:Launches = 0
+function Start-Process {
+    param([string]$FilePath, [string]$WorkingDirectory, [switch]$PassThru)
+    $script:Launches++
+    $script:LaunchedPath = $FilePath
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('twilight-installer-tests-' + [guid]::NewGuid().ToString('N'))
 $null = [IO.Directory]::CreateDirectory($root)
 try {
@@ -139,6 +146,8 @@ try {
     $fetches = $script:Fetches
     $same = Install-TwilightSync -InstallDirectory $directory -NoLaunch -NoShortcut
     Assert-Installer (-not $same.Changed -and $script:Fetches -eq $fetches) 'repeat installation is idempotent without redownloading'
+    $reopened = Install-TwilightSync -InstallDirectory $directory -NoShortcut
+    Assert-Installer (-not $reopened.Changed -and $reopened.Launched -and $script:Launches -eq 1 -and $script:LaunchedPath -eq $first.Executable) 'rerunning an unchanged installation still opens the verified app unless no-launch is requested'
 
     $before = [IO.File]::ReadAllBytes($first.Executable)
     $receiptPath = Join-Path $directory '.twilight-sync-install.json'
@@ -156,22 +165,55 @@ try {
 
     $programs = Join-Path $root 'test Start menu'
     $desktop = Join-Path $root 'test desktop'
+    $manager = Join-Path $root 'test manager'
     $null = [IO.Directory]::CreateDirectory($programs)
     $null = [IO.Directory]::CreateDirectory($desktop)
-    $link = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    $null = [IO.Directory]::CreateDirectory($manager)
+    $link = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager
     Assert-Installer ($link -ceq (Join-Path $desktop 'Twilight Sync.lnk')) 'installer creates the single master desktop shortcut'
     Assert-Installer ((Test-Path -LiteralPath (Join-Path $programs 'Twilight Sync.lnk')) -and @(Get-ChildItem -LiteralPath $desktop).Count -eq 1) 'Start-menu entry does not add per-game desktop icons'
     $linkHash = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
-    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager
     Assert-Installer ((Get-FixtureHash ([IO.File]::ReadAllBytes($link))) -ceq $linkHash) 'repeat installer preserves a matching app link and its private receipt hash'
     Remove-Item -LiteralPath $link
-    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop
+    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager
     Assert-Installer (Test-Path -LiteralPath $link) 'app update recreates a deleted master desktop shortcut'
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $null
     try {
         $shortcut = $shell.CreateShortcut($link)
         Assert-Installer ($shortcut.TargetPath -ceq $updated.Executable -and $shortcut.Arguments -ceq '' -and $shortcut.IconLocation -ceq "$($updated.Executable),0") 'master opens only Twilight Sync and uses its app icon'
+        $previousExecutable = Join-Path $root 'old-build\idle_profile.exe'
+        $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($previousExecutable))
+        [IO.File]::WriteAllBytes($previousExecutable, $script:FixtureBytes)
+        $shortcut.TargetPath = $previousExecutable
+        $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($previousExecutable)
+        $shortcut.IconLocation = "$previousExecutable,0"
+        $shortcut.Save()
+    } finally {
+        if ($null -ne $shortcut) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+    $oldLinkHash = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
+    Assert-InstallerThrows { New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager } 'customized shortcut'
+    Assert-Installer ((Get-FixtureHash ([IO.File]::ReadAllBytes($link))) -ceq $oldLinkHash) 'a different app link without proof of ownership is preserved'
+    $ownership = @{
+        version = 2
+        shortcut = $link
+        manager = $previousExecutable
+        sha256 = $oldLinkHash
+    }
+    $receipt = Join-Path $manager 'desktop-shortcut.json'
+    [IO.File]::WriteAllText($receipt, ($ownership | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    $null = New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $null
+    try {
+        $shortcut = $shell.CreateShortcut($link)
+        Assert-Installer ($shortcut.TargetPath -ceq $updated.Executable -and $shortcut.WorkingDirectory -ceq $directory -and $shortcut.Arguments -ceq '' -and $shortcut.IconLocation -ceq "$($updated.Executable),0") 'an unchanged receipt-owned development link is repaired to the installed app'
+        $ownership.manager = $updated.Executable
+        $ownership.sha256 = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
+        [IO.File]::WriteAllText($receipt, ($ownership | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         $shortcut.Arguments = '--custom-user-option'
         $shortcut.Save()
     } finally {
@@ -179,7 +221,7 @@ try {
         $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
     }
     $customHash = Get-FixtureHash ([IO.File]::ReadAllBytes($link))
-    Assert-InstallerThrows { New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop } 'customized shortcut'
+    Assert-InstallerThrows { New-TwilightShortcut -Executable $updated.Executable -ProgramsDirectory $programs -DesktopDirectory $desktop -ManagerDirectory $manager } 'customized shortcut'
     Assert-Installer ((Get-FixtureHash ([IO.File]::ReadAllBytes($link))) -ceq $customHash) 'customized master desktop shortcuts are never overwritten'
 
     [IO.File]::WriteAllText($updated.Executable, 'user-modified executable')

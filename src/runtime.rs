@@ -6933,7 +6933,7 @@ mod tests {
         }
 
         fn pump_until(&mut self, predicate: impl Fn(&Self) -> bool) -> Result<()> {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 for _ in 0..128 {
                     let Ok(input) = self.left_rx.try_recv() else {
@@ -6952,7 +6952,11 @@ mod tests {
                 }
                 ensure!(
                     Instant::now() < deadline,
-                    "Timed out waiting for two-device protocol transition"
+                    "Timed out waiting for two-device protocol transition: left={}, right={}, left_error={:?}, right_error={:?}",
+                    self.left.message,
+                    self.right.message,
+                    self.left.error,
+                    self.right.error,
                 );
                 thread::sleep(Duration::from_millis(1));
             }

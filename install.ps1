@@ -226,7 +226,8 @@ param(
         param(
             [string]$Executable,
             [string]$ProgramsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs),
-            [string]$DesktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+            [string]$DesktopDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory),
+            [string]$ManagerDirectory = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.twilight-sync')
         )
         $null = Assert-TwilightPath $Executable
         $shell = New-Object -ComObject WScript.Shell
@@ -238,7 +239,11 @@ param(
                 $null = Assert-TwilightPath $path
                 $shortcut = $shell.CreateShortcut($path)
                 $working = [IO.Path]::GetDirectoryName($Executable)
-                if (Test-Path -LiteralPath $path) {
+                $exists = Test-Path -LiteralPath $path
+                $repair = $false
+                $previousHash = $null
+                $receiptHash = $null
+                if ($exists) {
                     $icon = $shortcut.IconLocation
                     $separator = $icon.LastIndexOf(',')
                     if ($separator -lt 0 -or
@@ -247,15 +252,39 @@ param(
                         -not [string]::Equals($shortcut.WorkingDirectory, $working, [StringComparison]::OrdinalIgnoreCase) -or
                         -not [string]::Equals($icon.Substring(0, $separator).Trim('"'), $Executable, [StringComparison]::OrdinalIgnoreCase) -or
                         $icon.Substring($separator + 1) -cne '0') {
-                        throw 'A different or customized shortcut already uses the Twilight Sync name; it was not overwritten.'
+                        $receiptPath = Join-Path $ManagerDirectory 'desktop-shortcut.json'
+                        $null = Assert-TwilightPath $receiptPath
+                        if ($folder -ine $DesktopDirectory -or -not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+                            throw 'A different or customized shortcut already uses the Twilight Sync name; it was not overwritten.'
+                        }
+                        if ((Get-Item -LiteralPath $receiptPath).Length -gt 16KB -or (Get-Item -LiteralPath $path).Length -gt 64KB) {
+                            throw 'The desktop shortcut or ownership receipt exceeds its size limit.'
+                        }
+                        $receiptHash = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash
+                        $receipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json
+                        $previousHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+                        if ($receipt.version -ne 2 -or $receipt.sha256 -cnotmatch '^[a-f0-9]{64}$' -or
+                            -not [string]::Equals($receipt.shortcut, $path, [StringComparison]::OrdinalIgnoreCase) -or
+                            -not [string]::Equals($receipt.manager, $shortcut.TargetPath, [StringComparison]::OrdinalIgnoreCase) -or
+                            $receipt.sha256 -cne $previousHash) {
+                            throw 'A different or customized shortcut already uses the Twilight Sync name; it was not overwritten.'
+                        }
+                        $repair = $true
                     }
-                } else {
+                }
+                if (-not $exists -or $repair) {
+                    if ($repair -and (
+                        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $previousHash -or
+                        (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash -cne $receiptHash)) {
+                        throw 'Desktop shortcut ownership changed during verification; it was not overwritten.'
+                    }
                     $shortcut.TargetPath = $Executable
                     $shortcut.Arguments = ''
                     $shortcut.WorkingDirectory = $working
                     $shortcut.Description = 'Open Twilight Sync to manage and safely play your games'
                     $shortcut.IconLocation = "$Executable,0"
                     $shortcut.Save()
+                    if ($repair) { Write-Host 'Repaired the unchanged Twilight Sync-owned desktop shortcut to use the installed app.' }
                 }
                 $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
                 $shortcut = $null
@@ -369,7 +398,7 @@ param(
                 catch { throw "The verified app is installed at $executable, but its shortcut could not be created. Use -NoShortcut or open that executable directly. $_" }
             }
             $launched = $false
-            if (-not $NoLaunch -and $changed) {
+            if (-not $NoLaunch) {
                 $null = Start-Process -FilePath $executable -WorkingDirectory $directory -PassThru
                 $launched = $true
             }
@@ -392,7 +421,7 @@ param(
     $result = Install-TwilightSync -Version $Options.Version -InstallDirectory $Options.InstallDirectory -NoLaunch:$Options.NoLaunch -NoShortcut:$Options.NoShortcut
     Write-Host "Twilight Sync $($result.Version) is ready."
     Write-Host "Installed for your user: $($result.Executable)"
-    if (-not $result.Changed) { Write-Host 'Already up to date. Open Twilight Sync from its desktop or Start-menu icon.' }
-    elseif (-not $result.Launched) { Write-Host 'No app was launched. Open Twilight Sync when you are ready.' }
+    if (-not $result.Changed) { Write-Host 'Already up to date.' }
+    if (-not $result.Launched) { Write-Host 'No app was launched. Open Twilight Sync when you are ready.' }
     Write-Host 'Saves, pairing keys, texture libraries, and startup preferences were not changed by this installer.'
 } @{ Version = $Version; InstallDirectory = $InstallDirectory; NoLaunch = [bool]$NoLaunch; NoShortcut = [bool]$NoShortcut }
