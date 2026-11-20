@@ -383,8 +383,9 @@ master desktop icon and keeps the Start-menu entry.
 Separate per-game shortcuts are no longer created by game installs, updates,
 source activation or executable selection. On startup/repair, old app-generated
 game links are removed only when their private receipts match their exact paths
-and unchanged contents. Unrelated or customized icons are preserved; conflicts
-are reported instead of silently overwritten. A matching installer-created
+and unchanged contents. After a Desktop move, stale receipts are cleared if
+the old link is absent from both locations. Unrelated or customized icons are
+preserved; conflicts are reported instead of silently overwritten. A matching installer-created
 master link can be adopted without rewriting it. Legacy `--open-dusklight`,
 `--open-totk` and `--open-triforce` arguments still work for existing custom links.
 

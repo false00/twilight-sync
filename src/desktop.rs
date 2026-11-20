@@ -262,10 +262,18 @@ fn retire_legacy_link(path: &Path, receipt_path: &Path) -> Result<()> {
     let bytes = read_bounded(receipt_path, 16 * 1024)?;
     let receipt: LegacyReceipt = serde_json::from_slice(&bytes)?;
     ensure!(
-        receipt.version == 1 && valid_hash(&receipt.sha256) && receipt.shortcut == path,
+        receipt.version == 1
+            && valid_hash(&receipt.sha256)
+            && receipt.shortcut.is_absolute()
+            && receipt.shortcut.file_name() == path.file_name(),
         "Invalid legacy shortcut receipt; no legacy shortcut was removed"
     );
-    if path.try_exists()? {
+    if receipt.shortcut != path {
+        ensure!(
+            !path.try_exists()? && !receipt.shortcut.try_exists()?,
+            "Legacy shortcut desktop location changed; no legacy shortcut was removed"
+        );
+    } else if path.try_exists()? {
         let shortcut = read_bounded(path, 64 * 1024)?;
         ensure!(
             sha256(&shortcut) == receipt.sha256,
@@ -448,6 +456,29 @@ mod tests {
             assert!(!f.root.join(receipt).try_exists()?);
         }
         assert_eq!(fs::read(unrelated)?, b"user shortcut");
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_move_retires_stale_receipts_without_touching_links() -> Result<()> {
+        let f = fixture()?;
+        let new_desktop = f.root.join("redirected-desktop");
+        fs::create_dir(&new_desktop)?;
+        let (name, receipt_name) = LEGACY[0];
+        let old = legacy(&f, name, receipt_name)?;
+        let receipt = f.root.join(receipt_name);
+        let current = new_desktop.join(name);
+        assert!(retire_legacy_link(&current, &receipt).is_err());
+        fs::remove_file(old)?;
+        fs::write(&current, b"unrelated shortcut at the new desktop")?;
+        assert!(retire_legacy_link(&current, &receipt).is_err());
+        assert_eq!(
+            fs::read(&current)?,
+            b"unrelated shortcut at the new desktop"
+        );
+        fs::remove_file(&current)?;
+        retire_legacy_link(&current, &receipt)?;
+        assert!(!receipt.try_exists()?);
         Ok(())
     }
 
