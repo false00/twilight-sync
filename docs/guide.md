@@ -779,6 +779,13 @@ The flow:
    upstream comparison between the two recorded full commits. Unrecorded installs
    are explicitly labelled unknown; version labels do not imply binary verification.
    Returning to a page restores its scroll position, including while a build runs.
+   Source-wizard Next buttons and step tabs keep the current scroll position,
+   clamping it only when the new step is shorter.
+   A completed-session acknowledgment waiting for the paired PC does not block
+   local source builds or verified activation. The acknowledgment and unchanged
+   save's common base survive activation and restart for later reconciliation.
+   Active games, play reservations, transfers and recovery still block installation
+   changes. Source and tool downloads still need Internet access.
 
 Only the selected game's build recipe runs. Dusklight uses its documented MSVC
 CMake preset/install target. TotK compiles hactool and the shader translator,

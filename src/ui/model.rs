@@ -270,10 +270,6 @@ pub(super) fn source_blocker(snapshot: &Snapshot) -> Option<&'static str> {
         Some(
             "A native-game play reservation is held. Recover the completed session on Play before changing its installation.",
         )
-    } else if native.iter().any(|state| state.release_pending) {
-        Some(
-            "Reconnect both managers to acknowledge the completed game session before changing installations.",
-        )
     } else if snapshot.pending_save
         || snapshot.pending_iso
         || snapshot.pending_recovery
@@ -887,6 +883,7 @@ mod tests {
                 .executable()
                 .into(),
         );
+        assert!(source_blocker(&snapshot).is_none());
         for game in [GameId::Totk, GameId::Triforce] {
             assert_eq!(game_status(&snapshot, game), "Offline play");
             assert!(!recovery_needed(&snapshot, game));
@@ -895,6 +892,7 @@ mod tests {
         }
         snapshot.ready = true;
         snapshot.triforce_supported = true;
+        assert!(source_blocker(&snapshot).is_none());
         for game in [GameId::Totk, GameId::Triforce] {
             assert_eq!(game_status(&snapshot, game), "Finishing previous session");
             assert!(recovery_needed(&snapshot, game));
@@ -911,6 +909,7 @@ mod tests {
         assert!(recovery_needed(&snapshot, GameId::Triforce));
         assert!(can_recover(&snapshot, GameId::Triforce));
         assert!(play_blocker(&snapshot, GameId::Triforce).is_some());
+        assert!(source_blocker(&snapshot).is_some());
         snapshot.triforce.busy = true;
         assert!(!can_recover(&snapshot, GameId::Triforce));
         snapshot.triforce.busy = false;

@@ -839,6 +839,7 @@ impl Channel {
     }
 
     pub fn set_executable(&mut self, executable: &Path) -> Result<()> {
+        self.require_update_idle()?;
         self.select_executable(executable, false)
     }
 
@@ -847,11 +848,16 @@ impl Channel {
             self.game == crate::native::Game::Triforce,
             "Only OOT has project selection"
         );
+        self.require_installation_idle()
+    }
+
+    pub(crate) fn require_installation_idle(&mut self) -> Result<()> {
+        // Completed-session acknowledgments stay persisted across verified installation changes.
         self.require_session_idle()?;
         self.require_app_update_idle()?;
         ensure!(
             self.status.remote_lock.is_none() && !self.status.pending,
-            "Finish the paired device's reservation or incoming save before switching OOT projects"
+            "Finish the paired device's reservation or incoming save before changing game installations"
         );
         Ok(())
     }
@@ -941,7 +947,7 @@ impl Channel {
         executable: &Path,
         expected: Option<&str>,
     ) -> Result<()> {
-        self.require_update_idle()?;
+        self.require_installation_idle()?;
         let current = self
             .install
             .as_ref()
@@ -965,11 +971,7 @@ impl Channel {
     }
 
     fn select_executable(&mut self, executable: &Path, preserve_base: bool) -> Result<()> {
-        self.require_update_idle()?;
-        ensure!(
-            self.session.lock.is_none() && self.session.release.is_none(),
-            "Finish or recover the game play session before changing installations"
-        );
+        self.require_session_idle()?;
         let install = self.game.installation(executable)?;
         self.install = Ok(install.clone());
         self.session.install = Some(install);

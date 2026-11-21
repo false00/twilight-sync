@@ -401,7 +401,6 @@ export component MainWindow inherits Window {
         root.extra-game-inputs = false;
         root.show-other-saves = false; root.comparison-open = false;
     }
-    changed setup-step => { if root.section == 1 { main-scroll.content-y = 0px; } }
     changed comparison-open => { root.branch-choice = -1; root.update-modal-state(); }
     changed about-open => { root.update-modal-state(); }
     changed confirmation-open => { root.update-modal-state(); }

@@ -2173,8 +2173,7 @@ impl Engine {
     }
 
     fn require_source_idle(&mut self) -> Result<()> {
-        self.require_oot_switch_idle()?;
-        self.triforce.require_update_idle()
+        self.require_oot_switch_idle()
     }
 
     fn require_oot_switch_idle(&mut self) -> Result<()> {
@@ -2188,12 +2187,7 @@ impl Engine {
                 && self.requested_recovery.is_none(),
             "Finish pending transfers, play sessions and recovery before building"
         );
-        self.totk.require_update_idle()?;
-        self.totk.require_app_update_idle()?;
-        ensure!(
-            self.totk.status.remote_lock.is_none() && !self.totk.status.pending,
-            "Finish the paired device's TotK reservation or pending save first"
-        );
+        self.totk.require_installation_idle()?;
         self.triforce.require_oot_switch_idle()
     }
 
@@ -7543,6 +7537,7 @@ mod tests {
             ));
             if reserved {
                 assert!(switched.is_err());
+                assert!(h.left.require_source_idle().is_err());
                 assert_eq!(h.left.triforce.executable()?, longshot.join("longshot.exe"));
                 assert_eq!(
                     crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
@@ -7567,13 +7562,130 @@ mod tests {
                     crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
                     Some(source.hash.clone())
                 );
-                assert!(h.left.require_source_idle().is_err());
+                h.left.require_source_idle()?;
             }
             assert_eq!(h.left.current_hash()?, dusklight);
             assert_eq!(
                 crate::triforce::snapshot(&longshot.join("user"))?.map(|save| save.hash),
                 Some(source.hash.clone())
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn offline_source_builds_preserve_completed_releases_through_activation_and_restart()
+    -> Result<()> {
+        for (native, project) in [
+            (
+                crate::native::Game::Totk,
+                source_build::OotProject::Triforce,
+            ),
+            (
+                crate::native::Game::Triforce,
+                source_build::OotProject::Triforce,
+            ),
+            (
+                crate::native::Game::Triforce,
+                source_build::OotProject::Longshot,
+            ),
+        ] {
+            let mut h = Harness::new(Some(variant(1)), Some(variant(1)))?;
+            h.left.disconnect("Offline source-build fixture");
+            h.right.disconnect("Offline source-build fixture");
+            let game = native.id();
+            let previous = h.left.root.join("previous-build");
+            let next = h.left.root.join("completed-build");
+            let name = if native == crate::native::Game::Triforce {
+                project.executable()
+            } else {
+                native.executable_name()
+            };
+            let bytes = b"synthetic source-build executable, never executed";
+            for directory in [&previous, &next] {
+                let profile = directory.join(native.profile_name());
+                fs::create_dir_all(&profile)?;
+                fs::write(directory.join(name), bytes)?;
+                if native == crate::native::Game::Triforce {
+                    fs::create_dir(directory.join("romfs"))?;
+                    fs::write(directory.join("image.bin"), b"synthetic game data")?;
+                    crate::triforce::tests::seed(&profile, 7)?;
+                } else {
+                    fs::write(profile.join("account.uid"), 1_u128.to_le_bytes())?;
+                    let slot = profile
+                        .join("save")
+                        .join(format!("{:032x}", 1_u128))
+                        .join("slot_00");
+                    fs::create_dir_all(&slot)?;
+                    fs::write(slot.join("progress.sav"), b"unchanged progress")?;
+                }
+            }
+            let save = native
+                .snapshot(&previous.join(native.profile_name()))?
+                .context("Missing source-build save fixture")?;
+            let dusklight = h.left.current_hash()?;
+            let transfers = h.left.root.join(format!("{game:?}-transfers"));
+            fs::create_dir_all(&transfers)?;
+            let token = "c".repeat(64);
+            let peer = h.right.identity.public.clone();
+            files::atomic_write(
+                &transfers.join("session.json"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "base": save.hash,
+                    "lock": null,
+                    "peer": peer,
+                    "release": token,
+                    "install": previous,
+                }))?,
+            )?;
+            let mut channel =
+                totk::Channel::for_game(transfers.clone(), Ok(previous.clone()), native);
+            channel.identify(&h.left.identity.public, h.left.audit.username());
+            channel.bind_peer(&peer)?;
+            channel.refresh()?;
+            *h.left.native_channel(game)? = channel;
+            h.left.source.preferences.triforce.oot_project = project;
+            h.left.begin_source_operation(game, true)?;
+            h.left.input(Input::SourceBuilt {
+                game,
+                result: Ok(source_build::Built {
+                    game,
+                    executable: next.join(name),
+                    directory: next.clone(),
+                    tag: "v1.0.0-test".into(),
+                    commit: "a".repeat(40),
+                    sha256: files::sha256(bytes),
+                    source: None,
+                    log: h.left.root.join("build.log"),
+                    expected_save: Some(save.hash.clone()),
+                }),
+            })?;
+            assert_eq!(
+                h.left.source.completion,
+                Some(source_build::Completion::Ready(game))
+            );
+            assert_eq!(h.left.native_channel(game)?.executable()?, next.join(name));
+            let mut restarted =
+                totk::Channel::for_game(transfers.clone(), Ok(previous.clone()), native);
+            assert_eq!(restarted.executable()?, next.join(name));
+            assert!(restarted.status.release_pending);
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&fs::read(transfers.join("session.json"))?)?;
+            assert_eq!(persisted["release"], token);
+            assert_eq!(persisted["base"], save.hash);
+            assert_eq!(persisted["peer"], peer);
+            restarted.handle(Event::LeaseReleased { token })?;
+            assert!(!restarted.status.release_pending);
+            for directory in [&previous, &next] {
+                assert_eq!(
+                    native
+                        .snapshot(&directory.join(native.profile_name()))?
+                        .map(|save| save.hash),
+                    Some(save.hash.clone())
+                );
+            }
+            assert_eq!(h.left.current_hash()?, dusklight);
         }
         Ok(())
     }

@@ -970,6 +970,68 @@ fn settings_cards_expand_with_their_content_instead_of_overlapping() -> Result<(
 }
 
 #[test]
+fn source_wizard_next_preserves_scroll_and_clamps_shorter_steps() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_section(1);
+    ui.set_source_mode(true);
+    ui.set_tools(rows(
+        ["C++ build tools", ".NET SDK", "MSYS2"]
+            .into_iter()
+            .map(|name| widgets::ToolRow {
+                name: name.into(),
+                detail: "Synthetic prerequisite, never executed".into(),
+                ready: true,
+                ..Default::default()
+            })
+            .collect(),
+    ));
+    let scroll = ElementHandle::find_by_element_id(&ui, "MainWindow::main-scroll")
+        .next()
+        .context("Missing main scroll view")?;
+    for width in [720.0, 900.0, 1200.0] {
+        ui.window().set_size(slint::LogicalSize::new(width, 720.0));
+        for game in [0, 1, 2] {
+            ui.set_selected_game(game);
+            ui.set_setup_step(0);
+            flush();
+            let steps: &[(&str, i32)] = if game == 0 {
+                &[("Next: review build", 2)]
+            } else {
+                &[("Next: game files", 1), ("Next: review build", 2)]
+            };
+            for &(label, step) in steps {
+                scroll.scroll(0.0, -4000.0);
+                i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+                flush();
+                let before = ui.get_scroll_position();
+                assert!(before < -20.0, "The source wizard did not scroll");
+                let next = button(&ui, label)?;
+                let top = scroll.absolute_position().y;
+                assert!(
+                    next.absolute_position().y >= top
+                        && next.absolute_position().y + next.size().height
+                            <= top + scroll.size().height + 1.0,
+                    "{label} is not visible at {width}px for game {game}"
+                );
+                next.mock_single_click(slint::platform::PointerEventButton::Left);
+                flush();
+                assert_eq!(ui.get_setup_step(), step);
+                let after = ui.get_scroll_position();
+                scroll.scroll(0.0, -4000.0);
+                i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+                flush();
+                let end = ui.get_scroll_position();
+                assert!(
+                    (after - before.max(end)).abs() <= 1.0,
+                    "{label} lost the scroll position at {width}px for game {game}: {before} -> {after}, end {end}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn source_wizard_reaches_review_without_a_dead_end_for_every_game() -> Result<()> {
     let ui = fixture()?;
     activate(&ui, "Game setup")?;
