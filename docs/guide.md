@@ -633,7 +633,13 @@ target project using the normal transactional save writer. Replaced target saves
 remain in its `user\save-sync-backups`; graphics settings are not copied.
 If the current project has no progress, existing target progress is kept.
 This also prepares saves when the target project has not been built yet.
-Both games must be closed, with no pending transfers or play reservations.
+Both games must be closed, with no pending transfers or unrecovered play
+reservations. A completed OOT session awaiting the other PC's acknowledgment
+does not prevent local project switching, including while that PC is offline.
+Its release token is retained across switches and restarts, then acknowledged
+on reconnection.
+Offline progress still follows the normal save reconciliation and branch-choice
+rules.
 The selected project uses the existing OOT LAN channel, history and play protection;
 there is no separate simultaneous play session for each project.
 

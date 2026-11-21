@@ -842,17 +842,22 @@ impl Channel {
         self.select_executable(executable, false)
     }
 
-    pub(crate) fn switch_oot_installation(&mut self, directory: &Path) -> Result<()> {
+    pub(crate) fn require_oot_switch_idle(&mut self) -> Result<()> {
         ensure!(
             self.game == crate::native::Game::Triforce,
             "Only OOT has project selection"
         );
-        self.require_update_idle()?;
+        self.require_session_idle()?;
         self.require_app_update_idle()?;
         ensure!(
             self.status.remote_lock.is_none() && !self.status.pending,
             "Finish the paired device's reservation or incoming save before switching OOT projects"
         );
+        Ok(())
+    }
+
+    pub(crate) fn switch_oot_installation(&mut self, directory: &Path) -> Result<()> {
+        self.require_oot_switch_idle()?;
         ensure_safe_path(directory)?;
         let current = self
             .install
@@ -1140,15 +1145,23 @@ impl Channel {
         Ok(())
     }
 
-    pub fn require_update_idle(&mut self) -> Result<()> {
+    fn require_session_idle(&mut self) -> Result<()> {
         self.idle()?;
         ensure!(
             !self.status.busy
                 && self.launch_request.is_none()
                 && self.child.is_none()
-                && self.session.lock.is_none()
-                && self.session.release.is_none(),
+                && self.session.lock.is_none(),
             "Finish or recover the game play session and pending transfers first"
+        );
+        Ok(())
+    }
+
+    pub fn require_update_idle(&mut self) -> Result<()> {
+        self.require_session_idle()?;
+        ensure!(
+            self.session.release.is_none(),
+            "Reconnect both managers to acknowledge the completed game session before changing installations"
         );
         Ok(())
     }

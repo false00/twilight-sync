@@ -45,6 +45,10 @@ pub(super) fn native(snapshot: &Snapshot, game: GameId) -> Option<&totk::Status>
     }
 }
 
+fn native_connected(snapshot: &Snapshot, game: GameId) -> bool {
+    snapshot.ready && (game != GameId::Triforce || snapshot.triforce_supported)
+}
+
 pub(super) fn local_hash(snapshot: &Snapshot, game: GameId) -> Option<&str> {
     native(snapshot, game).map_or(snapshot.local_hash.as_deref(), |state| {
         state.local_hash.as_deref()
@@ -96,7 +100,7 @@ pub(super) fn game_status(snapshot: &Snapshot, game: GameId) -> &'static str {
                 state.remote_running,
                 state.pending,
                 state.recovery_pending,
-                state.lock.is_some() || state.remote_lock.is_some() || state.release_pending,
+                state.lock.is_some() || state.remote_lock.is_some(),
                 state.conflict,
             )
         } else {
@@ -119,6 +123,10 @@ pub(super) fn game_status(snapshot: &Snapshot, game: GameId) -> &'static str {
         "Incoming save needs approval"
     } else if reserved {
         "Previous session needs attention"
+    } else if native_connected(snapshot, game)
+        && native(snapshot, game).is_some_and(|state| state.release_pending)
+    {
+        "Finishing previous session"
     } else if conflict {
         "Two save branches to compare"
     } else if saves_match(snapshot, game) {
@@ -255,14 +263,16 @@ pub(super) fn source_blocker(snapshot: &Snapshot) -> Option<&'static str> {
         Some(
             "A Dusklight play reservation is held. Open Twilight Princess on Play and recover the completed session first.",
         )
-    } else if native.iter().any(|state| {
-        state.lock.is_some()
-            || state.remote_lock.is_some()
-            || state.launch_pending
-            || state.release_pending
-    }) {
+    } else if native
+        .iter()
+        .any(|state| state.lock.is_some() || state.remote_lock.is_some() || state.launch_pending)
+    {
         Some(
             "A native-game play reservation is held. Recover the completed session on Play before changing its installation.",
+        )
+    } else if native.iter().any(|state| state.release_pending) {
+        Some(
+            "Reconnect both managers to acknowledge the completed game session before changing installations.",
         )
     } else if snapshot.pending_save
         || snapshot.pending_iso
@@ -539,6 +549,17 @@ pub(super) fn can_accept(snapshot: &Snapshot, game: GameId) -> bool {
     }
 }
 
+pub(super) fn recovery_needed(snapshot: &Snapshot, game: GameId) -> bool {
+    if let Some(state) = native(snapshot, game) {
+        state.recovery_pending
+            || state.lock.is_some()
+            || state.remote_lock.is_some()
+            || (state.release_pending && native_connected(snapshot, game))
+    } else {
+        snapshot.pending_recovery || snapshot.settings.play_lock.is_some()
+    }
+}
+
 pub(super) fn can_recover(snapshot: &Snapshot, game: GameId) -> bool {
     if let Some(state) = native(snapshot, game) {
         !state.running
@@ -546,7 +567,17 @@ pub(super) fn can_recover(snapshot: &Snapshot, game: GameId) -> bool {
             && !state.updating
             && !state.launch_pending
             && !state.pending
+            && !state.busy
             && !snapshot.self_updates.preparing
+            && if native_connected(snapshot, game) {
+                state.recovery_pending || state.lock.is_some() || state.release_pending
+            } else {
+                !state.recovery_pending
+                    && state
+                        .lock
+                        .as_ref()
+                        .is_some_and(|lock| lock.owner == snapshot.public_key)
+            }
     } else {
         !snapshot.game_running
             && !snapshot.remote_game
@@ -833,6 +864,63 @@ mod tests {
         assert!(source_blocker(&snapshot).is_some());
         assert!(configuration_available(&snapshot));
         assert!(!can_install(&snapshot, GameId::Dusklight));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_native_releases_are_not_offline_recovery_errors() -> Result<()> {
+        let mut snapshot = snapshot()?;
+        snapshot.ready = false;
+        snapshot.totk = totk::Status {
+            checked: true,
+            installed: true,
+            release_pending: true,
+            ..Default::default()
+        };
+        snapshot.triforce = snapshot.totk.clone();
+        snapshot.triforce.executable = Some(
+            snapshot
+                .source
+                .preferences
+                .triforce
+                .oot_project
+                .executable()
+                .into(),
+        );
+        for game in [GameId::Totk, GameId::Triforce] {
+            assert_eq!(game_status(&snapshot, game), "Offline play");
+            assert!(!recovery_needed(&snapshot, game));
+            assert!(!can_recover(&snapshot, game));
+            assert!(play_blocker(&snapshot, game).is_none());
+        }
+        snapshot.ready = true;
+        snapshot.triforce_supported = true;
+        for game in [GameId::Totk, GameId::Triforce] {
+            assert_eq!(game_status(&snapshot, game), "Finishing previous session");
+            assert!(recovery_needed(&snapshot, game));
+            assert!(can_recover(&snapshot, game));
+        }
+        snapshot.triforce_supported = false;
+        assert!(!recovery_needed(&snapshot, GameId::Triforce));
+        assert!(!can_recover(&snapshot, GameId::Triforce));
+        snapshot.ready = false;
+        snapshot.triforce.lock = Some(crate::config::PlayLock {
+            owner: snapshot.public_key.clone(),
+            token: "a".repeat(64),
+        });
+        assert!(recovery_needed(&snapshot, GameId::Triforce));
+        assert!(can_recover(&snapshot, GameId::Triforce));
+        assert!(play_blocker(&snapshot, GameId::Triforce).is_some());
+        snapshot.triforce.busy = true;
+        assert!(!can_recover(&snapshot, GameId::Triforce));
+        snapshot.triforce.busy = false;
+        snapshot
+            .triforce
+            .lock
+            .as_mut()
+            .context("Missing fixture lock")?
+            .owner = "b".repeat(64);
+        assert!(!can_recover(&snapshot, GameId::Triforce));
         Ok(())
     }
 

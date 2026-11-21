@@ -44,6 +44,8 @@ ROMs, and console keys are not included.*
 - **Choose your OOT project.** Switch between Triforce and Longshot beside Play
   or in Game setup. Both build locally from source and update independently.
   Switching carries verified progress across, with backups of replaced saves.
+  A completed OOT session awaiting your offline PC's acknowledgment does not
+  block switching.
 - **Bring your own game files once.** Explicitly approve encrypted transfers of
   OOT `.nup` and TotK base/update `.nsp` files between your paired PCs.
   Console `prod.keys` has a separate, default-off permission and approvals.

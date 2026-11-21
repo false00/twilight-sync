@@ -145,6 +145,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn completed_oot_release_survives_switch_restart_and_acknowledgment() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let longshot = temp.path().join("Longshot");
+        let triforce = temp.path().join("Triforce");
+        for (root, executable, marker) in [
+            (&longshot, "longshot.exe", 7),
+            (&triforce, "Triforce.exe", 2),
+        ] {
+            fs::create_dir_all(root.join("romfs"))?;
+            fs::write(root.join("image.bin"), b"synthetic game data")?;
+            fs::write(root.join(executable), b"fixture, never executed")?;
+            seed(&root.join("user"), marker)?;
+        }
+        let source = snapshot(&longshot.join("user"))?.context("Missing source fixture")?;
+        let target = snapshot(&triforce.join("user"))?.context("Missing target fixture")?;
+        let transfers = temp.path().join("transfers");
+        let token = "c".repeat(64);
+        let peer = "b".repeat(64);
+        fs::create_dir(&transfers)?;
+        crate::files::atomic_write(
+            &transfers.join("session.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "base": source.hash,
+                "lock": null,
+                "peer": peer,
+                "release": token,
+                "install": longshot,
+            }))?,
+        )?;
+        let mut channel = totk::Channel::for_game(
+            transfers.clone(),
+            Ok(longshot.clone()),
+            native::Game::Triforce,
+        );
+        channel.identify(&"a".repeat(64), "Local user");
+        channel.bind_peer(&peer)?;
+        channel.refresh()?;
+        channel.switch_oot_installation(&triforce)?;
+        assert!(channel.status.release_pending);
+        assert_eq!(
+            snapshot(&triforce.join("user"))?.map(|save| save.hash),
+            Some(source.hash.clone())
+        );
+        let backup = fs::read_dir(triforce.join("user").join("save-sync-backups"))?
+            .next()
+            .context("Target save was not backed up")??
+            .path();
+        assert_eq!(
+            totk::snapshot_account(&backup, &ACCOUNT.to_le_bytes())?.map(|save| save.hash),
+            Some(target.hash)
+        );
+
+        let mut restarted = totk::Channel::for_game(
+            transfers.clone(),
+            Ok(longshot.clone()),
+            native::Game::Triforce,
+        );
+        assert_eq!(restarted.executable()?, triforce.join("Triforce.exe"));
+        assert!(restarted.status.release_pending);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(transfers.join("session.json"))?)?;
+        assert_eq!(persisted["release"], token);
+        assert_eq!(persisted["base"], source.hash);
+        assert_eq!(persisted["peer"], peer);
+        restarted.handle(crate::protocol::Event::LeaseReleased { token })?;
+        assert!(!restarted.status.release_pending);
+        assert_eq!(
+            snapshot(&longshot.join("user"))?.map(|save| save.hash),
+            Some(source.hash.clone())
+        );
+        assert_eq!(
+            snapshot(&triforce.join("user"))?.map(|save| save.hash),
+            Some(source.hash)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn oot_switches_protect_pending_sessions_and_prepare_uninstalled_projects() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let previous = temp.path().join("Triforce");
@@ -162,6 +241,15 @@ pub(crate) mod tests {
         channel.status.pending = true;
         assert!(channel.switch_oot_installation(&next).is_err());
         channel.status.pending = false;
+        channel.status.busy = true;
+        assert!(channel.switch_oot_installation(&next).is_err());
+        channel.status.busy = false;
+        channel.handle(crate::protocol::Event::Recover {
+            token: "a".repeat(64),
+        })?;
+        assert!(channel.switch_oot_installation(&next).is_err());
+        channel.approve_recovery(false)?;
+        assert!(!next.try_exists()?);
         channel.switch_oot_installation(&next)?;
         assert!(!channel.status.installed);
         assert_eq!(

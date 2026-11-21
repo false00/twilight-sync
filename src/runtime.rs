@@ -2173,6 +2173,11 @@ impl Engine {
     }
 
     fn require_source_idle(&mut self) -> Result<()> {
+        self.require_oot_switch_idle()?;
+        self.triforce.require_update_idle()
+    }
+
+    fn require_oot_switch_idle(&mut self) -> Result<()> {
         self.game_running = self.process.game_running();
         self.require_idle()?;
         ensure!(
@@ -2183,16 +2188,13 @@ impl Engine {
                 && self.requested_recovery.is_none(),
             "Finish pending transfers, play sessions and recovery before building"
         );
-        for game in [protocol::GameId::Totk, protocol::GameId::Triforce] {
-            let channel = self.native_channel(game)?;
-            channel.require_update_idle()?;
-            channel.require_app_update_idle()?;
-            ensure!(
-                channel.status.remote_lock.is_none() && !channel.status.pending,
-                "Finish the paired device's {game:?} reservation or pending save first"
-            );
-        }
-        Ok(())
+        self.totk.require_update_idle()?;
+        self.totk.require_app_update_idle()?;
+        ensure!(
+            self.totk.status.remote_lock.is_none() && !self.totk.status.pending,
+            "Finish the paired device's TotK reservation or pending save first"
+        );
+        self.triforce.require_oot_switch_idle()
     }
 
     fn begin_source_operation(&mut self, game: protocol::GameId, building: bool) -> Result<()> {
@@ -2437,7 +2439,7 @@ impl Engine {
                             == self.source.preferences.triforce.oot_project,
                         "Select the matching OOT project before locating its executable"
                     );
-                    self.require_source_idle()?;
+                    self.require_oot_switch_idle()?;
                     let directory = crate::native::Game::Triforce.installation(&path)?;
                     self.triforce.switch_oot_installation(&directory)?;
                 } else {
@@ -2534,7 +2536,7 @@ impl Engine {
                     self.source.preferences_valid && !self.source.busy,
                     "Finish the source operation or reset invalid preferences first"
                 );
-                self.require_source_idle()?;
+                self.require_oot_switch_idle()?;
                 let mut preferences = self.source.preferences.clone();
                 if let Some(current) = &self.triforce.status.install_path {
                     let project = match &self.triforce.status.executable {
@@ -7475,6 +7477,104 @@ mod tests {
             crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
             crate::triforce::snapshot(&longshot.join("user"))?.map(|save| save.hash)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn offline_oot_selection_preserves_release_but_blocks_active_reservations() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), Some(variant(1)))?;
+        h.left.disconnect("Offline OOT fixture");
+        h.right.disconnect("Offline OOT fixture");
+        let longshot = h.left.root.join("Longshot");
+        let triforce = h.left.root.join("Triforce");
+        for (root, executable, marker) in [
+            (&longshot, "longshot.exe", 7),
+            (&triforce, "Triforce.exe", 2),
+        ] {
+            fs::create_dir_all(root.join("romfs"))?;
+            fs::write(root.join("image.bin"), b"synthetic game data")?;
+            fs::write(root.join(executable), b"fixture, never executed")?;
+            crate::triforce::tests::seed(&root.join("user"), marker)?;
+        }
+        let source =
+            crate::triforce::snapshot(&longshot.join("user"))?.context("Missing source fixture")?;
+        let target =
+            crate::triforce::snapshot(&triforce.join("user"))?.context("Missing target fixture")?;
+        let dusklight = h.left.current_hash()?;
+        let transfers = h.left.root.join("triforce-transfers");
+        fs::create_dir_all(&transfers)?;
+        h.left.source.preferences.triforce.oot_project = source_build::OotProject::Longshot;
+        h.left.source.preferences.longshot_install = Some(longshot.clone());
+        h.left.source.preferences.triforce_install = Some(triforce.clone());
+        let token = "c".repeat(64);
+        for owner in [
+            Some(h.left.identity.public.clone()),
+            Some(h.right.identity.public.clone()),
+            None,
+        ] {
+            let reserved = owner.is_some();
+            let lock = owner.map(|owner| crate::config::PlayLock {
+                owner,
+                token: "d".repeat(64),
+            });
+            files::atomic_write(
+                &transfers.join("session.json"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "base": source.hash,
+                    "lock": lock,
+                    "peer": h.right.identity.public,
+                    "release": if reserved { None } else { Some(&token) },
+                    "install": longshot,
+                }))?,
+            )?;
+            h.left.triforce = totk::Channel::for_game(
+                transfers.clone(),
+                Ok(longshot.clone()),
+                crate::native::Game::Triforce,
+            );
+            h.left
+                .triforce
+                .identify(&h.left.identity.public, h.left.audit.username());
+            h.left.triforce.bind_peer(&h.right.identity.public)?;
+            h.left.triforce.refresh()?;
+            let switched = h.left.command(Command::SelectOotProject(
+                source_build::OotProject::Triforce,
+            ));
+            if reserved {
+                assert!(switched.is_err());
+                assert_eq!(h.left.triforce.executable()?, longshot.join("longshot.exe"));
+                assert_eq!(
+                    crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
+                    Some(target.hash.clone())
+                );
+            } else {
+                switched?;
+                assert_eq!(h.left.triforce.executable()?, triforce.join("Triforce.exe"));
+                assert_eq!(
+                    source_build::Preferences::load(&h.left.root)?
+                        .triforce
+                        .oot_project,
+                    source_build::OotProject::Triforce
+                );
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&fs::read(transfers.join("session.json"))?)?;
+                assert_eq!(persisted["release"], token);
+                assert_eq!(persisted["base"], source.hash);
+                assert_eq!(persisted["peer"], h.right.identity.public);
+                assert!(h.left.triforce.status.release_pending);
+                assert_eq!(
+                    crate::triforce::snapshot(&triforce.join("user"))?.map(|save| save.hash),
+                    Some(source.hash.clone())
+                );
+                assert!(h.left.require_source_idle().is_err());
+            }
+            assert_eq!(h.left.current_hash()?, dusklight);
+            assert_eq!(
+                crate::triforce::snapshot(&longshot.join("user"))?.map(|save| save.hash),
+                Some(source.hash.clone())
+            );
+        }
         Ok(())
     }
 

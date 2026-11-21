@@ -1638,10 +1638,7 @@ impl Controller {
                 },
                 state.conflict,
                 state.pending,
-                state.recovery_pending
-                    || state.lock.is_some()
-                    || state.remote_lock.is_some()
-                    || state.release_pending,
+                model::recovery_needed(snapshot, game),
                 if state.comparison_verified {
                     "Complete snapshots verified for comparison."
                 } else if state.local_hash.is_some() {
@@ -1654,7 +1651,7 @@ impl Controller {
         } else {
             (snapshot.local_save.as_ref().map(model::dusklight_cards).unwrap_or_default(),
              snapshot.conflict.as_ref().and_then(|conflict| conflict.remote.as_ref()).map(model::dusklight_cards).unwrap_or_default(),
-             snapshot.conflict.is_some(), snapshot.pending_save, snapshot.pending_recovery || snapshot.settings.play_lock.is_some(),
+             snapshot.conflict.is_some(), snapshot.pending_save, model::recovery_needed(snapshot, game),
              if snapshot.save_ready { "Your active profile is detected and verified automatically." } else { "Waiting for a valid Dusklight profile. No manual save-folder selection is needed." }.to_string())
         };
         replace_rows(ui.get_local_saves(), local, |rows| ui.set_local_saves(rows));
