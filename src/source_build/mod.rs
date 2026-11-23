@@ -1202,9 +1202,9 @@ pub fn build(
     let output = output_stage.path().join("game");
     fs::create_dir(&output)?;
     let mut runner = Runner::new(&request.log, cancel, progress)?;
+    #[cfg(windows)]
+    let _keep_awake = crate::power::KeepAwake::new()?;
     let result: Result<(PathBuf, String, Option<String>)> = (|| {
-        #[cfg(windows)]
-        let _keep_awake = crate::power::KeepAwake::new()?;
         runner.message("Preventing automatic system sleep during this build and shader preparation; the display can still turn off.")?;
         let mut tools = Toolset::new(root)?;
         let git = tools.ensure(
