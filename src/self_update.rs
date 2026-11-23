@@ -671,9 +671,13 @@ fn wait_parent(parent: Option<&std::os::windows::io::OwnedHandle>, stage: &Path)
 #[cfg(windows)]
 pub fn apply(root: &Path, path: &Path) -> Result<()> {
     apply_with(root, path, |target| {
+        // Not the helper's handles: they are its log in the update stage, which is deleted later.
         Command::new(target)
             .arg("--background")
             .current_dir(target.parent().context("No executable directory")?)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("Restarting Twilight Sync")?;
         Ok(())

@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
 };
 #[cfg(not(windows))]
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
@@ -150,6 +150,12 @@ pub fn launch_game(path: &Path, game: crate::protocol::GameId) -> Result<Child> 
     ensure!(path.is_file(), "Game executable was not found");
     let mut command = Command::new(path);
     command.current_dir(path.parent().context("Executable has no directory")?);
+    // Inherited handles can be a file of the self-update helper; TotK logs into a stderr file
+    // instead of writing logs\totk.log.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if game == crate::protocol::GameId::Triforce {
         command
             .env("HOOKSHOT_NO_UPDATE_CHECK", "1")

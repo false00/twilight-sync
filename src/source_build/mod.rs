@@ -835,6 +835,15 @@ pub(crate) fn preserve_dusklight(executable: &Path, output: &Path) -> Result<()>
     Ok(())
 }
 
+// What TotK recorded in play: the new build prebuilds these pipelines at startup instead of
+// compiling them during play. It checks the files and drops what it cannot use.
+const TOTK_SHADER_RECORDS: [&str; 4] = [
+    "pipeline-keys.bin",
+    "shader-answers.bin",
+    "shader-programs.bin",
+    "pipeline-cache.bin",
+];
+
 fn preserve_current_data(
     request: &Request,
     previous: &Path,
@@ -850,6 +859,11 @@ fn preserve_current_data(
         }
     } else {
         let native = native_game(game)?;
+        let shader_records: &[&str] = if game == GameId::Totk {
+            &TOTK_SHADER_RECORDS
+        } else {
+            &[]
+        };
         for relative in [
             native.profile_name(),
             "mods",
@@ -861,7 +875,10 @@ fn preserve_current_data(
             "longshot_env.txt",
             "mods.json",
             "language.txt",
-        ] {
+        ]
+        .into_iter()
+        .chain(shader_records.iter().copied())
+        {
             let source = previous.join(relative);
             ensure_safe_path(&source)?;
             if source.try_exists()? {
@@ -1790,6 +1807,39 @@ mod tests {
             changed
         );
         assert_eq!(save_hash(GameId::Triforce, &previous, None)?, latest);
+        Ok(())
+    }
+
+    #[test]
+    fn totk_source_build_carries_the_recorded_shaders_and_pipelines() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let previous = temp.path().join("previous");
+        let next = temp.path().join("next");
+        fs::create_dir_all(&previous)?;
+        fs::create_dir_all(&next)?;
+        let executable = next.join("totk.exe");
+        fs::write(&executable, b"synthetic file, never executed")?;
+        for name in TOTK_SHADER_RECORDS {
+            fs::write(previous.join(name), name)?;
+        }
+        let request = Request {
+            plan: Plan {
+                game: GameId::Totk,
+                oot_project: OotProject::default(),
+                tag: "v0.5.0".into(),
+                commit: "a".repeat(40),
+                review_url: String::new(),
+            },
+            preference: Preference::default(),
+            previous_install: Some(previous.clone()),
+            previous_executable: None,
+            approved: true,
+            log: temp.path().join("log.txt"),
+        };
+        preserve_current_data(&request, &previous, &next, &executable)?;
+        for name in TOTK_SHADER_RECORDS {
+            assert_eq!(fs::read(next.join(name))?, name.as_bytes());
+        }
         Ok(())
     }
 

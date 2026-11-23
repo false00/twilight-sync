@@ -763,7 +763,11 @@ The flow:
    after a cancellation request.
 7. Built Windows x64 headers, executable hashes and preserved save hashes are
    checked before selection. Saves are copied after compilation so the staged
-   install preserves the latest committed progress. Changes during that copy
+   install preserves the latest committed progress. TotK's recorded shader and
+   pipeline lists (`pipeline-keys.bin`, `shader-answers.bin`,
+   `shader-programs.bin`) and `pipeline-cache.bin` are copied with them: the new
+   build prebuilds those pipelines at startup instead of compiling them during
+   play, and drops what it cannot use. Changes during that copy
    or before activation still leave the previous installation selected.
    Output is prepared separately, then promoted to
    `Games\Dusklight`, `Games\TotKRecomp`, or `Games\Triforce` when idle.
@@ -788,8 +792,7 @@ The flow:
    stays selected. A new source build will not start while an extra managed
    version folder remains, even if an earlier cleanup removed its executable
    or receipt. Play and settings changes wait while files are checked.
-   Earlier rollback folders and unrelated manually managed folders are not
-   automatically deleted.
+   Unrelated manually managed folders are never deleted.
    To check older siblings without rebuilding, close all games and quit Twilight
    Sync, then use `twilight-sync --cleanup-source-installs longshot` (or
    `triforce`, `totk`, `dusklight`) with that source installation already selected.
@@ -800,6 +803,27 @@ The flow:
    sleep, including shader and Vulkan pipeline preparation. The display can
    still turn off. Normal sleep behavior is restored on completion, cancellation,
    or failure; manual Sleep, lid-close actions and power settings are unchanged.
+   After an update, a game folder move or that cleanup, Twilight Sync waits until
+   no game, transfer or play reservation is active on either PC. When TotK runs
+   from a new folder, its prepared shader list changed, or a graphics driver was
+   updated, it first runs `totk.exe --warm-shaders` there. The driver keys its
+   shader cache by the executable's path, and setup prepared the shaders in the
+   build's version folder, so after the move each library would otherwise be
+   compiled again the first time the game draws it. The run uses below-normal
+   priority, is repeated after a driver crash as upstream's preparation script
+   does, and stops if a game starts; it continues after the game closes. A run
+   Twilight Sync stops, or one cut off when it quits, has its shader journal
+   removed, so TotK does not take the interrupted shaders for driver crashes and
+   skip them. Its output is in `build-logs\totk-shaders-*.log`, and
+   `totk-shaders.json` records the folder, shader list and drivers it warmed.
+   Nothing is kept as a backup: Twilight Sync then removes `.twilight-sync-backup-*`
+   folders, version folders beside a known active install, and build workspaces
+   other than the one the active TotK build's mod rebuild command uses. The
+   selected Triforce and Longshot installs and a completed build that awaits
+   activation stay. So does any folder still named by Twilight Sync's settings,
+   Dusklight's `config.json` or `data_location.json`, or the TotK build's receipt
+   or rebuild command; a backup kept that way is reported with the path. Nothing
+   is removed while a folder move is unfinished.
 8. **Game setup** shows recorded installed official/source versions. Source checks
    distinguish a newer release, downgrade, same revision, changed revision under
    the same tag, or unknown ordering. **Compare with installed source** opens the
@@ -854,8 +878,9 @@ and after a failed or cancelled build of any game. Successful TotK builds keep
 the source, tools, Python environment and incremental build files used by the
 in-game mod rebuild command; the package download and restore caches are removed.
 Logs, verified tool archives and the active game's shader caches are kept.
-Older workspaces and files left by a force-quit are not removed
-automatically. If cleanup is blocked, the build log records the path and reason.
+Older workspaces, including those a force-quit left behind, are removed after
+the next update once games are idle. If cleanup is blocked, the build log or
+the audit log records the path and reason.
 Native builds still require at least 64 GiB free; the portable-data/mod copy is
 additional. Keep game-derived workspaces private.
 
@@ -1112,6 +1137,7 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
     settings.json           Router pin, public peer key, local paths, common hash, play lock
     update-settings.json    Optional automatic app-update-check preference
     source-builds.json      Local build methods, input paths and worker preferences
+    totk-shaders.json       TotK folder, shader list and graphics drivers last warmed
     interface.json          Optional Windows/System, Light, or Dark appearance preference
     instance.lock           Per-user single-manager lock
     logs\
@@ -1136,9 +1162,9 @@ and index bytes. Paths/timestamps can slightly change the metadata size.
     triforce-transfers\     Triforce session, common base and separate compact history
     build-tools\
         archives\          Rechecked official tool ZIPs; fresh tool extractions are temporary
-    build-logs\            Captured local source-build output
+    build-logs\            Captured local source-build and TotK shader warm-up output
     source-builds\
-        <game>\<tag>-<commit>-<id>\  Temporary build workspace; retained for successful TotK mod rebuilds
+        <game>\<tag>-<commit>-<id>\  Temporary build workspace; the active TotK build's is kept for mod rebuilds
 ```
 
 New game installations default to `%USERPROFILE%\Games`:
@@ -1148,7 +1174,7 @@ Games\
     Dusklight\            Selected Dusklight game and installation receipt
     TotKRecomp\            Native TotK game, profile, settings and mods
     Triforce\              Native OoT game, user saves and local graphics settings
-    .twilight-sync-backup-<id>\  Retained prior data; eligible source backups are compacted
+    .twilight-sync-backup-<id>\  Prior install moved aside by a folder move; removed once games are idle
 ```
 
 Updater caches and application settings remain in `.twilight-sync`; they are not
@@ -1167,6 +1193,8 @@ local discovery; save contents and paths are not.
 
 Source-build logs additionally capture upstream stdout/stderr. Review and redact
 them before sharing: third-party scripts can print anything they can read.
+Launched games do not inherit Twilight Sync's standard handles; TotK writes its
+own `logs\totk.log` next to `totk.exe`.
 Twilight Sync does not upload game inputs/keys/saves to a public service.
 Explicitly approved paired-LAN transfers are supported; an approved source
 script has normal user permissions and can make its own network requests.

@@ -9,6 +9,7 @@ use crate::{
     install::{self, Installed, ReleaseInfo},
     lan::{self, Advertisement, Discovered, Network},
     play::{self, ProcessMonitor},
+    post_update,
     protocol::{self, Event, Handshake, SecureWriter},
     save_data, save_location, self_update, source_build, sync_policy,
     textures::{self, Activation, Pack},
@@ -331,6 +332,7 @@ enum Input {
         directory: PathBuf,
         result: Result<String>,
     },
+    PostUpdated(Result<post_update::Outcome>),
     SelfUpdateChecked(Result<self_update::Release>),
     SelfUpdatePrepared(Result<self_update::Prepared>),
     SelfUpdateCancelled(Result<()>),
@@ -510,6 +512,10 @@ struct Engine {
     install_busy: bool,
     layout_recovery: bool,
     compacting_backup: bool,
+    post_update_due: bool,
+    post_updating: bool,
+    #[cfg(test)]
+    test_games: Option<PathBuf>,
     latest_release: Option<ReleaseInfo>,
     latest_totk_release: Option<ReleaseInfo>,
     selected_release: Option<String>,
@@ -645,6 +651,9 @@ fn start_manager(desktop: bool, storage_cleanup: bool) -> Result<Backend> {
                 engine.report(error);
             }
             if !storage_cleanup && let Err(error) = engine.initialize_self_updates() {
+                engine.report(error);
+            }
+            if let Err(error) = post_update::recover(&engine.root) {
                 engine.report(error);
             }
             match game_file::Permissions::load(&engine.root) {
@@ -1031,6 +1040,10 @@ impl Engine {
             install_busy: layout_pending,
             layout_recovery: layout_pending,
             compacting_backup: false,
+            post_update_due: true,
+            post_updating: false,
+            #[cfg(test)]
+            test_games: None,
             latest_release: None,
             latest_totk_release: None,
             selected_release: None,
@@ -1406,6 +1419,7 @@ impl Engine {
                     updated.log.display()
                 );
                 self.totk.status.message = self.message.clone();
+                self.post_update_due = true;
                 if updated.fresh {
                     self.cleanup_replaced_install(
                         protocol::GameId::Totk,
@@ -1598,6 +1612,7 @@ impl Engine {
                 );
                 self.compacting_backup = false;
                 self.install_busy = false;
+                self.post_update_due = true;
                 let (event, detail, failed) = match result {
                     Ok(detail) => ("source-backup-cleanup", detail, false),
                     Err(error) => (
@@ -1616,6 +1631,45 @@ impl Engine {
                 self.audit
                     .record(event, Some(&directory), None, None, &detail)?;
                 ensure!(!failed, "{detail}");
+                Ok(())
+            }
+            Input::PostUpdated(result) => {
+                ensure!(self.post_updating, "Unexpected post-update result");
+                self.post_updating = false;
+                self.install_busy = false;
+                let outcome = result.unwrap_or_else(|error| post_update::Outcome {
+                    summary: String::new(),
+                    failures: vec![format!("{error:#}")],
+                    interrupted: false,
+                });
+                // Resumes once the game that started has closed.
+                self.post_update_due |= outcome.interrupted;
+                let detail = if outcome.failures.is_empty() {
+                    outcome.summary
+                } else {
+                    format!(
+                        "{} Not finished: {}",
+                        outcome.summary,
+                        outcome.failures.join("; ")
+                    )
+                    .trim_start()
+                    .to_owned()
+                };
+                if !detail.is_empty() {
+                    self.message = detail.clone();
+                }
+                self.audit.record(
+                    if outcome.failures.is_empty() {
+                        "post-update"
+                    } else {
+                        "post-update-incomplete"
+                    },
+                    None,
+                    None,
+                    None,
+                    &detail,
+                )?;
+                ensure!(outcome.failures.is_empty(), "{detail}");
                 Ok(())
             }
             Input::SelfUpdateChecked(result) => {
@@ -2367,6 +2421,22 @@ impl Engine {
         Ok(())
     }
 
+    // Dusklight's own settings files, which can name game folders; a folder move rewrites them too.
+    fn dusklight_metadata(&self, directory: Option<&Path>) -> Vec<PathBuf> {
+        let mut metadata = Vec::new();
+        if let Some(directory) = directory {
+            metadata.push(directory.join("data_location.json"));
+        }
+        metadata.push(self.default_profile.join("data_location.json"));
+        if let Some(directory) = self.default_profile.parent() {
+            metadata.push(directory.join("Dusk").join("data_location.json"));
+        }
+        if let Some(profile) = &self.save_profile {
+            metadata.push(profile.join("config.json"));
+        }
+        metadata
+    }
+
     fn cleanup_replaced_install(
         &mut self,
         game: protocol::GameId,
@@ -2385,19 +2455,11 @@ impl Engine {
         let Ok(managed) = managed else {
             return;
         };
-        let mut metadata = Vec::new();
-        if game == protocol::GameId::Dusklight {
-            if let Some(directory) = replacement.parent() {
-                metadata.push(directory.join("data_location.json"));
-            }
-            metadata.push(self.default_profile.join("data_location.json"));
-            if let Some(directory) = self.default_profile.parent() {
-                metadata.push(directory.join("Dusk").join("data_location.json"));
-            }
-            if let Some(profile) = &self.save_profile {
-                metadata.push(profile.join("config.json"));
-            }
-        }
+        let metadata = if game == protocol::GameId::Dusklight {
+            self.dusklight_metadata(replacement.parent())
+        } else {
+            Vec::new()
+        };
         let backup = previous.and_then(|previous| {
             game_layout::SourceBackup::previous(
                 &self.root,
@@ -3683,7 +3745,7 @@ impl Engine {
                     "Stop Dusklight before quitting; close the window to the tray instead"
                 );
                 ensure!(
-                    (!self.install_busy || self.layout_recovery)
+                    (!self.install_busy || self.layout_recovery || self.post_updating)
                         && !self.texture_busy
                         && !self.self_updates.preparing
                         && !self.iso_preparing,
@@ -4382,7 +4444,7 @@ impl Engine {
                 let result = (|| -> Result<PlayLock> {
                     ensure!(
                         self.no_transfer()
-                            && (!self.install_busy || self.source.building)
+                            && (!self.install_busy || self.source.building || self.post_updating)
                             && !self.texture_busy
                             && !self.self_updates.preparing,
                         "A transfer or installation is active"
@@ -5783,6 +5845,7 @@ impl Engine {
                 }
             }
             self.try_game_layout()?;
+            self.try_post_update()?;
         }
         Ok(())
     }
@@ -5823,6 +5886,7 @@ impl Engine {
         migration.finish(&self.root)?;
         self.layout_recovery = false;
         self.install_busy = false;
+        self.post_update_due = true;
         self.message = format!(
             "{:?} is now installed in {}. Saves, mods, inputs and settings were retained.",
             migration.game,
@@ -5862,8 +5926,9 @@ impl Engine {
         });
     }
 
-    fn try_game_layout(&mut self) -> Result<()> {
-        if self.maintenance
+    // Nothing is running, transferring, locked or being installed on either PC.
+    fn games_idle(&self) -> bool {
+        !(self.maintenance
             || self.install_busy
             || self.texture_busy
             || self.source.busy
@@ -5893,8 +5958,131 @@ impl Engine {
                         || state.launch_pending
                         || state.release_pending
                         || state.recovery_pending
-                })
-        {
+                }))
+    }
+
+    fn try_post_update(&mut self) -> Result<()> {
+        // The process check also covers games the runtime does not track, so a stopped run never restarts at once.
+        if !self.post_update_due || !self.games_idle() || post_update::games_running() {
+            return Ok(());
+        }
+        self.post_update_due = false;
+        let Some(games) = self.games_root()? else {
+            return Ok(());
+        };
+        let Some(plan) = self.post_update_plan(games)? else {
+            return Ok(());
+        };
+        self.post_updating = true;
+        self.install_busy = true;
+        self.message = plan.describe();
+        let root = self.root.clone();
+        let log = self.root.join("build-logs").join(format!(
+            "totk-shaders-{}.log",
+            time::OffsetDateTime::now_utc().unix_timestamp()
+        ));
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = post_update::run(&root, &plan, &log);
+            if sender.send(Input::PostUpdated(result)).is_err() {
+                eprintln!("Twilight Sync stopped before it could report its post-update work");
+            }
+        });
+        Ok(())
+    }
+
+    fn post_update_plan(&self, games: PathBuf) -> Result<Option<post_update::Plan>> {
+        use source_build::OotProject;
+        let preferences = &self.source.preferences;
+        let launchable = |executable: Option<&Path>| executable.is_some_and(Path::is_file);
+        let project = self
+            .triforce
+            .status
+            .executable
+            .as_deref()
+            .and_then(|path| OotProject::from_executable(path).ok())
+            .unwrap_or(preferences.triforce.oot_project);
+        let oot = |wanted: OotProject| {
+            if wanted == project {
+                return self
+                    .triforce
+                    .status
+                    .install_path
+                    .clone()
+                    .filter(|_| launchable(self.triforce.status.executable.as_deref()));
+            }
+            match wanted {
+                OotProject::Triforce => &preferences.triforce_install,
+                OotProject::Longshot => &preferences.longshot_install,
+            }
+            .clone()
+            .filter(|install| install.join(wanted.executable()).is_file())
+        };
+        let (dusklight, _) = self.source_paths(protocol::GameId::Dusklight);
+        let totk = self
+            .totk
+            .status
+            .install_path
+            .clone()
+            .filter(|_| launchable(self.totk.status.executable.as_deref()));
+        let managed = vec![
+            post_update::Managed {
+                folder: games.join("Dusklight"),
+                active: dusklight
+                    .clone()
+                    .filter(|_| launchable(self.settings.game_exe.as_deref())),
+            },
+            post_update::Managed {
+                folder: games.join("TotKRecomp"),
+                active: totk.clone(),
+            },
+            post_update::Managed {
+                folder: games.join(OotProject::Triforce.name()),
+                active: oot(OotProject::Triforce),
+            },
+            post_update::Managed {
+                folder: games.join(OotProject::Longshot.name()),
+                active: oot(OotProject::Longshot),
+            },
+        ];
+        let mut keep: Vec<PathBuf> = [
+            dusklight.clone(),
+            self.totk.status.install_path.clone(),
+            self.triforce.status.install_path.clone(),
+            preferences.triforce_install.clone(),
+            preferences.longshot_install.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if let Some(built) = &self.source.built {
+            keep.push(built.directory.clone());
+            keep.extend(built.source.clone());
+        }
+        let mut metadata = self.dusklight_metadata(dusklight.as_deref());
+        if let Some(install) = &self.totk.status.install_path {
+            // Both name the workspace that the in-game mod rebuild uses.
+            metadata.push(install.join("twilight-source.json"));
+            metadata.push(install.join("build-cache").join("rebuild.txt"));
+        }
+        let warm = totk.filter(|_| self.totk.status.verification_error.is_none());
+        post_update::Plan::new(&self.root, games, managed, keep, metadata, warm.as_deref())
+    }
+
+    #[cfg(not(test))]
+    fn games_root(&self) -> Result<Option<PathBuf>> {
+        Ok(install::default_directory(protocol::GameId::Totk)?
+            .parent()
+            .map(Path::to_path_buf))
+    }
+
+    #[cfg(test)]
+    fn games_root(&self) -> Result<Option<PathBuf>> {
+        Ok(self.test_games.clone())
+    }
+
+    fn try_game_layout(&mut self) -> Result<()> {
+        if !self.games_idle() {
             return Ok(());
         }
         for game in [
@@ -10075,6 +10263,31 @@ mod tests {
             &token
         ));
         assert!(Settings::load(&h.right.root)?.play_lock.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_game_folders_are_removed_once_games_are_idle() -> Result<()> {
+        let mut h = Harness::new(None, None)?;
+        let games = h.left.root.join("Games");
+        let backup = games.join(format!(".twilight-sync-backup-{}", "c".repeat(32)));
+        fs::create_dir_all(backup.join("romfs"))?;
+        h.left.test_games = Some(games);
+        h.left.game_running = true;
+        h.left.try_post_update()?;
+        assert!(!h.left.post_updating && backup.exists());
+        h.left.game_running = false;
+        h.left.try_post_update()?;
+        assert!(h.left.post_updating && h.left.install_busy);
+        h.pump_until(|h| !h.left.post_updating)?;
+        assert!(!backup.exists() && !h.left.install_busy && !h.left.post_update_due);
+        assert!(
+            h.left
+                .message
+                .starts_with("Removed 1 superseded game folder"),
+            "{}",
+            h.left.message
+        );
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use crate::{
     source_build,
 };
 use anyhow::{Context, Result, ensure};
-pub(crate) use backup::SourceBackup;
+pub(crate) use backup::{SourceBackup, mentions_backup, regular_metadata, source_version, within};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -152,7 +152,7 @@ fn rebuild_command(bytes: &[u8], from: &Path, destination: &Path) -> Result<Vec<
     Ok((args.join("\n") + "\n").into_bytes())
 }
 
-fn metadata_paths(root: &Path) -> [PathBuf; 4] {
+pub(crate) fn metadata_paths(root: &Path) -> [PathBuf; 4] {
     [
         root.join("settings.json"),
         root.join("source-builds.json"),

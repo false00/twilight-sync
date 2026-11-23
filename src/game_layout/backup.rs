@@ -15,10 +15,28 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) fn mentions_backup(bytes: &[u8], name: &str) -> bool {
+pub(crate) fn mentions_backup(bytes: &[u8], name: &str) -> bool {
     bytes
         .windows(name.len())
         .any(|window| window.eq_ignore_ascii_case(name.as_bytes()))
+}
+
+/// "<prefix><tag>-<12 hex commit>-<6 random>": the version folders and workspaces source builds create.
+pub(crate) fn source_version(name: &str, prefix: &str) -> bool {
+    let Some((revision, suffix)) = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.rsplit_once('-'))
+    else {
+        return false;
+    };
+    let Some((tag, commit)) = revision.rsplit_once('-') else {
+        return false;
+    };
+    source_build::valid_tag(tag)
+        && commit.len() == 12
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && suffix.len() == 6
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 pub(crate) struct SourceBackup {
@@ -38,21 +56,10 @@ impl SourceBackup {
         ensure_safe_path(managed)?;
         for entry in fs::read_dir(managed)? {
             let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str().and_then(|name| name.strip_prefix("source-")) else {
-                continue;
-            };
-            let Some((revision, suffix)) = name.rsplit_once('-') else {
-                continue;
-            };
-            let Some((tag, commit)) = revision.rsplit_once('-') else {
-                continue;
-            };
-            if !source_build::valid_tag(tag)
-                || commit.len() != 12
-                || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || suffix.len() != 6
-                || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| source_version(name, "source-"))
             {
                 continue;
             }
@@ -508,7 +515,7 @@ impl SourceBackup {
     }
 }
 
-fn within(path: &Path, base: &Path) -> bool {
+pub(crate) fn within(path: &Path, base: &Path) -> bool {
     #[cfg(windows)]
     {
         let mut path = path.components();
@@ -554,7 +561,7 @@ fn collect_references(
     }
 }
 
-fn regular_metadata(path: &Path) -> Result<Option<Metadata>> {
+pub(crate) fn regular_metadata(path: &Path) -> Result<Option<Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {

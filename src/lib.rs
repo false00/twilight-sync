@@ -10,6 +10,7 @@ pub mod install;
 pub mod lan;
 pub(crate) mod native;
 pub mod play;
+pub(crate) mod post_update;
 #[cfg(windows)]
 pub(crate) mod power;
 #[cfg(windows)]

@@ -127,7 +127,8 @@ own games and keys with your own trusted paired PC.
 
 Managed games use stable `Games\Dusklight`, `Games\TotKRecomp`, and `Games\Triforce`
 folders. Existing managed version folders migrate when games, reservations and
-transfers are idle; previous containers are retained for recovery. Custom
+transfers are idle. The previous container, superseded versions and old build
+workspaces are then removed rather than kept as backups. Custom
 installations and occupied unmanaged destinations are never overwritten.
 **Game setup** shows the recorded installed version, whether a candidate is newer
 or older, and source-to-source comparison links when both revisions are known.
@@ -187,11 +188,12 @@ This is not a sandbox. Use a separate VM for code you do not trust.
 
 Native builds need at least **64 GiB free**, plus room for copied local data;
 the complete process can take an hour or more. Temporary workspaces are cleaned
-up after the build. TotK keeps the setup it needs for in-game mod rebuilds,
-and verified source updates trim the previous managed build's replaced program,
-regenerable caches and duplicate game data without deleting saves, mods or
-selected inputs. Shader preparation may open a window, but normal gameplay
-does not start as part of the build.
+up after the build, and TotK keeps the setup it needs for in-game mod rebuilds.
+Saves, mods and settings are copied into the new build before it is selected.
+Once games are idle, the previous build, install backups and older workspaces
+are removed, and TotK's prepared shaders are warmed in the graphics driver's
+cache for the folder it now runs from. Shader preparation may open a window,
+but normal gameplay does not start as part of the build.
 
 Triforce builds include their required Vulkan/SDL and movie/audio dependencies.
 Optional graphics controls are separate from what the game needs to run.
