@@ -11,6 +11,8 @@ pub mod lan;
 pub(crate) mod native;
 pub mod play;
 #[cfg(windows)]
+pub(crate) mod power;
+#[cfg(windows)]
 pub(crate) mod process_job;
 pub mod protocol;
 pub mod raw_card;

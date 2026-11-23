@@ -933,6 +933,69 @@ pub fn verify_activation(
     Ok(())
 }
 
+pub(crate) fn prepare_activation(
+    built: &mut Built,
+    previous: Option<&Path>,
+    executable: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    games_stopped()?;
+    ensure!(
+        install::digest_file(&built.executable, built.executable.metadata()?.len())?
+            == built.sha256,
+        "The completed source-build executable changed before activation"
+    );
+    ensure!(
+        save_hash(built.game, &built.directory, Some(&built.executable))? == built.expected_save,
+        "The staged build's progress changed; it was not overwritten or selected"
+    );
+    let previous = previous
+        .map(Path::to_path_buf)
+        .unwrap_or(install::default_directory(built.game)?);
+    let latest = save_hash(built.game, &previous, executable)?;
+    if latest == built.expected_save {
+        return Ok(None);
+    }
+    ensure!(
+        latest.is_some(),
+        "Current progress is missing; the staged save was kept"
+    );
+    let backup = if built.game == GameId::Dusklight {
+        let default = save_location::default_profile()?;
+        let source = save_location::profile(&default, executable)?;
+        let target = save_location::profile(&default, Some(&built.executable))?;
+        let bytes = files::read_save(&save_location::discover(&source)?)?;
+        ensure!(
+            Some(files::sha256(&bytes)) == latest,
+            "Current progress changed before staging"
+        );
+        let path = save_location::discover(&target)?;
+        save_location::validate_at_path(&target, &path, &bytes)?;
+        files::write_save(&path, &bytes, built.expected_save.as_deref())?;
+        None
+    } else {
+        let game = native_game(built.game)?;
+        let save = game
+            .snapshot(&previous.join(game.profile_name()))?
+            .context("Current native-game progress is missing")?;
+        ensure!(
+            Some(save.hash) == latest,
+            "Current progress changed before staging"
+        );
+        game.apply(
+            &built.directory.join(game.profile_name()),
+            &save.bytes,
+            built.expected_save.as_deref(),
+        )?
+    };
+    ensure!(
+        save_hash(built.game, &previous, executable)? == latest
+            && save_hash(built.game, &built.directory, Some(&built.executable))? == latest,
+        "Progress changed while preparing activation; the existing installation stays selected"
+    );
+    built.expected_save = latest;
+    Ok(backup)
+}
+
 pub fn stage_configured(
     game: GameId,
     approved_commit: &str,
@@ -1140,6 +1203,9 @@ pub fn build(
     fs::create_dir(&output)?;
     let mut runner = Runner::new(&request.log, cancel, progress)?;
     let result: Result<(PathBuf, String, Option<String>)> = (|| {
+        #[cfg(windows)]
+        let _keep_awake = crate::power::KeepAwake::new()?;
+        runner.message("Preventing automatic system sleep during this build and shader preparation; the display can still turn off.")?;
         let mut tools = Toolset::new(root)?;
         let git = tools.ensure(
             Package::Git,
@@ -1182,6 +1248,15 @@ pub fn build(
         crate::self_update::validate_pe(&executable)
             .context("The source build did not produce the expected Windows x64 game")?;
         let mut runtime_libraries = Vec::new();
+        if game == GameId::Totk && request.preference.nvidia_dlss {
+            crate::totk_update::verify_dlss_runtime(&output, true)?;
+            let name = crate::totk_update::DLSS_DLL;
+            let path = output.join(name);
+            runtime_libraries.push((
+                name.to_owned(),
+                install::digest_file(&path, path.metadata()?.len())?,
+            ));
+        }
         if game == GameId::Triforce {
             for name in oot_runtime_libraries(request.plan.oot_project) {
                 let path = output.join(name);
@@ -1290,9 +1365,14 @@ pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
             && valid_hash(&label.sha256)
             && label.runtime_libraries.len() <= 3
             && label.runtime_libraries.iter().all(|(name, hash)| {
-                game == GameId::Triforce
-                    && oot_runtime_libraries(label.oot_project).contains(&name.as_str())
-                    && valid_hash(hash)
+                valid_hash(hash)
+                    && match game {
+                        GameId::Triforce => {
+                            oot_runtime_libraries(label.oot_project).contains(&name.as_str())
+                        }
+                        GameId::Totk => name == crate::totk_update::DLSS_DLL,
+                        GameId::Dusklight => false,
+                    }
             }),
         "Invalid source-build installation receipt"
     );
@@ -1451,6 +1531,61 @@ mod tests {
     }
 
     #[test]
+    fn completed_dusklight_build_uses_latest_portable_progress_without_changing_settings()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let previous = temp.path().join("previous");
+        let next = temp.path().join("next");
+        fs::create_dir_all(previous.join("data"))?;
+        fs::create_dir_all(&next)?;
+        let program = b"synthetic compiled game, never executed";
+        let old_exe = previous.join("dusklight.exe");
+        let new_exe = next.join("dusklight.exe");
+        fs::write(&old_exe, program)?;
+        fs::write(&new_exe, program)?;
+        fs::write(
+            previous.join("data_location.json"),
+            br#"{"version":1,"mode":"portable"}"#,
+        )?;
+        let settings = br#"{"game.enableTextureReplacements":true}"#;
+        fs::write(previous.join("data").join("config.json"), settings)?;
+        let original = save_location::tests::stock_save("GZ2E");
+        let path = save_location::path_for_identity(
+            &previous.join("data"),
+            &files::validate_save(&original)?,
+        )?;
+        fs::create_dir_all(path.parent().context("Missing portable save parent")?)?;
+        fs::write(&path, &original)?;
+        preserve_dusklight(&old_exe, &next)?;
+        let mut built = Built {
+            game: GameId::Dusklight,
+            executable: new_exe,
+            directory: next.clone(),
+            tag: "v2.0.3".into(),
+            commit: "a".repeat(40),
+            sha256: files::sha256(program),
+            source: None,
+            log: temp.path().join("build.log"),
+            expected_save: save_hash(GameId::Dusklight, &previous, Some(&old_exe))?,
+        };
+        let mut latest = original.clone();
+        latest[0x28] = 1;
+        fs::write(&path, &latest)?;
+        prepare_activation(&mut built, Some(&previous), Some(&old_exe))?;
+        verify_activation(&built, Some(&previous), Some(&old_exe))?;
+        let staged = save_location::discover(&next.join("data"))?;
+        assert_eq!(files::read_save(&staged)?, latest);
+        assert_eq!(files::read_save(&path)?, latest);
+        assert_eq!(fs::read(next.join("data").join("config.json"))?, settings);
+
+        fs::write(&staged, &original)?;
+        assert!(prepare_activation(&mut built, Some(&previous), Some(&old_exe)).is_err());
+        assert_eq!(files::read_save(&staged)?, original);
+        assert_eq!(files::read_save(&path)?, latest);
+        Ok(())
+    }
+
+    #[test]
     fn compiler_worker_limit_accounts_for_cpu_and_available_memory() {
         let gib = 1024_u64.pow(3);
         assert_eq!(compiler_jobs(16, 10 * gib), 8);
@@ -1474,6 +1609,32 @@ mod tests {
                 .get("jobs")
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn totk_source_receipts_recognize_owned_dlss_without_accepting_oot_libraries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let receipt = temp.path().join("twilight-source.json");
+        let mut label = serde_json::json!({
+            "version": 1, "game": GameId::Totk, "tag": "v0.5.0",
+            "commit": "a".repeat(40), "sha256": "b".repeat(64),
+            "runtime_libraries": [[crate::totk_update::DLSS_DLL, "c".repeat(64)]],
+        });
+        fs::write(&receipt, serde_json::to_vec(&label)?)?;
+        assert_eq!(
+            selected_revision(&receipt, GameId::Totk)?
+                .runtime_libraries
+                .len(),
+            1
+        );
+        label["game"] = serde_json::json!(GameId::Triforce);
+        fs::write(&receipt, serde_json::to_vec(&label)?)?;
+        assert!(selected_revision(&receipt, GameId::Triforce).is_err());
+        label["game"] = serde_json::json!(GameId::Totk);
+        label["runtime_libraries"] = serde_json::json!([["triforce_vk.dll", "c".repeat(64)]]);
+        fs::write(&receipt, serde_json::to_vec(&label)?)?;
+        assert!(selected_revision(&receipt, GameId::Totk).is_err());
         Ok(())
     }
 
@@ -1595,7 +1756,7 @@ mod tests {
         assert_eq!(fs::read(previous.join("triforce_env.txt"))?, environment);
         let copied = fs::read_to_string(next.join("triforce_env.txt"))?;
         assert!(copied.contains("RX_VK_NOOPT=1") && copied.ends_with("RX_BACKEND=vulkan\n"));
-        let built = Built {
+        let mut built = Built {
             game: GameId::Triforce,
             executable,
             directory: next.clone(),
@@ -1613,6 +1774,22 @@ mod tests {
             crate::triforce::snapshot(&next.join("user"))?.map(|save| save.hash),
             expected
         );
+        prepare_activation(&mut built, Some(&previous), None)?;
+        verify_activation(&built, Some(&previous), None)?;
+        let latest = save_hash(GameId::Triforce, &previous, None)?;
+        assert_eq!(built.expected_save, latest);
+        assert_eq!(
+            save_hash(GameId::Triforce, &next, Some(&built.executable))?,
+            latest
+        );
+        crate::triforce::tests::seed(&next.join("user"), 9)?;
+        let changed = save_hash(GameId::Triforce, &next, Some(&built.executable))?;
+        assert!(prepare_activation(&mut built, Some(&previous), None).is_err());
+        assert_eq!(
+            save_hash(GameId::Triforce, &next, Some(&built.executable))?,
+            changed
+        );
+        assert_eq!(save_hash(GameId::Triforce, &previous, None)?, latest);
         Ok(())
     }
 

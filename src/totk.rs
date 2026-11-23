@@ -862,6 +862,26 @@ impl Channel {
         Ok(())
     }
 
+    pub(crate) fn require_compilation_idle(&mut self, peer: Option<&str>) -> Result<()> {
+        self.idle()?;
+        self.require_manager_restart_idle()?;
+        ensure!(
+            !self.status.pending
+                && self
+                    .session
+                    .lock
+                    .as_ref()
+                    .is_none_or(|lock| Some(lock.owner.as_str()) == peer)
+                && self
+                    .status
+                    .remote_lock
+                    .as_ref()
+                    .is_none_or(|lock| Some(lock.owner.as_str()) == peer),
+            "Finish local game reservations and incoming saves before compiling"
+        );
+        Ok(())
+    }
+
     pub(crate) fn switch_oot_installation(&mut self, directory: &Path) -> Result<()> {
         self.require_oot_switch_idle()?;
         ensure_safe_path(directory)?;

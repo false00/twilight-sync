@@ -269,6 +269,7 @@ export component MainWindow inherits Window {
     in property <bool> has-built;
     in property <bool> sdk-busy;
     in property <bool> source-ready;
+    in property <string> source-activation-blocker;
     in property <bool> source-consent;
     in property <bool> managed-tools;
     in property <bool> renodx;
@@ -708,7 +709,8 @@ export component MainWindow inherits Window {
                                     }
                                     ActionButton { text: "Open full log externally"; available: root.source-log != ""; subtle: true; clicked => { root.action(Action.open-log, 0); } }
                                 }
-                                if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
+                                if root.has-built && !root.source-busy && root.source-activation-blocker != "": Muted { text: root.source-activation-blocker; }
+                                if root.has-built: ActionButton { text: "Use completed build"; available: root.can-manage && root.source-activation-blocker == ""; clicked => { root.action(Action.use-built, 0); } }
                             }
                         }
                         if !root.preferences-valid: Surface {
@@ -732,6 +734,16 @@ export component MainWindow inherits Window {
                                 Muted { text: root.installed-path == "" ? "New games are installed in your Games folder." : root.installed-path; }
                                 if root.installed-executable != "": DetailBlock { title: "SELECTED EXECUTABLE"; text: root.installed-executable; }
                                 if root.installed-release != "": Muted { text: "Installed release: " + root.installed-release; }
+                                if root.selected-game == 1 && (!root.source-mode || root.setup-step == 2): SwitchRow {
+                                    title: "NVIDIA DLSS / DLAA support";
+                                    description: "Have TotK setup download NVIDIA's runtime (RTX GPUs only). Rendering modes stay in TotK's settings.";
+                                    checked: root.nvidia; available: root.can-manage;
+                                    toggled(value) => { root.toggle(Toggle.nvidia, value); }
+                                }
+                                if root.selected-game == 1 && (!root.source-mode || root.setup-step == 2): ActionButton {
+                                    text: "Review NVIDIA SDK terms"; subtle: true;
+                                    clicked => { root.action(Action.nvidia-terms, 0); }
+                                }
                             }
                         }
                         if root.selected-game == 2: HorizontalLayout {

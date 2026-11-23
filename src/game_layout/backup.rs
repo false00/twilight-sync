@@ -1,6 +1,13 @@
 use super::{metadata_paths, pending, read};
-use crate::{files::ensure_safe_path, install, protocol::GameId, source_build};
+use crate::{
+    files::{ensure_safe_path, valid_hash},
+    install,
+    protocol::GameId,
+    source_build,
+};
 use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
+use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
     fs::{self, File, Metadata, OpenOptions},
@@ -325,6 +332,18 @@ impl SourceBackup {
         if self.game == GameId::Triforce
             && revision.oot_project == source_build::OotProject::Longshot
         {
+            if wrapper.is_some() {
+                cleanup
+                    .remove_longshot_install_record(&self.directory, &revision.runtime_libraries)?;
+                cleanup.remove_prompt_outputs(&self.directory.join("prompts"))?;
+                for name in ["logs", "bug-reports"] {
+                    cleanup.preserve_missing(
+                        &self.directory.join(name),
+                        &self.destination.join(name),
+                        0,
+                    )?;
+                }
+            }
             // Upstream stores these generated files in cache/, or loose in older releases.
             let cache = self.directory.join("cache");
             let mut locations = vec![self.directory.as_path()];
@@ -346,6 +365,7 @@ impl SourceBackup {
                     "longshot_compute_variants.bin",
                     "longshot_pipeline_states.bin",
                     "longshot_pipeline_states_v1.bin",
+                    "longshot_pipeline_states_shipped.bin",
                     "longshot_prepared.bin",
                     "longshot_vk_pipelines.bin",
                     "longshot_vk_pipelines.stamp",
@@ -353,6 +373,7 @@ impl SourceBackup {
                     "mkw_vk_pipelines.bin",
                     "mkw_vk_pipelines.stamp",
                     "longshot_shaders.bin",
+                    "longshot_load_start.txt",
                 ] {
                     cleanup.remove_cache(&directory.join(name))?;
                 }
@@ -363,6 +384,19 @@ impl SourceBackup {
                         cleanup.remove_cache(&entry.path())?;
                     }
                 }
+            }
+            let prompts = cache.join("prompts");
+            if regular_metadata(&prompts)?.is_some_and(|m| m.is_dir()) {
+                for name in [
+                    "Common.blarc.key",
+                    "Common.blarc.zs",
+                    "Common.bntx.zs",
+                    "Common.key",
+                    "External.bfotf.zs",
+                ] {
+                    cleanup.remove_cache(&prompts.join(name))?;
+                }
+                cleanup.remove_empty_dir(&prompts)?;
             }
             cleanup.remove_empty_dir(&cache)?;
         }
@@ -558,6 +592,7 @@ fn open_for_comparison(path: &Path) -> Result<File> {
 
 struct Compactor {
     removed: usize,
+    preserved: usize,
     locked: usize,
     bytes: u64,
     visited: usize,
@@ -582,6 +617,7 @@ impl Compactor {
     fn new(protected: Vec<PathBuf>) -> Self {
         Self {
             removed: 0,
+            preserved: 0,
             locked: 0,
             bytes: 0,
             visited: 0,
@@ -595,6 +631,133 @@ impl Compactor {
 }
 
 impl Compactor {
+    fn remove_longshot_install_record(
+        &mut self,
+        directory: &Path,
+        libraries: &[(String, String)],
+    ) -> Result<()> {
+        #[derive(Deserialize)]
+        struct InstalledFile {
+            sha1: String,
+        }
+        let path = directory.join(".longshot_installed.json");
+        if !regular_metadata(&path)?.is_some_and(|m| m.is_file()) {
+            return Ok(());
+        }
+        let installed: HashMap<String, InstalledFile> = serde_json::from_slice(&read(&path)?)
+            .context("Reading Longshot's installation record")?;
+        ensure!(
+            installed.len() <= 4096,
+            "Longshot installation record exceeds its limit"
+        );
+        for name in source_build::oot_runtime_libraries(source_build::OotProject::Longshot) {
+            // Older source receipts did not record DLL hashes; never override a newer SHA-256 receipt.
+            if libraries.iter().any(|(recorded, _)| recorded == name) {
+                continue;
+            }
+            let Some(record) = installed.get(name) else {
+                continue;
+            };
+            ensure!(
+                record.sha1.len() == 40 && record.sha1.bytes().all(|b| b.is_ascii_hexdigit()),
+                "Invalid Longshot installed file hash: {name}"
+            );
+            let file = directory.join(name);
+            if overlaps_any(&file, &self.protected)
+                || !regular_metadata(&file)?.is_some_and(|m| m.is_file())
+            {
+                continue;
+            }
+            ensure_safe_path(&file)?;
+            let mut locked = open_for_comparison(&file)?;
+            let size = locked.metadata()?.len();
+            let mut hash = Sha1::new();
+            loop {
+                let count = locked.read(&mut self.old_buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&self.old_buffer[..count]);
+            }
+            if hex::encode(hash.finalize()).eq_ignore_ascii_case(&record.sha1) {
+                self.remove(&file, size)?;
+            }
+        }
+        self.remove_cache(&path)
+    }
+
+    fn remove_prompt_outputs(&mut self, directory: &Path) -> Result<()> {
+        #[derive(Deserialize)]
+        struct PromptRecord {
+            outputs: HashMap<PathBuf, Option<(u64, String)>>,
+        }
+        let key = directory.join(".prompt_key");
+        if !regular_metadata(&key)?.is_some_and(|m| m.is_file()) {
+            return Ok(());
+        }
+        let record: PromptRecord = serde_json::from_slice(&read(&key)?)
+            .context("Reading Longshot's generated prompt record")?;
+        ensure!(
+            record.outputs.len() <= 4096,
+            "Longshot prompt record exceeds its limit"
+        );
+        for (relative, output) in record.outputs {
+            ensure!(
+                !relative.as_os_str().is_empty()
+                    && relative
+                        .components()
+                        .all(|part| { matches!(part, std::path::Component::Normal(_)) }),
+                "Unsafe generated prompt path: {}",
+                relative.display()
+            );
+            if let Some((size, hash)) = output {
+                ensure!(valid_hash(&hash), "Invalid generated prompt hash");
+                let path = directory.join(relative);
+                if let Some((_lock, size)) = self.verify(&path, &hash, Some(size))? {
+                    self.remove(&path, size)?;
+                }
+            }
+        }
+        self.remove_cache(&key)
+    }
+
+    fn preserve_missing(&mut self, old: &Path, new: &Path, depth: usize) -> Result<()> {
+        if self.protected.iter().any(|path| within(old, path)) {
+            return Ok(());
+        }
+        self.visited += 1;
+        ensure!(
+            depth <= 32 && self.visited <= 500_000,
+            "Old diagnostics exceed the cleanup scan limit"
+        );
+        let Some(metadata) = regular_metadata(old)? else {
+            return Ok(());
+        };
+        ensure_safe_path(old)?;
+        ensure_safe_path(new)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(old)? {
+                let entry = entry?;
+                self.preserve_missing(&entry.path(), &new.join(entry.file_name()), depth + 1)?;
+            }
+        } else if metadata.is_file() && !new.try_exists()? {
+            let parent = new.parent().context("Missing diagnostic destination")?;
+            fs::create_dir_all(parent)?;
+            let mut previous = open_for_comparison(old)?;
+            let mut copy = tempfile::NamedTempFile::new_in(parent)?;
+            ensure!(
+                std::io::copy(&mut previous, &mut copy)? == metadata.len(),
+                "Old diagnostic changed during preservation: {}",
+                old.display()
+            );
+            copy.as_file().sync_all()?;
+            copy.persist_noclobber(new)
+                .with_context(|| format!("Preserving old diagnostics at {}", new.display()))?;
+            self.preserved += 1;
+        }
+        Ok(())
+    }
+
     fn verify(
         &self,
         path: &Path,
@@ -785,6 +948,14 @@ impl Compactor {
     }
 
     fn summary(&self, previous: &Path) -> String {
+        let preserved = if self.preserved > 0 {
+            format!(
+                " Preserved {} missing diagnostic files in the replacement.",
+                self.preserved
+            )
+        } else {
+            String::new()
+        };
         let residual = if previous.is_dir() {
             format!(
                 " Remaining data and unrecognized files were kept at {}.",
@@ -794,7 +965,7 @@ impl Compactor {
             String::new()
         };
         format!(
-            "Removed {} old program, cache, or duplicate data files ({:.2} GiB by file size).{residual}",
+            "Removed {} old program, cache, or duplicate data files ({:.2} GiB by file size).{preserved}{residual}",
             self.removed,
             self.bytes as f64 / (1024_u64.pow(3) as f64)
         )
@@ -960,6 +1131,239 @@ mod tests {
         )?;
         assert!(!old.parent().context("Missing old wrapper")?.exists());
         assert_eq!(fs::read(new.join("mods").join("local"))?, b"user mod");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_longshot_retirement_verifies_generated_assets_and_preserves_diagnostics() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let managed = root.join("Games").join("Longshot");
+        let old = managed
+            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+            .join("game");
+        let new = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+        fs::write(old.join("longshot_vk.dll"), b"old renderer")?;
+        fs::write(new.join("longshot_vk.dll"), b"new renderer")?;
+        fs::write(
+            old.join(".longshot_installed.json"),
+            serde_json::to_vec(&json!({
+                "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"old renderer"))}
+            }))?,
+        )?;
+        let new_record = serde_json::to_vec(&json!({
+            "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"new renderer"))}
+        }))?;
+        fs::write(new.join(".longshot_installed.json"), &new_record)?;
+        for directory in [&old, &new] {
+            fs::create_dir_all(directory.join("prompts"))?;
+            fs::create_dir_all(directory.join("cache").join("prompts"))?;
+            fs::create_dir_all(directory.join("logs"))?;
+            fs::create_dir_all(directory.join("bug-reports").join("pending"))?;
+            fs::create_dir_all(directory.join("user"))?;
+            fs::write(
+                directory.join("user").join("progress.sav"),
+                b"saved progress",
+            )?;
+        }
+        let prompt = old.join("prompts").join("External.bfotf");
+        fs::write(&prompt, b"generated old font")?;
+        fs::write(
+            new.join("prompts").join("External.bfotf"),
+            b"generated new font",
+        )?;
+        fs::write(
+            old.join("prompts").join("rsizetable.zs"),
+            b"generated table",
+        )?;
+        fs::write(
+            old.join("prompts").join(".prompt_key"),
+            serde_json::to_vec(&json!({"outputs": {
+                "External.bfotf": [18, sha256(b"generated old font")],
+                "rsizetable.zs": [15, sha256(b"generated table")]
+            }}))?,
+        )?;
+        fs::write(
+            new.join("prompts").join(".prompt_key"),
+            b"new prompt record",
+        )?;
+        fs::write(
+            old.join("longshot_pipeline_states_shipped.bin"),
+            b"old shipped cache",
+        )?;
+        fs::write(
+            new.join("longshot_pipeline_states_shipped.bin"),
+            b"new shipped cache",
+        )?;
+        fs::write(
+            old.join("cache").join("longshot_load_start.txt"),
+            b"old timings",
+        )?;
+        fs::write(
+            old.join("cache").join("prompts").join("Common.key"),
+            b"generated prompt cache",
+        )?;
+        fs::write(
+            old.join("logs").join("longshot_log.txt"),
+            b"old diagnostics",
+        )?;
+        fs::write(old.join("bug-reports").join("shown.txt"), b"")?;
+        fs::write(
+            old.join("bug-reports").join("pending").join("report.txt"),
+            b"pending report",
+        )?;
+        fs::write(old.join("custom.json"), b"unrecognized user data")?;
+        let cleanup =
+            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
+                .context("Expected a previous Longshot build")?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("Custom data must block cleanup")?;
+        assert!(format!("{error:#}").contains("custom.json"));
+        assert!(old_exe.is_file());
+        assert_eq!(fs::read(&prompt)?, b"generated old font");
+        assert_eq!(fs::read(new.join(".longshot_installed.json"))?, new_record);
+        fs::copy(old.join("custom.json"), new.join("custom.json"))?;
+
+        let new_log = new.join("logs").join("longshot_log.txt");
+        fs::write(&new_log, b"new diagnostics")?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("Existing diagnostics must not be overwritten")?;
+        assert!(format!("{error:#}").contains("longshot_log.txt"));
+        assert_eq!(fs::read(&new_log)?, b"new diagnostics");
+        assert_eq!(
+            fs::read(old.join("logs").join("longshot_log.txt"))?,
+            b"old diagnostics"
+        );
+        assert!(old_exe.is_file());
+        fs::write(&new_log, b"old diagnostics")?;
+
+        fs::write(&prompt, b"customized old font")?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("Modified prompt assets must be kept")?;
+        assert!(format!("{error:#}").contains("External.bfotf"));
+        assert!(old_exe.is_file());
+        fs::write(&prompt, b"generated old font")?;
+        let summary = cleanup.compact(root)?;
+        assert!(!old.parent().context("Missing old wrapper")?.exists());
+        assert!(summary.contains("Removed"));
+        assert_eq!(
+            fs::read(new.join("logs").join("longshot_log.txt"))?,
+            b"old diagnostics"
+        );
+        assert_eq!(
+            fs::read(new.join("bug-reports").join("pending").join("report.txt"))?,
+            b"pending report",
+        );
+        assert_eq!(
+            fs::read(new.join("user").join("progress.sav"))?,
+            b"saved progress"
+        );
+        assert_eq!(fs::read(new.join(".longshot_installed.json"))?, new_record);
+        assert_eq!(
+            fs::read(new.join("prompts").join("External.bfotf"))?,
+            b"generated new font"
+        );
+        assert_eq!(
+            fs::read(new.join("longshot_pipeline_states_shipped.bin"))?,
+            b"new shipped cache"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn longshot_install_records_do_not_override_receipts_or_references() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let managed = root.join("Games").join("Longshot");
+        let old = managed
+            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+            .join("game");
+        let new = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+        fs::write(old.join("longshot_vk.dll"), b"modified renderer")?;
+        fs::write(new.join("longshot_vk.dll"), b"replacement renderer")?;
+        let receipt = old.join("twilight-source.json");
+        let mut label: serde_json::Value = serde_json::from_slice(&fs::read(&receipt)?)?;
+        label["runtime_libraries"] = json!([["longshot_vk.dll", sha256(b"verified renderer")]]);
+        fs::write(&receipt, serde_json::to_vec(&label)?)?;
+        let record = old.join(".longshot_installed.json");
+        fs::write(
+            &record,
+            serde_json::to_vec(&json!({
+                "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"modified renderer"))}
+            }))?,
+        )?;
+        let cleanup =
+            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
+                .context("Expected a previous Longshot build")?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("The SHA-256 receipt must take priority")?;
+        assert!(format!("{error:#}").contains("longshot_vk.dll"));
+        assert!(old_exe.is_file());
+        assert_eq!(fs::read(old.join("longshot_vk.dll"))?, b"modified renderer");
+
+        fs::write(old.join("longshot_vk.dll"), b"verified renderer")?;
+        fs::write(
+            root.join("source-builds.json"),
+            serde_json::to_vec(&json!({"triforce": {"game_input": record}}))?,
+        )?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("Referenced metadata must be kept")?;
+        assert!(format!("{error:#}").contains("still referenced"));
+        assert!(old_exe.is_file());
+        assert!(record.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn longshot_prompt_records_cannot_authorize_cleanup_outside_prompts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let managed = root.join("Games").join("Longshot");
+        let old = managed
+            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+            .join("game");
+        let new = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+        fs::write(old.join("progress.sav"), b"unique progress")?;
+        fs::create_dir(old.join("prompts"))?;
+        fs::write(
+            old.join("prompts").join(".prompt_key"),
+            serde_json::to_vec(&json!({"outputs": {
+                "../progress.sav": [15, sha256(b"unique progress")]
+            }}))?,
+        )?;
+        let cleanup =
+            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
+                .context("Expected a previous Longshot build")?;
+        let error = cleanup
+            .compact(root)
+            .err()
+            .context("Prompt paths must not escape their directory")?;
+        assert!(format!("{error:#}").contains("Unsafe generated prompt path"));
+        assert!(old_exe.is_file());
+        assert_eq!(fs::read(old.join("progress.sav"))?, b"unique progress");
         Ok(())
     }
 

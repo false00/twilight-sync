@@ -67,6 +67,48 @@ fn fixture() -> Result<MainWindow> {
 }
 
 #[test]
+fn totk_dlss_support_is_available_for_official_and_source_setup_and_routes_consent() -> Result<()> {
+    let ui = fixture()?;
+    ui.set_selected_game(1);
+    ui.set_section(1);
+    let toggles = Rc::new(RefCell::new(Vec::new()));
+    let recorded = toggles.clone();
+    ui.on_toggle(move |toggle, value| recorded.borrow_mut().push((toggle, value)));
+    for source in [false, true] {
+        ui.set_source_mode(source);
+        ui.set_setup_step(2);
+        flush();
+        let mut matches = ElementHandle::find_by_accessible_label(
+            &ui,
+            "NVIDIA DLSS / DLAA support",
+        )
+        .filter(|element| {
+            element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Checkbox)
+        });
+        let toggle = matches
+            .next()
+            .context("TotK DLSS opt-in must be visible for both setup paths")?;
+        assert!(matches.next().is_none());
+        toggle.invoke_accessible_default_action();
+        flush();
+        assert_eq!(toggles.borrow().last(), Some(&(Toggle::Nvidia, true)));
+        button(&ui, "Review NVIDIA SDK terms")?;
+    }
+    ui.set_can_manage(false);
+    flush();
+    let count = toggles.borrow().len();
+    ElementHandle::find_by_accessible_label(&ui, "NVIDIA DLSS / DLAA support")
+        .find(|element| {
+            element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Checkbox)
+        })
+        .context("Missing disabled TotK DLSS control")?
+        .invoke_accessible_default_action();
+    flush();
+    assert_eq!(toggles.borrow().len(), count);
+    Ok(())
+}
+
+#[test]
 fn oot_project_controls_fit_beside_play_and_select_the_project_in_setup() -> Result<()> {
     let ui = fixture()?;
     ui.set_selected_game(2);

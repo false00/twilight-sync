@@ -654,6 +654,9 @@ fn totk_installer(context: &ContextData<'_>, request: &Request, jobs: usize) -> 
     if let Some(firmware) = &request.preference.firmware {
         command.arg("--firmware").arg(firmware);
     }
+    if request.preference.nvidia_dlss {
+        command.arg("--dlss");
+    }
     Ok(command)
 }
 
@@ -1312,7 +1315,7 @@ mod tests {
             output: &output,
             paths: Vec::new(),
         };
-        let request = Request {
+        let mut request = Request {
             plan: super::super::Plan {
                 game: GameId::Totk,
                 oot_project: super::super::OotProject::Triforce,
@@ -1384,6 +1387,10 @@ mod tests {
                     .any(|args| args == [flag.as_ref(), path.as_os_str()])
             );
         }
+        assert!(!args.contains(&std::ffi::OsStr::new("--dlss")));
+        request.preference.nvidia_dlss = true;
+        let command = totk_installer(&context, &request, 4)?;
+        assert!(command.get_args().any(|argument| argument == "--dlss"));
         assert!(!request.log.try_exists()?);
         Ok(())
     }

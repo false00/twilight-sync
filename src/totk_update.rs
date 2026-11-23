@@ -22,6 +22,8 @@ const MAX_ENTRIES: usize = 16_384;
 const MAX_EXPANDED: u64 = 2 * 1024 * 1024 * 1024;
 const STDOUT: &str = "twilight-update.jsonl";
 const STDERR: &str = "twilight-update-stderr.log";
+pub(crate) const DLSS_DLL: &str = "nvngx_dlss.dll";
+pub(crate) const DLSS_LICENSE: &str = "https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt";
 
 #[derive(Deserialize)]
 struct Installation {
@@ -58,6 +60,7 @@ pub struct SetupInputs {
     pub update: Option<PathBuf>,
     pub keys: Option<PathBuf>,
     pub firmware: Option<PathBuf>,
+    pub nvidia_dlss: bool,
 }
 
 impl From<&crate::source_build::Preference> for SetupInputs {
@@ -67,6 +70,7 @@ impl From<&crate::source_build::Preference> for SetupInputs {
             update: preference.update.clone(),
             keys: preference.keys.clone(),
             firmware: preference.firmware.clone(),
+            nvidia_dlss: preference.nvidia_dlss,
         }
     }
 }
@@ -246,6 +250,7 @@ fn setup_command(
     setup: &Path,
     destination: &Path,
     inputs: Option<&SetupInputs>,
+    dlss: bool,
 ) -> Result<Command> {
     let mut command = Command::new(setup.join("python").join("python.exe"));
     command
@@ -270,6 +275,9 @@ fn setup_command(
             command.arg("--firmware").arg(firmware);
         }
     }
+    if dlss {
+        command.arg("--dlss");
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -278,7 +286,22 @@ fn setup_command(
     Ok(command)
 }
 
+pub(crate) fn verify_dlss_runtime(destination: &Path, requested: bool) -> Result<()> {
+    if requested {
+        let path = destination.join(DLSS_DLL);
+        ensure_safe_path(&path)?;
+        crate::self_update::validate_pe(&path).with_context(|| {
+            format!(
+                "NVIDIA DLSS was requested, but TotK setup did not produce a valid Windows x64 {DLSS_DLL}. A supported NVIDIA RTX GPU and a successful SDK download are required. Retry setup or disable DLSS support."
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn run_setup(command: &mut Command) -> Result<ExitStatus> {
+    #[cfg(windows)]
+    let _keep_awake = crate::power::KeepAwake::new()?;
     #[cfg(windows)]
     let job = crate::process_job::Job::new(None, None)?;
     let mut child = command
@@ -418,7 +441,7 @@ pub fn install_or_update(root: &Path, destination: &Path, inputs: &SetupInputs) 
     } else {
         destination.to_path_buf()
     };
-    let mut command = setup_command(&setup, &target, fresh.then_some(inputs))?;
+    let mut command = setup_command(&setup, &target, fresh.then_some(inputs), inputs.nvidia_dlss)?;
     files::atomic_write(
         &pending_path,
         &serde_json::to_vec(&PendingInstall {
@@ -438,7 +461,9 @@ pub fn install_or_update(root: &Path, destination: &Path, inputs: &SetupInputs) 
                 if source.try_exists()? { crate::source_build::copy_tree(&source, &target.join(relative))?; }
             }
         }
-        verify_updated(&target, &expected_version, &before, &log)
+        let executable = verify_updated(&target, &expected_version, &before, &log)?;
+        verify_dlss_runtime(&target, inputs.nvidia_dlss)?;
+        Ok(executable)
     })()
     .with_context(|| {
         format!(
@@ -537,10 +562,66 @@ mod tests {
     }
 
     #[test]
+    fn dlss_opt_in_reaches_both_first_install_and_update_commands() -> Result<()> {
+        for fresh in [false, true] {
+            for enabled in [false, true] {
+                let temp = tempfile::tempdir()?;
+                let preference = crate::source_build::Preference {
+                    game_input: Some(temp.path().join("base.nsp")),
+                    update: Some(temp.path().join("update.nsp")),
+                    keys: Some(temp.path().join("prod.keys")),
+                    nvidia_dlss: enabled,
+                    ..Default::default()
+                };
+                let inputs = SetupInputs::from(&preference);
+                let command = setup_command(
+                    temp.path(),
+                    &temp.path().join("game"),
+                    fresh.then_some(&inputs),
+                    inputs.nvidia_dlss,
+                )?;
+                let args: Vec<_> = command.get_args().collect();
+                assert_eq!(
+                    args.iter().filter(|arg| **arg == "--dlss").count(),
+                    usize::from(enabled)
+                );
+                assert_eq!(args.contains(&std::ffi::OsStr::new("--base")), fresh);
+                assert_eq!(args.contains(&std::ffi::OsStr::new("--keys")), fresh);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_dlss_runtime_must_exist_and_be_windows_x64() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        verify_dlss_runtime(temp.path(), false)?;
+        let error = verify_dlss_runtime(temp.path(), true)
+            .err()
+            .context("A missing requested DLSS runtime must not be reported ready")?;
+        assert!(format!("{error:#}").contains(DLSS_DLL));
+        let path = temp.path().join(DLSS_DLL);
+        fs::write(&path, b"not a DLL")?;
+        assert!(verify_dlss_runtime(temp.path(), true).is_err());
+        let mut pe = vec![0; 90];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[60..64].copy_from_slice(&64_u32.to_le_bytes());
+        pe[64..68].copy_from_slice(b"PE\0\0");
+        pe[68..70].copy_from_slice(&0x8664_u16.to_le_bytes());
+        pe[88..90].copy_from_slice(&0x20b_u16.to_le_bytes());
+        fs::write(&path, &pe)?;
+        verify_dlss_runtime(temp.path(), true)?;
+        pe[68..70].copy_from_slice(&0x14c_u16.to_le_bytes());
+        fs::write(&path, pe)?;
+        assert!(verify_dlss_runtime(temp.path(), true).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn setup_targets_the_selected_folder_using_only_its_bundled_tools() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let destination = temp.path().join("selected game");
-        let command = setup_command(temp.path(), &destination, None)?;
+        let command = setup_command(temp.path(), &destination, None, false)?;
         assert_eq!(
             command.get_program(),
             temp.path().join("python").join("python.exe")
@@ -571,6 +652,7 @@ mod tests {
             update: Some(temp.path().join("update.nsp")),
             keys: Some(temp.path().join("prod.keys")),
             firmware: Some(temp.path().join("firmware")),
+            ..Default::default()
         };
         for path in [&inputs.base, &inputs.update, &inputs.keys]
             .into_iter()
@@ -589,7 +671,7 @@ mod tests {
         let target = fresh_target(&destination, &install::tests::totk_release_fixture()?, None)?;
         assert!(target.starts_with(&destination));
         assert!(!target.try_exists()?);
-        let command = setup_command(temp.path(), &target, Some(&inputs))?;
+        let command = setup_command(temp.path(), &target, Some(&inputs), false)?;
         let args: Vec<_> = command.get_args().collect();
         assert!(args.windows(2).any(|args| args == ["--lang", "en-US"]));
         for (flag, path) in [
@@ -747,7 +829,7 @@ mod tests {
         fs::create_dir(&unpack)?;
         let setup = unpack_setup(&archive, &unpack, &release)?;
         let destination = temp.path().join("game-not-created");
-        let status = setup_command(&setup, &destination, None)?
+        let status = setup_command(&setup, &destination, None, false)?
             .arg("--help")
             .status()?;
         ensure!(status.success(), "Official setup --help failed");

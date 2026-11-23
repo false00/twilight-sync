@@ -249,24 +249,39 @@ pub(super) fn app_update_blocker(snapshot: &Snapshot) -> Option<&'static str> {
 }
 
 pub(super) fn source_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+    source_operation_blocker(snapshot, false)
+}
+
+pub(super) fn source_activation_blocker(snapshot: &Snapshot) -> Option<&'static str> {
+    source_operation_blocker(snapshot, true)
+}
+
+fn source_operation_blocker(snapshot: &Snapshot, activation: bool) -> Option<&'static str> {
     let native = [&snapshot.totk, &snapshot.triforce];
+    let peer = snapshot
+        .settings
+        .peer
+        .as_ref()
+        .map(|peer| peer.public_key.as_str());
+    let blocks = |lock: &crate::config::PlayLock| activation || Some(lock.owner.as_str()) != peer;
     if snapshot.game_running
-        || snapshot.remote_game
-        || native
-            .iter()
-            .any(|state| state.running || state.remote_running)
+        || native.iter().any(|state| state.running)
+        || (activation && (snapshot.remote_game || native.iter().any(|state| state.remote_running)))
     {
-        Some(
-            "Close games on both PCs before building. Source review and tool preparation remain available.",
-        )
-    } else if snapshot.settings.play_lock.is_some() {
+        Some(if activation {
+            "Close games on both PCs before activating this build."
+        } else {
+            "Close games on this PC before building. Your paired PC can keep playing."
+        })
+    } else if snapshot.settings.play_lock.as_ref().is_some_and(blocks) {
         Some(
             "A Dusklight play reservation is held. Open Twilight Princess on Play and recover the completed session first.",
         )
-    } else if native
-        .iter()
-        .any(|state| state.lock.is_some() || state.remote_lock.is_some() || state.launch_pending)
-    {
+    } else if native.iter().any(|state| {
+        state.lock.as_ref().is_some_and(blocks)
+            || state.remote_lock.as_ref().is_some_and(blocks)
+            || state.launch_pending
+    }) {
         Some(
             "A native-game play reservation is held. Recover the completed session on Play before changing its installation.",
         )
@@ -811,6 +826,36 @@ mod tests {
         let snapshot = backend.snapshot()?;
         backend.command(crate::runtime::Command::Shutdown)?;
         Ok(snapshot)
+    }
+
+    #[test]
+    fn paired_play_allows_source_compilation_but_local_reservations_still_block_it() -> Result<()> {
+        let mut snapshot = snapshot()?;
+        let peer = "c".repeat(64);
+        snapshot.settings.peer = Some(crate::config::Peer {
+            public_key: peer.clone(),
+            name: "Paired PC".into(),
+        });
+        let lock = crate::config::PlayLock {
+            owner: peer,
+            token: "a".repeat(64),
+        };
+        snapshot.remote_game = true;
+        snapshot.settings.play_lock = Some(lock.clone());
+        for state in [&mut snapshot.totk, &mut snapshot.triforce] {
+            state.remote_running = true;
+            state.lock = Some(lock.clone());
+            state.remote_lock = Some(lock.clone());
+        }
+        assert!(source_blocker(&snapshot).is_none());
+        assert!(source_activation_blocker(&snapshot).is_some());
+        assert!(configuration_available(&snapshot));
+        snapshot.triforce.lock = Some(crate::config::PlayLock {
+            owner: snapshot.public_key.clone(),
+            token: "b".repeat(64),
+        });
+        assert!(source_blocker(&snapshot).is_some());
+        Ok(())
     }
 
     #[test]

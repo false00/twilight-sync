@@ -586,7 +586,18 @@ alternative. Existing custom install folders are respected; updates do not move 
   Unknown rebuild-command formats stop relocation before any folder is moved.
   Existing profile/mods/fonts/settings are copied and saves verified before the
   new executable is selected. Unmanaged previous files are not overwritten.
-  No game assets, console keys or optional DLSS library are downloaded by this flow.
+  No game assets or console keys are downloaded by this flow. The separate
+  **NVIDIA DLSS / DLAA support** option in TotK's Game setup applies to both
+  official setup and source builds (in the Build review step). It is off by
+  default and requires explicit
+  NVIDIA SDK license acceptance. When enabled, setup receives `--dlss` and
+  downloads the pinned, SHA-256-verified `nvngx_dlss.dll` beside `totk.exe` on
+  supported Windows NVIDIA RTX systems. A missing or invalid requested runtime
+  is reported as a setup error, not silently treated as enabled DLSS.
+  Rendering modes, `dlaa`, `dlss_preset` and `fxaa` remain TotK settings; the
+  manager does not rewrite them. The OOT NVIDIA option is independent.
+  A TotK log reporting that `fxaa = 0` found no FXAA draw indicates an upstream
+  shader-recognition issue; installing the DLSS runtime alone does not fix it.
 - TotK play, incoming saves and automatic synchronization pause while rebuilding;
   the partner receives an unavailable game state. A normal successful setup exit,
   its final success event, the resulting executable and the exact installed
@@ -738,7 +749,14 @@ The flow:
    on CPU and available RAM; the source compiler worker limit does not affect
    this phase. The advanced graphics option to skip preparation defers the work
    to the game.
-6. Play, incoming replacement and automatic sync are paused during compilation.
+6. Local play, incoming replacement and automatic sync are paused during compilation.
+   The paired PC may already be playing or start playing while this PC builds;
+   its play reservations remain intact. If it is still playing when compilation
+   finishes, the completed build waits for activation rather than reporting a
+   build failure. After both PCs are idle and saves are synced, choose
+   **Use completed build**. It preserves the latest local progress only if the
+   staged copy is unchanged; separately played or modified staged saves are never
+   overwritten. Activation and old-file cleanup still require both PCs to be idle.
    Windows jobs own build process trees so cancellation or manager termination
    stops those helpers. This is lifecycle control, **not isolation from malicious
    scripts**. Copies, downloads or archive verification may take time to finish
@@ -760,6 +778,11 @@ The flow:
    For a verified version folder, cleanup checks the entire old install first.
    It removes the folder only when every file is an owned program file, a known
    regenerable cache, or already present in the replacement byte for byte.
+   Longshot's generated installation record and prompt-output hashes identify
+   version-specific build artifacts; older receipts without DLL hashes use the
+   upstream installation record for those DLLs only. Newer SHA-256 receipts
+   always take priority. Missing old logs and bug reports are copied into the
+   replacement without overwriting existing diagnostics.
    A different save, setting, mod, unexpected file, or reference into the old
    install blocks retirement and reports the path to resolve. The new build
    stays selected. A new source build will not start while an extra managed
@@ -773,6 +796,10 @@ The flow:
    This command does not download, build, launch, or switch projects.
    Official Dusklight updates apply the same check to versioned releases using
    their install manifests; normal official TotK updates replace files in place.
+   Managed source builds and TotK setup compilation prevent Windows automatic
+   sleep, including shader and Vulkan pipeline preparation. The display can
+   still turn off. Normal sleep behavior is restored on completion, cancellation,
+   or failure; manual Sleep, lid-close actions and power settings are unchanged.
 8. **Game setup** shows recorded installed official/source versions. Source checks
    distinguish a newer release, downgrade, same revision, changed revision under
    the same tag, or unknown ordering. **Compare with installed source** opens the

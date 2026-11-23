@@ -502,13 +502,18 @@ impl Controller {
                     Toggle::Fsr => preference.amd_fsr4 = value,
                     Toggle::Shaders => preference.prepare_shaders = value,
                     Toggle::Nvidia => {
-                        if value
-                            && !self.confirm(
-                                "NVIDIA SDK terms",
-                                "Enable NVIDIA DLSS/frame generation and accept NVIDIA's SDK license for this build? Review https://developer.nvidia.com/rtx/sdk-license before accepting. Its SDK/runtime files will be downloaded.",
-                            ).await?
-                        {
-                            return Ok(());
+                        if value {
+                            let message = if self.game == GameId::Totk {
+                                format!(
+                                    "Enable NVIDIA DLSS/DLAA support for TotK setup and source builds and accept NVIDIA's SDK license? A supported NVIDIA RTX GPU is required; setup will download its runtime. Rendering modes stay in TotK's settings. Review {} before accepting.",
+                                    crate::totk_update::DLSS_LICENSE,
+                                )
+                            } else {
+                                "Enable NVIDIA DLSS/frame generation and accept NVIDIA's SDK license for this build? Review https://developer.nvidia.com/rtx/sdk-license before accepting. Its SDK/runtime files will be downloaded.".into()
+                            };
+                            if !self.confirm("NVIDIA SDK terms", &message).await? {
+                                return Ok(());
+                            }
                         }
                         preference.nvidia_dlss = value;
                     }
@@ -893,7 +898,11 @@ impl Controller {
                     .context("The prerequisite list changed; check again")?;
                 open_url(prerequisite.url)
             }
-            Action::NvidiaTerms => open_url("https://developer.nvidia.com/rtx/sdk-license"),
+            Action::NvidiaTerms => open_url(if self.game == GameId::Totk {
+                crate::totk_update::DLSS_LICENSE
+            } else {
+                "https://developer.nvidia.com/rtx/sdk-license"
+            }),
             Action::PrepareTools => {
                 if self.confirm(
                     "Prepare verified build tools",
@@ -1880,6 +1889,11 @@ impl Controller {
             .map(str::to_owned)
             .or(input_problem);
         ui.set_source_blocker(blocker.as_deref().unwrap_or_default().into());
+        ui.set_source_activation_blocker(
+            model::source_activation_blocker(snapshot)
+                .unwrap_or_default()
+                .into(),
+        );
         ui.set_source_ready(
             self.approved()
                 && plan.is_some()

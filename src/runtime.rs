@@ -1531,6 +1531,23 @@ impl Engine {
                         self.source.built = Some(built.clone());
                         self.source.completion =
                             Some(source_build::Completion::NeedsActivation(game));
+                        if self.peer_play_active() {
+                            self.source.error = None;
+                            self.source.message = format!(
+                                "{} built from commit {}. Waiting for the paired PC's play session to finish; the existing installation stays selected. Use completed build after both PCs are idle and saves are synced.",
+                                built.tag,
+                                &built.commit[..12],
+                            );
+                            self.message = self.source.message.clone();
+                            self.audit.record(
+                                "source-build-awaiting-peer",
+                                Some(&built.executable),
+                                Some(&built.sha256),
+                                None,
+                                &self.source.message,
+                            )?;
+                            return Ok(());
+                        }
                         match self.activate_source(&built) {
                             Ok(()) => {
                                 self.source.completion =
@@ -2176,6 +2193,63 @@ impl Engine {
         self.require_oot_switch_idle()
     }
 
+    fn require_source_compilation_idle(&mut self) -> Result<()> {
+        self.game_running = self.process.game_running();
+        ensure!(
+            !self.game_running,
+            "Close Dusklight on this PC before building"
+        );
+        ensure!(
+            self.no_transfer()
+                && self.launch_pending.is_none()
+                && self.child.is_none()
+                && self.pending_recovery.is_none()
+                && self.requested_recovery.is_none(),
+            "Finish local transfers, play sessions and recovery before building"
+        );
+        let peer = self
+            .settings
+            .peer
+            .as_ref()
+            .map(|peer| peer.public_key.clone());
+        let peer = peer.as_deref();
+        ensure!(
+            self.settings
+                .play_lock
+                .as_ref()
+                .is_none_or(|lock| Some(lock.owner.as_str()) == peer)
+                && self.remote.as_ref().is_none_or(|remote| {
+                    remote
+                        .lock
+                        .as_ref()
+                        .is_none_or(|lock| Some(lock.owner.as_str()) == peer)
+                }),
+            "Finish or recover this PC's play reservation before building"
+        );
+        self.totk.require_compilation_idle(peer)?;
+        self.triforce.require_compilation_idle(peer)
+    }
+
+    fn peer_play_active(&self) -> bool {
+        let peer = self
+            .settings
+            .peer
+            .as_ref()
+            .map(|peer| peer.public_key.as_str());
+        let peer_lock = |lock: &PlayLock| Some(lock.owner.as_str()) == peer;
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.game || remote.lock.as_ref().is_some_and(peer_lock))
+            || self.settings.play_lock.as_ref().is_some_and(peer_lock)
+            || [&self.totk.status, &self.triforce.status]
+                .iter()
+                .any(|state| {
+                    state.remote_running
+                        || state.lock.as_ref().is_some_and(peer_lock)
+                        || state.remote_lock.as_ref().is_some_and(peer_lock)
+                })
+    }
+
     fn require_oot_switch_idle(&mut self) -> Result<()> {
         self.game_running = self.process.game_running();
         self.require_idle()?;
@@ -2204,7 +2278,7 @@ impl Engine {
             "Finish the current management operation before continuing"
         );
         if building {
-            self.require_source_idle()?;
+            self.require_source_compilation_idle()?;
         }
         self.audit.record(
             "source-operation-approved",
@@ -2762,18 +2836,32 @@ impl Engine {
                 }
             }
             Command::ActivateSourceBuild(game) => {
-                let built = self
+                self.require_source_idle()?;
+                let mut built = self
                     .source
                     .built
                     .clone()
                     .filter(|built| built.game == game)
                     .context("There is no completed source build for this game")?;
+                let (previous, executable) = self.source_paths(game);
+                let backup = source_build::prepare_activation(
+                    &mut built,
+                    previous.as_deref(),
+                    executable.as_deref(),
+                )?;
+                self.source.built = Some(built.clone());
                 self.activate_source(&built)?;
                 self.source.completion = Some(source_build::Completion::Ready(game));
                 self.source.error = None;
                 self.source.message =
-                    "The completed source build is now selected; progress was verified unchanged."
+                    "The completed source build is now selected; current progress was preserved and verified."
                         .into();
+                if let Some(backup) = backup {
+                    self.source.message.push_str(&format!(
+                        " Previous staged progress was backed up at {}.",
+                        backup.display()
+                    ));
+                }
                 if self.compacting_backup {
                     self.message = self.source.message.clone();
                     self.note_backup_cleanup();
@@ -8022,6 +8110,80 @@ mod tests {
     }
 
     #[test]
+    fn paired_play_defers_source_activation_and_preserves_latest_progress() -> Result<()> {
+        let mut h = Harness::new(Some(variant(1)), None)?;
+        let game = protocol::GameId::Triforce;
+        let previous = h.left.root.join("previous-oot");
+        let next = h.left.root.join("next-oot");
+        for directory in [&previous, &next] {
+            crate::triforce::tests::seed(&directory.join("user"), 3)?;
+            fs::write(directory.join("Triforce.exe"), b"synthetic compiled game")?;
+            fs::write(directory.join("image.bin"), b"synthetic game data")?;
+            fs::create_dir(directory.join("romfs"))?;
+        }
+        h.left.triforce = totk::Channel::for_game(
+            h.left.root.join("triforce-transfers"),
+            Ok(previous.clone()),
+            crate::native::Game::Triforce,
+        );
+        h.left.triforce.refresh()?;
+        let expected = crate::triforce::snapshot(&previous.join("user"))?.map(|save| save.hash);
+        let before = h.left.current_hash()?;
+        h.left.begin_source_operation(game, true)?;
+        h.left.remote = Some(RemoteState {
+            hash: before.clone(),
+            save_ready: true,
+            game: true,
+            lock: None,
+        });
+        h.left.input(Input::SourceBuilt {
+            game,
+            result: Ok(source_build::Built {
+                game,
+                executable: next.join("Triforce.exe"),
+                directory: next.clone(),
+                tag: "v0.5.0".into(),
+                commit: "a".repeat(40),
+                sha256: files::sha256(b"synthetic compiled game"),
+                source: None,
+                log: h.left.root.join("build.log"),
+                expected_save: expected.clone(),
+            }),
+        })?;
+        assert_eq!(
+            h.left.source.completion,
+            Some(source_build::Completion::NeedsActivation(game))
+        );
+        assert!(h.left.source.error.is_none());
+        assert_eq!(h.left.triforce.executable()?, previous.join("Triforce.exe"));
+        assert!(h.left.command(Command::ActivateSourceBuild(game)).is_err());
+        assert_eq!(
+            crate::triforce::snapshot(&next.join("user"))?.map(|save| save.hash),
+            expected
+        );
+
+        h.left.remote = None;
+        crate::triforce::tests::seed(&previous.join("user"), 4)?;
+        let latest = crate::triforce::snapshot(&previous.join("user"))?.map(|save| save.hash);
+        h.left.command(Command::ActivateSourceBuild(game))?;
+        assert_eq!(
+            h.left.source.completion,
+            Some(source_build::Completion::Ready(game))
+        );
+        assert_eq!(h.left.triforce.executable()?, next.join("Triforce.exe"));
+        assert_eq!(
+            crate::triforce::snapshot(&next.join("user"))?.map(|save| save.hash),
+            latest
+        );
+        assert_eq!(
+            crate::triforce::snapshot(&previous.join("user"))?.map(|save| save.hash),
+            latest
+        );
+        assert_eq!(h.left.current_hash()?, before);
+        Ok(())
+    }
+
+    #[test]
     fn source_builds_advertise_idle_games_and_allow_the_paired_pc_to_reserve_play() -> Result<()> {
         for building in [
             protocol::GameId::Dusklight,
@@ -8106,6 +8268,23 @@ mod tests {
                 h.left.require_source_idle().is_err(),
                 "Activation ignored the paired play reservation"
             );
+            h.left.remote = Some(RemoteState {
+                hash: before.clone(),
+                save_ready: true,
+                game: true,
+                lock: h.left.settings.play_lock.clone(),
+            });
+            h.left.totk.status.remote_running = true;
+            h.left.triforce.status.remote_running = true;
+            h.left.begin_source_operation(building, true)?;
+            assert!(play::matches(
+                h.left.settings.play_lock.as_ref(),
+                &h.right.identity.public,
+                &token,
+            ));
+            assert!(h.left.totk.status.lock.is_some());
+            assert!(h.left.triforce.status.lock.is_some());
+            assert_eq!(h.left.current_hash()?, before);
         }
         Ok(())
     }
