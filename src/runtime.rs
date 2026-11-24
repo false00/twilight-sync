@@ -5973,6 +5973,7 @@ impl Engine {
                     .open(&log)
                     .with_context(|| format!("Opening cleanup log {}", log.display()))?;
                 let mut last_report: Option<Instant> = None;
+                let mut last_removing = None;
                 let mut checks = 0_u64;
                 let mut bytes = 0_u64;
                 let mut progress = |update: game_layout::CleanupProgress<'_>| {
@@ -5981,7 +5982,9 @@ impl Engine {
                     }
                     checks += u64::from(update.bytes == 0);
                     bytes += update.bytes;
-                    if last_report.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                    if last_report.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                        || last_removing != Some(update.removing)
+                    {
                         let stage = if update.removing {
                             "Deleting obsolete game files without comparing assets. The new game is selected; this folder finishes before cancellation."
                         } else {
@@ -6007,6 +6010,7 @@ impl Engine {
                             })
                             .context("Cleanup progress receiver stopped")?;
                         last_report = Some(Instant::now());
+                        last_removing = Some(update.removing);
                     }
                     Ok(())
                 };
@@ -10384,6 +10388,13 @@ mod tests {
                 protocol::GameId::Triforce,
                 directory.clone(),
                 move |_, progress| {
+                    if outcome == "finalizing" {
+                        progress(game_layout::CleanupProgress {
+                            path: &checked,
+                            bytes: 0,
+                            removing: false,
+                        })?;
+                    }
                     ready_tx.send(()).context("Cleanup test receiver stopped")?;
                     continue_rx
                         .recv_timeout(Duration::from_secs(5))
@@ -10394,7 +10405,7 @@ mod tests {
                         removing: outcome == "finalizing",
                     })?;
                     if outcome == "failed" {
-                        bail!("An old save differs; keep it");
+                        bail!("Previous save backup could not be verified");
                     }
                     Ok("Old-file cleanup completed.".into())
                 },
@@ -10432,7 +10443,7 @@ mod tests {
                             .err()
                             .context("Cleanup failure was hidden")?
                             .to_string()
-                            .contains("An old save differs")
+                            .contains("save backup")
                     );
                 } else {
                     result?;
@@ -10441,6 +10452,12 @@ mod tests {
             assert!(!h.left.install_busy && !h.left.source.busy);
             assert_eq!(h.left.triforce.status.executable.as_ref(), Some(&selected));
             assert!(selected.is_file());
+            if outcome == "finalizing" {
+                assert!(
+                    h.left.source.progress.report.stage.starts_with("Deleting"),
+                    "The deletion phase was hidden by progress throttling"
+                );
+            }
             assert_eq!(
                 game_layout::retained_cleanup(&h.left.root)?.contains(&directory),
                 matches!(outcome, "cancelled" | "failed")

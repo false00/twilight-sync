@@ -642,7 +642,7 @@ fn copy_saved_path(
     let mut copy = tempfile::NamedTempFile::new_in(parent)?;
     let mut hash = Sha256::new();
     let mut copied = 0;
-    let mut buffer = [0; 64 * 1024];
+    let mut buffer = vec![0; 64 * 1024];
     loop {
         let count = previous.read(&mut buffer)?;
         if count == 0 {
@@ -1016,6 +1016,28 @@ mod tests {
             "A partially removed old version must be resumable"
         );
         assert!(active_exe.is_file() && newer_exe.is_file() && triforce_exe.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn save_backup_preserves_files_at_the_supported_nesting_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let install = root.join("old-install");
+        let mut folder = install.join("user");
+        for _ in 0..31 {
+            folder.push("s");
+        }
+        fs::create_dir_all(&folder)?;
+        let save = folder.join("progress.sav");
+        fs::write(&save, b"nested saved progress")?;
+        let backup = preserve_retired_saves(root, &install, &[], &mut |_| Ok(()))?
+            .context("Missing nested save backup")?;
+        assert_eq!(
+            fs::read(backup.join(save.strip_prefix(&install)?))?,
+            b"nested saved progress"
+        );
+        assert!(save.is_file());
         Ok(())
     }
 
