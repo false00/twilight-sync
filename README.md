@@ -194,6 +194,8 @@ Once games are idle, the previous build, install backups and older workspaces
 are removed, and TotK's prepared shaders are warmed in the graphics driver's
 cache for the folder it now runs from. Shader preparation may open a window,
 but normal gameplay does not start as part of the build.
+Newer builds awaiting activation and their mod-rebuild workspaces are kept,
+including after restarting Twilight Sync.
 
 Triforce builds include their required Vulkan/SDL and movie/audio dependencies.
 Optional graphics controls are separate from what the game needs to run.

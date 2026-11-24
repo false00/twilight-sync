@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const WARMED: &str = "totk-shaders.json";
@@ -50,7 +50,7 @@ enum State {
     Stopped,
 }
 
-/// A managed game folder and the install in it a game uses. Versions beside an unknown install stay.
+/// A managed game folder and the program a game runs from it. Versions beside an unknown program stay.
 pub(crate) struct Managed {
     pub folder: PathBuf,
     pub active: Option<PathBuf>,
@@ -382,10 +382,11 @@ fn attempt(
     waited
 }
 
-/// Folders Twilight Sync made that no game uses: install backups in `games`, version folders beside a
-/// known active install, and build workspaces. A folder holding an active install or a path in `keep`
-/// stays, and so does one that a settings file names: those backups are returned second. Nothing is
-/// planned while a folder move can still need its folders.
+/// Folders Twilight Sync made that no game uses: install backups in `games`, version folders built before
+/// a known active program beside it, and build workspaces. A folder holding an active install or a path
+/// in `keep` stays, and so does one that a settings file names: those backups are returned second. A
+/// newer version folder awaits activation, so it stays with the workspace its rebuild command uses.
+/// Nothing is planned while a folder move can still need its folders.
 fn superseded(
     root: &Path,
     games: &Path,
@@ -396,8 +397,48 @@ fn superseded(
     if game_layout::pending(root)? {
         return Ok((Vec::new(), Vec::new()));
     }
+    let kept: Vec<&Path> = keep
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(
+            managed
+                .iter()
+                .filter_map(|game| game.active.as_deref()?.parent()),
+        )
+        .collect();
+    let active = |path: &Path| kept.iter().any(|kept| within(kept, path));
+    let mut files: Vec<PathBuf> = game_layout::metadata_paths(root)
+        .into_iter()
+        .chain(metadata.iter().cloned())
+        .collect();
+    let mut versions = Vec::new();
+    for game in managed {
+        let selected = game.active.as_deref().map(created).transpose()?.flatten();
+        let file = game.active.as_deref().and_then(Path::file_name);
+        for path in folders(&game.folder)? {
+            if !name(&path).is_some_and(|name| source_version(name, "source-")) {
+                continue;
+            }
+            let install = path.join("game");
+            let older = match (selected, file) {
+                (Some(selected), Some(file)) => {
+                    let built = match created(&install.join(file))? {
+                        Some(time) => Some(time),
+                        None => created(&path)?,
+                    };
+                    built.is_some_and(|time| time <= selected)
+                }
+                _ => false,
+            };
+            if !older || active(&path) {
+                files.push(install.join("twilight-source.json"));
+                files.push(install.join("build-cache").join("rebuild.txt"));
+            }
+            versions.push((path, older));
+        }
+    }
     let mut settings = Vec::new();
-    for path in game_layout::metadata_paths(root).iter().chain(metadata) {
+    for path in &files {
         ensure_safe_path(path)?;
         if let Some(found) = regular_metadata(path)?.filter(|found| found.is_file()) {
             ensure!(
@@ -408,12 +449,6 @@ fn superseded(
             settings.push(fs::read(path)?);
         }
     }
-    let kept: Vec<&Path> = keep
-        .iter()
-        .map(PathBuf::as_path)
-        .chain(managed.iter().filter_map(|game| game.active.as_deref()))
-        .collect();
-    let active = |path: &Path| kept.iter().any(|kept| within(kept, path));
     let named = |path: &Path| {
         name(path).is_none_or(|name| settings.iter().any(|bytes| mentions_backup(bytes, name)))
     };
@@ -434,14 +469,9 @@ fn superseded(
             }
         }
     }
-    for game in managed.iter().filter(|game| game.active.is_some()) {
-        for path in folders(&game.folder)? {
-            if name(&path).is_some_and(|name| source_version(name, "source-"))
-                && !active(&path)
-                && !named(&path)
-            {
-                found.push(path);
-            }
+    for (path, older) in versions {
+        if older && !active(&path) && !named(&path) {
+            found.push(path);
         }
     }
     for game in folders(&root.join("source-builds"))? {
@@ -457,6 +487,21 @@ fn superseded(
     found.sort();
     referenced.sort();
     Ok((found, referenced))
+}
+
+// A file system without creation times keeps the folder.
+fn created(path: &Path) -> Result<Option<SystemTime>> {
+    ensure_safe_path(path)?;
+    let Some(found) = regular_metadata(path)? else {
+        return Ok(None);
+    };
+    match found.created() {
+        Ok(time) => Ok(Some(time)),
+        Err(error) if error.kind() == ErrorKind::Unsupported => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("Reading creation time for {}", path.display()))
+        }
+    }
 }
 
 fn identity(install: &Path) -> Result<Option<Warmed>> {
@@ -798,7 +843,7 @@ mod tests {
         let plan = |totk: &Path| {
             let managed = vec![Managed {
                 folder: folder.clone(),
-                active: Some(totk.to_path_buf()),
+                active: Some(totk.join("totk.exe")),
             }];
             Plan::new(
                 &root,
@@ -881,15 +926,20 @@ mod tests {
             totk.join("twilight-source.json"),
             serde_json::to_vec(&serde_json::json!({ "source": rebuild.join("source") }))?,
         )?;
+        fs::write(totk.join("totk.exe"), b"synthetic file, never executed")?;
+        fs::write(
+            longshot_install.join("longshot.exe"),
+            b"synthetic file, never executed",
+        )?;
         let managed = || {
             vec![
                 Managed {
                     folder: totk.clone(),
-                    active: Some(totk.clone()),
+                    active: Some(totk.join("totk.exe")),
                 },
                 Managed {
                     folder: longshot.clone(),
-                    active: Some(longshot_install.clone()),
+                    active: Some(longshot_install.join("longshot.exe")),
                 },
                 Managed {
                     folder: games.join("Triforce"),
@@ -975,6 +1025,97 @@ mod tests {
             &tools,
         ] {
             assert!(path.exists(), "{} was removed", path.display());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unactivated_builds_keep_their_install_and_rebuild_workspaces() -> Result<()> {
+        use std::os::windows::fs::FileTimesExt;
+
+        fn built_at(directory: &Path, seconds: u64) -> Result<()> {
+            install(directory)?;
+            File::options()
+                .write(true)
+                .open(directory.join("totk.exe"))?
+                .set_times(
+                    fs::FileTimes::new().set_created(UNIX_EPOCH + Duration::from_secs(seconds)),
+                )?;
+            Ok(())
+        }
+
+        for (known, keep_old) in [(true, false), (false, false), (true, true)] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("manager");
+            let games = temp.path().join("Games");
+            let totk = games.join("TotKRecomp");
+            let old = totk.join("source-v0.4.1-6151ac4fbc2c-3coTxn");
+            let pending = totk.join("source-v0.5.0-afae80c908ab-Nmmr7y");
+            let builds = root.join("source-builds").join("totk");
+            let old_workspace = builds.join("v0.4.1-6151ac4fbc2c-JmahnP");
+            let pending_workspace = builds.join("v0.5.0-afae80c908ab-0E98Qb");
+            let command_workspace = builds.join("v0.5.0-afae80c908ab-Q1w2E3");
+            built_at(&old.join("game"), 10)?;
+            built_at(&totk, 20)?;
+            built_at(&pending.join("game"), 30)?;
+            for (version, workspace) in [(&old, &old_workspace), (&pending, &pending_workspace)] {
+                fs::create_dir_all(workspace.join("source"))?;
+                fs::write(
+                    version.join("game").join("twilight-source.json"),
+                    serde_json::to_vec(&serde_json::json!({ "source": workspace.join("source") }))?,
+                )?;
+            }
+            fs::create_dir_all(&command_workspace)?;
+            fs::create_dir_all(pending.join("game").join("build-cache"))?;
+            fs::write(
+                pending.join("game").join("build-cache").join("rebuild.txt"),
+                format!("{}\n--rebuild\n", command_workspace.display()),
+            )?;
+            let plan = Plan::new(
+                &root,
+                games,
+                vec![Managed {
+                    folder: totk,
+                    active: known.then(|| {
+                        temp.path()
+                            .join("Games")
+                            .join("TotKRecomp")
+                            .join("totk.exe")
+                    }),
+                }],
+                if keep_old {
+                    vec![old.join("game")]
+                } else {
+                    Vec::new()
+                },
+                Vec::new(),
+                None,
+            )?;
+            if known && !keep_old {
+                let plan = plan.context("The older build and workspace were not found")?;
+                let mut expected = vec![old.clone(), old_workspace.clone()];
+                expected.sort();
+                assert_eq!(plan.remove, expected);
+                let outcome = run_with(
+                    &root,
+                    &plan,
+                    &temp.path().join("unused.log"),
+                    &mut |_| unreachable!("Nothing needed warming"),
+                    &mut || false,
+                )?;
+                assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+                assert!(!old.exists() && !old_workspace.exists());
+            } else {
+                assert!(
+                    plan.is_none(),
+                    "Unselected or explicitly kept builds were retired"
+                );
+                assert!(old.exists() && old_workspace.exists());
+            }
+            assert!(pending.exists());
+            assert!(pending_workspace.exists());
+            assert!(command_workspace.exists());
         }
         Ok(())
     }

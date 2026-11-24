@@ -817,10 +817,12 @@ The flow:
    skip them. Its output is in `build-logs\totk-shaders-*.log`, and
    `totk-shaders.json` records the folder, shader list and drivers it warmed.
    Nothing is kept as a backup: Twilight Sync then removes `.twilight-sync-backup-*`
-   folders, version folders beside a known active install, and build workspaces
-   other than the one the active TotK build's mod rebuild command uses. The
-   selected Triforce and Longshot installs and a completed build that awaits
-   activation stay. So does any folder still named by Twilight Sync's settings,
+   folders, version folders built before the active executable, and unused build
+   workspaces. The selected Triforce and Longshot installs and newer builds that
+   await activation stay, including after restarting Twilight Sync. Their
+   receipts and mod rebuild commands protect the workspaces they need, as the
+   active TotK build's do. Version folders whose age cannot be established are
+   kept. So is any folder still named by Twilight Sync's settings,
    Dusklight's `config.json` or `data_location.json`, or the TotK build's receipt
    or rebuild command; a backup kept that way is reported with the path. Nothing
    is removed while a folder move is unfinished.

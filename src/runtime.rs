@@ -5994,7 +5994,8 @@ impl Engine {
     fn post_update_plan(&self, games: PathBuf) -> Result<Option<post_update::Plan>> {
         use source_build::OotProject;
         let preferences = &self.source.preferences;
-        let launchable = |executable: Option<&Path>| executable.is_some_and(Path::is_file);
+        let program =
+            |path: Option<&Path>| path.filter(|path| path.is_file()).map(Path::to_path_buf);
         let project = self
             .triforce
             .status
@@ -6004,33 +6005,22 @@ impl Engine {
             .unwrap_or(preferences.triforce.oot_project);
         let oot = |wanted: OotProject| {
             if wanted == project {
-                return self
-                    .triforce
-                    .status
-                    .install_path
-                    .clone()
-                    .filter(|_| launchable(self.triforce.status.executable.as_deref()));
+                return program(self.triforce.status.executable.as_deref());
             }
             match wanted {
                 OotProject::Triforce => &preferences.triforce_install,
                 OotProject::Longshot => &preferences.longshot_install,
             }
-            .clone()
-            .filter(|install| install.join(wanted.executable()).is_file())
+            .as_ref()
+            .map(|install| install.join(wanted.executable()))
+            .filter(|path| path.is_file())
         };
         let (dusklight, _) = self.source_paths(protocol::GameId::Dusklight);
-        let totk = self
-            .totk
-            .status
-            .install_path
-            .clone()
-            .filter(|_| launchable(self.totk.status.executable.as_deref()));
+        let totk = program(self.totk.status.executable.as_deref());
         let managed = vec![
             post_update::Managed {
                 folder: games.join("Dusklight"),
-                active: dusklight
-                    .clone()
-                    .filter(|_| launchable(self.settings.game_exe.as_deref())),
+                active: program(self.settings.game_exe.as_deref()),
             },
             post_update::Managed {
                 folder: games.join("TotKRecomp"),
@@ -6065,7 +6055,12 @@ impl Engine {
             metadata.push(install.join("twilight-source.json"));
             metadata.push(install.join("build-cache").join("rebuild.txt"));
         }
-        let warm = totk.filter(|_| self.totk.status.verification_error.is_none());
+        let warm = self
+            .totk
+            .status
+            .install_path
+            .clone()
+            .filter(|_| totk.is_some() && self.totk.status.verification_error.is_none());
         post_update::Plan::new(&self.root, games, managed, keep, metadata, warm.as_deref())
     }
 
@@ -10272,19 +10267,26 @@ mod tests {
         let games = h.left.root.join("Games");
         let backup = games.join(format!(".twilight-sync-backup-{}", "c".repeat(32)));
         fs::create_dir_all(backup.join("romfs"))?;
+        let dusklight = games.join("Dusklight");
+        let old_version = dusklight.join("source-v2.0.3-0123456789ab-Q1w2E3");
+        fs::create_dir_all(old_version.join("game"))?;
+        let executable = dusklight.join("dusklight.exe");
+        fs::write(&executable, b"synthetic file, never executed")?;
+        h.left.settings.game_exe = Some(executable);
         h.left.test_games = Some(games);
         h.left.game_running = true;
         h.left.try_post_update()?;
-        assert!(!h.left.post_updating && backup.exists());
+        assert!(!h.left.post_updating && backup.exists() && old_version.exists());
         h.left.game_running = false;
         h.left.try_post_update()?;
         assert!(h.left.post_updating && h.left.install_busy);
         h.pump_until(|h| !h.left.post_updating)?;
         assert!(!backup.exists() && !h.left.install_busy && !h.left.post_update_due);
+        assert!(!old_version.exists());
         assert!(
             h.left
                 .message
-                .starts_with("Removed 1 superseded game folder"),
+                .starts_with("Removed 2 superseded game folders"),
             "{}",
             h.left.message
         );
