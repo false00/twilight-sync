@@ -37,6 +37,10 @@ use std::{
 use tempfile::{NamedTempFile, TempPath};
 use xxhash_rust::xxh3::Xxh3;
 
+const BACKUP_CLEANUP_WAIT: &str =
+    "Wait for cleanup of the previous game installation before playing or changing settings";
+const BACKUP_CLEANUP_CANCELLED: &str = "Old-file cleanup cancelled. The new game stays selected; remaining old files were kept. You can play now and retry cleanup later.";
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub settings: Settings,
@@ -1206,8 +1210,8 @@ impl Engine {
         );
         ensure!(
             !self.compacting_backup
-                || !matches!(&input, Input::Command(command) if !matches!(command, Command::Shutdown)),
-            "Wait for cleanup of the previous game installation before playing or changing settings"
+                || !matches!(&input, Input::Command(command) if !matches!(command, Command::Shutdown | Command::CancelSource)),
+            "{BACKUP_CLEANUP_WAIT}"
         );
         if matches!(
             &input,
@@ -1328,7 +1332,7 @@ impl Engine {
                     previous.as_deref(),
                     replacement.as_deref(),
                     false,
-                );
+                )?;
                 Ok(())
             }
             Input::DesktopShortcutCreated(result) => {
@@ -1426,7 +1430,7 @@ impl Engine {
                         previous.as_deref(),
                         Some(&updated.executable),
                         false,
-                    );
+                    )?;
                 }
                 Ok(())
             }
@@ -1612,9 +1616,19 @@ impl Engine {
                 );
                 self.compacting_backup = false;
                 self.install_busy = false;
+                self.source.busy = false;
+                self.source.progress.finish();
                 self.post_update_due = true;
+                if self.error.as_deref() == Some(BACKUP_CLEANUP_WAIT) {
+                    self.error = None;
+                }
                 let (event, detail, failed) = match result {
                     Ok(detail) => ("source-backup-cleanup", detail, false),
+                    Err(error) if source_build::is_cancelled(&error) => (
+                        "source-backup-cleanup-cancelled",
+                        BACKUP_CLEANUP_CANCELLED.into(),
+                        false,
+                    ),
                     Err(error) => (
                         "source-backup-cleanup-stopped",
                         format!(
@@ -2417,7 +2431,7 @@ impl Engine {
             executable.as_deref(),
             Some(&built.executable),
             true,
-        );
+        )?;
         Ok(())
     }
 
@@ -2443,18 +2457,16 @@ impl Engine {
         previous: Option<&Path>,
         replacement: Option<&Path>,
         source: bool,
-    ) {
+    ) -> Result<()> {
         let Some(replacement) = replacement else {
-            return;
+            return Ok(());
         };
         let managed = match game {
             protocol::GameId::Triforce => source_build::OotProject::from_executable(replacement)
                 .and_then(|project| project.directory()),
             _ => install::default_directory(game),
         };
-        let Ok(managed) = managed else {
-            return;
-        };
+        let managed = managed?;
         let metadata = if game == protocol::GameId::Dusklight {
             self.dusklight_metadata(replacement.parent())
         } else {
@@ -2471,32 +2483,39 @@ impl Engine {
             )
         });
         if source || backup.is_some() {
-            let directory = backup
-                .as_ref()
-                .map(|backup| backup.directory.clone())
-                .unwrap_or_else(|| managed.clone());
+            let directory = if source {
+                managed.clone()
+            } else {
+                backup
+                    .as_ref()
+                    .map(|backup| backup.directory.clone())
+                    .unwrap_or_else(|| managed.clone())
+            };
             let replacement = replacement.to_path_buf();
-            self.start_backup_cleanup(directory, move |root| {
+            self.start_backup_cleanup(game, directory, move |root, progress| {
                 let mut results = Vec::new();
                 if let Some(backup) = &backup {
                     if !source {
-                        return backup.compact(root);
+                        return backup.compact_with_progress(root, progress);
                     }
                     results.push(
                         backup
-                            .compact(root)
+                            .compact_with_progress(root, progress)
                             .with_context(|| format!("Retiring {}", backup.directory.display()))?,
                     );
                 }
                 if source {
-                    results.extend(game_layout::SourceBackup::compact_source_siblings(
-                        root,
-                        &managed,
-                        game,
-                        &replacement,
-                        backup.as_ref().map(|backup| backup.directory.as_path()),
-                        &metadata,
-                    )?);
+                    results.extend(
+                        game_layout::SourceBackup::compact_source_siblings_with_progress(
+                            root,
+                            &managed,
+                            game,
+                            &replacement,
+                            backup.as_ref().map(|backup| backup.directory.as_path()),
+                            &metadata,
+                            progress,
+                        )?,
+                    );
                     game_layout::SourceBackup::require_no_extra_source_versions(
                         &managed,
                         replacement.parent(),
@@ -2507,8 +2526,9 @@ impl Engine {
                 } else {
                     Ok(results.join(" "))
                 }
-            });
+            })?;
         }
+        Ok(())
     }
 
     fn native_command(&mut self, game: protocol::GameId, command: NativeCommand) -> Result<()> {
@@ -2946,7 +2966,7 @@ impl Engine {
                 }
                 self.message =
                     "Preparing cleanup for the currently selected source installation.".into();
-                self.cleanup_replaced_install(game, None, Some(&active), true);
+                self.cleanup_replaced_install(game, None, Some(&active), true)?;
                 ensure!(
                     self.compacting_backup,
                     "Could not locate the managed Games directory"
@@ -2957,10 +2977,14 @@ impl Engine {
                     self.source.busy
                         && self.source.log.is_some()
                         && self.source.sdk_setup.is_none(),
-                    "There is no cancellable source build or tool download"
+                    "There is no cancellable source build, cleanup, or tool download"
                 );
                 self.source_cancel.store(true, Ordering::Release);
-                self.source.message = "Cancellation requested. The current download, copy or verification may need to finish before cleanup; owned build processes will be stopped.".into();
+                self.source.message = if self.compacting_backup {
+                    "Stopping save preservation. The new game stays selected and remaining old files will be kept. If a folder is already being removed, it finishes first."
+                } else {
+                    "Cancellation requested. The current download, copy or verification may need to finish before cleanup; owned build processes will be stopped."
+                }.into();
             }
             Command::Native { game, command } => self.native_command(game, command)?,
             Command::DesktopError(detail) => bail!("{detail}"),
@@ -5894,29 +5918,110 @@ impl Engine {
         );
         self.send_state()?;
         if let Some(backup) = old_source {
-            self.start_backup_cleanup(backup.directory.clone(), move |root| backup.compact(root));
+            self.start_backup_cleanup(
+                migration.game,
+                backup.directory.clone(),
+                move |root, progress| backup.compact_with_progress(root, progress),
+            )?;
         }
         Ok(())
     }
 
     fn note_backup_cleanup(&mut self) {
         self.message
-            .push_str(" Checking the previous install for files that can be removed...");
+            .push_str(" Preserving previous saves, then deleting obsolete game files without comparing game assets. Cancel safely stops save preparation; a folder already being removed finishes first.");
         self.source.message = self.message.clone();
     }
 
     fn start_backup_cleanup(
         &mut self,
+        game: protocol::GameId,
         directory: PathBuf,
-        compact: impl FnOnce(&Path) -> Result<String> + Send + 'static,
-    ) {
+        compact: impl FnOnce(&Path, &mut game_layout::CleanupReporter<'_>) -> Result<String>
+        + Send
+        + 'static,
+    ) -> Result<()> {
+        let log = match &self.source.log {
+            Some(log) if self.source.game == Some(game) => log.clone(),
+            _ => source_build::new_log(&self.root, game)?,
+        };
+        ensure_safe_path(&log)?;
+        game_layout::retain_cleanup(&self.root, &directory, true)?;
         self.compacting_backup = true;
         self.install_busy = true;
+        self.source.busy = true;
+        self.source.building = false;
+        self.source.game = Some(game);
+        self.source.error = None;
+        self.source.log = Some(log.clone());
+        self.source.progress.start();
+        self.source
+            .progress
+            .apply(source_build::progress::Update::Stage(
+                "Preserving previous saves; the new game is already selected.".into(),
+            ));
+        self.source_cancel = Arc::new(AtomicBool::new(false));
         self.note_backup_cleanup();
         let root = self.root.clone();
         let sender = self.sender.clone();
+        let cancel = self.source_cancel.clone();
         thread::spawn(move || {
-            let result = compact(&root);
+            let result = (|| -> Result<String> {
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .with_context(|| format!("Opening cleanup log {}", log.display()))?;
+                let mut last_report: Option<Instant> = None;
+                let mut checks = 0_u64;
+                let mut bytes = 0_u64;
+                let mut progress = |update: game_layout::CleanupProgress<'_>| {
+                    if !update.removing && cancel.load(Ordering::Acquire) {
+                        return Err(source_build::Cancelled.into());
+                    }
+                    checks += u64::from(update.bytes == 0);
+                    bytes += update.bytes;
+                    if last_report.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                        let stage = if update.removing {
+                            "Deleting obsolete game files without comparing assets. The new game is selected; this folder finishes before cancellation."
+                        } else {
+                            "Preserving and verifying previous saves only. Game assets are not compared; the new game is selected."
+                        };
+                        let activity = format!(
+                            "{checks} filesystem checks; {:.2} GiB read\n{}",
+                            bytes as f64 / (1024_u64.pow(3) as f64),
+                            update.path.display()
+                        );
+                        writeln!(log, "\n{stage}\n{activity}")?;
+                        sender
+                            .send(Input::SourceProgress {
+                                game,
+                                update: source_build::progress::Update::Output(
+                                    source_build::progress::Report {
+                                        stage: stage.into(),
+                                        unmeasurable_progress: true,
+                                        activity,
+                                        ..Default::default()
+                                    },
+                                ),
+                            })
+                            .context("Cleanup progress receiver stopped")?;
+                        last_report = Some(Instant::now());
+                    }
+                    Ok(())
+                };
+                let result = compact(&root, &mut progress);
+                match &result {
+                    Ok(detail) => writeln!(log, "\n{detail}")?,
+                    Err(error) if source_build::is_cancelled(error) => {
+                        writeln!(log, "\n{BACKUP_CLEANUP_CANCELLED}")?
+                    }
+                    Err(error) => writeln!(log, "\nOld-file cleanup stopped: {error:#}")?,
+                }
+                let detail = result?;
+                game_layout::retain_cleanup(&root, &directory, false)?;
+                Ok(detail)
+            })();
             if sender
                 .send(Input::SourceBackupCleaned { directory, result })
                 .is_err()
@@ -5924,6 +6029,7 @@ impl Engine {
                 eprintln!("Twilight Sync stopped before it could report old-file cleanup");
             }
         });
+        Ok(())
     }
 
     // Nothing is running, transferring, locked or being installed on either PC.
@@ -10258,6 +10364,107 @@ mod tests {
             &token
         ));
         assert!(Settings::load(&h.right.root)?.play_lock.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn source_backup_cleanup_reports_progress_and_releases_guards_on_every_outcome() -> Result<()> {
+        for outcome in ["completed", "cancelled", "failed", "finalizing"] {
+            let mut h = Harness::new(None, None)?;
+            let directory = h.left.root.join("Games").join("Longshot");
+            fs::create_dir_all(&directory)?;
+            let selected = directory.join("longshot.exe");
+            fs::write(&selected, b"selected program; never executed")?;
+            h.left.triforce.status.executable = Some(selected.clone());
+            h.left.source.preferences.triforce.oot_project = source_build::OotProject::Longshot;
+            let (ready_tx, ready_rx) = bounded(0);
+            let (continue_tx, continue_rx) = bounded(0);
+            let checked = directory.join("old-game-data.bin");
+            h.left.start_backup_cleanup(
+                protocol::GameId::Triforce,
+                directory.clone(),
+                move |_, progress| {
+                    ready_tx.send(()).context("Cleanup test receiver stopped")?;
+                    continue_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .context("Cleanup test did not resume")?;
+                    progress(game_layout::CleanupProgress {
+                        path: &checked,
+                        bytes: 64 * 1024,
+                        removing: outcome == "finalizing",
+                    })?;
+                    if outcome == "failed" {
+                        bail!("An old save differs; keep it");
+                    }
+                    Ok("Old-file cleanup completed.".into())
+                },
+            )?;
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("Cleanup test did not start")?;
+            assert!(h.left.compacting_backup && h.left.install_busy && h.left.source.busy);
+            assert!(!h.left.source.building);
+            assert!(h.left.source.progress.started.is_some());
+            let error = h
+                .left
+                .input(Input::Command(Command::RefreshSave))
+                .err()
+                .context("Cleanup did not guard game commands")?;
+            assert_eq!(error.to_string(), BACKUP_CLEANUP_WAIT);
+            h.left.report(error);
+            if matches!(outcome, "cancelled" | "finalizing") {
+                h.left.input(Input::Command(Command::CancelSource))?;
+                assert!(h.left.source_cancel.load(Ordering::Acquire));
+            } else if outcome == "failed" {
+                h.left.error = Some("Unrelated network error".into());
+            }
+            continue_tx.send(()).context("Cleanup worker stopped")?;
+            while h.left.compacting_backup {
+                let input = h
+                    .left_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("Cleanup did not release its guards")?;
+                let finished = matches!(&input, Input::SourceBackupCleaned { .. });
+                let result = h.left.input(input);
+                if finished && outcome == "failed" {
+                    assert!(
+                        result
+                            .err()
+                            .context("Cleanup failure was hidden")?
+                            .to_string()
+                            .contains("An old save differs")
+                    );
+                } else {
+                    result?;
+                }
+            }
+            assert!(!h.left.install_busy && !h.left.source.busy);
+            assert_eq!(h.left.triforce.status.executable.as_ref(), Some(&selected));
+            assert!(selected.is_file());
+            assert_eq!(
+                game_layout::retained_cleanup(&h.left.root)?.contains(&directory),
+                matches!(outcome, "cancelled" | "failed")
+            );
+            if outcome == "cancelled" {
+                assert_eq!(h.left.source.message, BACKUP_CLEANUP_CANCELLED);
+                assert!(h.left.source.error.is_none() && h.left.error.is_none());
+            } else {
+                assert!(
+                    h.left
+                        .source
+                        .progress
+                        .report
+                        .activity
+                        .contains("old-game-data.bin")
+                );
+                assert_eq!(h.left.source.error.is_some(), outcome == "failed");
+                assert_eq!(
+                    h.left.error.as_deref(),
+                    (outcome == "failed").then_some("Unrelated network error")
+                );
+            }
+            h.left.input(Input::Command(Command::RefreshSave))?;
+        }
         Ok(())
     }
 

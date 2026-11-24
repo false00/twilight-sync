@@ -199,7 +199,17 @@ fn run_with(
                 interrupted = true;
                 break;
             }
-            match remove_folder(folder) {
+            let result = game_layout::preserve_retired_saves(root, folder, &[], &mut |_| Ok(()))
+                .and_then(|saved| {
+                    if let Some(saved) = saved {
+                        done.push(format!(
+                            "Previous save data was retained at {}.",
+                            saved.display()
+                        ));
+                    }
+                    remove_folder(folder)
+                });
+            match result {
                 Ok(size) => {
                     count += 1;
                     bytes += size;
@@ -406,7 +416,13 @@ fn superseded(
                 .filter_map(|game| game.active.as_deref()?.parent()),
         )
         .collect();
-    let active = |path: &Path| kept.iter().any(|kept| within(kept, path));
+    let retained = game_layout::retained_cleanup(root)?;
+    let active = |path: &Path| {
+        kept.iter().any(|kept| within(kept, path))
+            || retained
+                .iter()
+                .any(|kept| within(path, kept) || within(kept, path))
+    };
     let mut files: Vec<PathBuf> = game_layout::metadata_paths(root)
         .into_iter()
         .chain(metadata.iter().cloned())
@@ -621,7 +637,31 @@ fn remove_file(path: &Path) -> Result<()> {
     }
 }
 
-fn remove_folder(folder: &Path) -> Result<u64> {
+pub(crate) fn remove_path(path: &Path) -> Result<u64> {
+    ensure_safe_path(path)?;
+    let Some(found) = regular_metadata(path)? else {
+        return Ok(0);
+    };
+    if found.is_dir() {
+        return remove_folder(path);
+    }
+    ensure!(found.is_file(), "{} is not a regular file", path.display());
+    make_writable(path, &found)?;
+    fs::remove_file(path).with_context(|| format!("Removing {}", path.display()))?;
+    Ok(found.len())
+}
+
+fn make_writable(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_folder(folder: &Path) -> Result<u64> {
     ensure_safe_path(folder)?;
     let Some(found) = regular_metadata(folder)? else {
         return Ok(0);
@@ -630,14 +670,7 @@ fn remove_folder(folder: &Path) -> Result<u64> {
     let mut bytes = 0;
     visit(folder, &mut |path, metadata| {
         bytes += metadata.len();
-        if metadata.permissions().readonly() {
-            // Git checkouts keep read-only object files.
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            fs::set_permissions(path, permissions)?;
-        }
-        Ok(())
+        make_writable(path, metadata)
     })?;
     fs::remove_dir_all(folder)?;
     Ok(bytes)
@@ -1026,6 +1059,169 @@ mod tests {
         ] {
             assert!(path.exists(), "{} was removed", path.display());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_retirement_preserves_saves_for_every_game_without_comparing_assets() -> Result<()>
+    {
+        for (project, executable, save) in [
+            (
+                "Dusklight",
+                "dusklight.exe",
+                "data\\EUR\\Card A\\01-GZ2P-gczelda2.gci",
+            ),
+            (
+                "TotKRecomp",
+                "totk.exe",
+                "profile\\save\\account\\progress.sav",
+            ),
+            (
+                "Triforce",
+                "Triforce.exe",
+                "user\\save\\account\\progress.sav",
+            ),
+            (
+                "Longshot",
+                "longshot.exe",
+                "user\\save\\account\\progress.sav",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("manager");
+            let games = temp.path().join("Games");
+            let managed = games.join(project);
+            let old = managed.join("source-v1.2.3-aaaaaaaaaaaa-Abc123");
+            let previous = old.join("game");
+            let selected = managed
+                .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+                .join("game");
+            fs::create_dir_all(&previous)?;
+            fs::write(previous.join(executable), b"previous executable")?;
+            let saved = previous.join(save);
+            fs::create_dir_all(saved.parent().context("Missing save folder")?)?;
+            fs::write(&saved, b"previous progress")?;
+            fs::write(previous.join("assets.bin"), b"unmatched old game assets")?;
+            fs::create_dir_all(&selected)?;
+            let active = selected.join(executable);
+            fs::write(&active, b"selected executable")?;
+            let current = selected.join(save);
+            fs::create_dir_all(current.parent().context("Missing current save folder")?)?;
+            fs::write(&current, b"current progress")?;
+            let plan = Plan::new(
+                &root,
+                games,
+                vec![Managed {
+                    folder: managed,
+                    active: Some(active.clone()),
+                }],
+                Vec::new(),
+                Vec::new(),
+                None,
+            )?
+            .context("No obsolete version was planned")?;
+            fs::create_dir_all(&root)?;
+            fs::write(root.join("retired-saves"), b"backup storage is unavailable")?;
+            let failed = run_with(
+                &root,
+                &plan,
+                &temp.path().join("unused.log"),
+                &mut |_| unreachable!("No shader preparation was requested"),
+                &mut || false,
+            )?;
+            assert!(!failed.failures.is_empty() && old.is_dir());
+            assert_eq!(fs::read(&current)?, b"current progress");
+            fs::remove_file(root.join("retired-saves"))?;
+            let outcome = run_with(
+                &root,
+                &plan,
+                &temp.path().join("unused.log"),
+                &mut |_| unreachable!("No shader preparation was requested"),
+                &mut || false,
+            )?;
+            assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+            assert!(!old.exists() && active.is_file());
+            assert_eq!(fs::read(current)?, b"current progress");
+            let backup = fs::read_dir(root.join("retired-saves"))?
+                .next()
+                .context("Missing previous-save backup")??
+                .path();
+            assert_eq!(
+                fs::read(backup.join("game").join(save))?,
+                b"previous progress"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_cleanup_keeps_unchecked_versions_and_workspaces_across_replanning() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("manager");
+        let games = temp.path().join("Games");
+        let managed = games.join("Longshot");
+        let old = managed.join("source-v1.2.3-aaaaaaaaaaaa-Abc123");
+        let selected = managed.join("source-v1.2.4-bbbbbbbbbbbb-Def456");
+        let workspace = root
+            .join("source-builds")
+            .join("triforce")
+            .join("v1.2.3-aaaaaaaaaaaa-Ghi789");
+        let orphan = root
+            .join("source-builds")
+            .join("triforce")
+            .join("v1.2.2-cccccccccccc-Jkl123");
+        for path in [
+            &old.join("game"),
+            &selected.join("game"),
+            &workspace,
+            &orphan,
+        ] {
+            fs::create_dir_all(path)?;
+        }
+        fs::write(old.join("game").join("longshot.exe"), b"old program")?;
+        fs::write(old.join("game").join("progress.sav"), b"unchecked old save")?;
+        fs::write(
+            old.join("game").join("twilight-source.json"),
+            serde_json::to_vec(&serde_json::json!({ "source": workspace.join("source") }))?,
+        )?;
+        let executable = selected.join("game").join("longshot.exe");
+        fs::write(&executable, b"new selected program")?;
+        let planned = || {
+            Plan::new(
+                &root,
+                games.clone(),
+                vec![Managed {
+                    folder: managed.clone(),
+                    active: Some(executable.clone()),
+                }],
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+        };
+        let before = planned()?.context("Old versions were not scheduled")?;
+        assert!(before.remove.contains(&old) && before.remove.contains(&workspace));
+        game_layout::retain_cleanup(&root, &managed, true)?;
+        assert_eq!(game_layout::retained_cleanup(&root)?, vec![managed.clone()]);
+        let after = planned()?.context("Unrelated workspace should still be removed")?;
+        assert_eq!(after.remove, vec![orphan.clone()]);
+        let outcome = run_with(
+            &root,
+            &before,
+            &temp.path().join("unused.log"),
+            &mut |_| unreachable!("Nothing needed warming"),
+            &mut || false,
+        )?;
+        assert!(outcome.failures.is_empty());
+        assert!(!orphan.exists());
+        assert!(old.is_dir() && selected.is_dir() && workspace.is_dir());
+        assert_eq!(
+            fs::read(old.join("game").join("progress.sav"))?,
+            b"unchecked old save"
+        );
+        game_layout::retain_cleanup(&root, &managed, false)?;
+        let retry = planned()?.context("Completed cleanup did not release retained folders")?;
+        assert!(retry.remove.contains(&old) && retry.remove.contains(&workspace));
         Ok(())
     }
 

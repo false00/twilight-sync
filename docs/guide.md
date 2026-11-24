@@ -776,29 +776,34 @@ The flow:
    remapped. A durable journal resumes an interrupted promotion before play or
    transfers are allowed. Conflicting metadata is never overwritten.
    Verified nonempty source-build activation retains its existing common sync base.
-   After successful source activation, Twilight Sync retires the previous verified
-   managed install and checks older versioned siblings of the same project.
+   After successful source activation, Twilight Sync retires the previous
+   managed install and older versioned siblings of the same project.
    Triforce and Longshot remain independent: updating one never retires the other.
-   For a verified version folder, cleanup checks the entire old install first.
-   It removes the folder only when every file is an owned program file, a known
-   regenerable cache, or already present in the replacement byte for byte.
-   Longshot's generated installation record and prompt-output hashes identify
-   version-specific build artifacts; older receipts without DLL hashes use the
-   upstream installation record for those DLLs only. Newer SHA-256 receipts
-   always take priority. Missing old logs and bug reports are copied into the
-   replacement without overwriting existing diagnostics.
-   A different save, setting, mod, unexpected file, or reference into the old
-   install blocks retirement and reports the path to resolve. The new build
-   stays selected. A new source build will not start while an extra managed
-   version folder remains, even if an earlier cleanup removed its executable
-   or receipt. Play and settings changes wait while files are checked.
+   **Cleanup preserves saves, not old installations.** For Dusklight, TotK,
+   Triforce and Longshot, previous save profiles are copied and verified into
+   `retired-saves` inside Twilight Sync's data directory before old folders are
+   removed. Native profiles retain account metadata and existing save backups;
+   Dusklight retains regional GCI folders and raw cards, including portable or
+   custom profiles inside the retired install. External save profiles are not
+   deleted. The selected installation and its current progress are not replaced.
+   Cleanup does **not** compare game assets, old executables, settings, mods,
+   caches or logs against the new install. Those old non-save files are deleted,
+   even when different or absent in the replacement. Removing many files still
+   takes filesystem time, but no longer rereads the full game to find duplicates.
+   A failed save backup stops deletion and reports the problem. Active paths,
+   newer builds awaiting activation, referenced folders and other OOT projects
+   remain protected. Cleanup shows elapsed time and live activity.
+   **Cancel safely** stops save preparation without undoing activation; a folder
+   already being deleted finishes first. Cancelled or failed cleanup is retained
+   across restarts rather than bypassed by automatic post-update cleanup.
    Unrelated manually managed folders are never deleted.
    To check older siblings without rebuilding, close all games and quit Twilight
    Sync, then use `twilight-sync --cleanup-source-installs longshot` (or
    `triforce`, `totk`, `dusklight`) with that source installation already selected.
    This command does not download, build, launch, or switch projects.
-   Official Dusklight updates apply the same check to versioned releases using
-   their install manifests; normal official TotK updates replace files in place.
+   Official Dusklight updates use the same saves-only retirement policy.
+   Normal official TotK updates replace files in place; any obsolete TotK
+   installation folders also preserve saves before direct removal.
    Managed source builds and TotK setup compilation prevent Windows automatic
    sleep, including shader and Vulkan pipeline preparation. The display can
    still turn off. Normal sleep behavior is restored on completion, cancellation,
@@ -816,7 +821,7 @@ The flow:
    removed, so TotK does not take the interrupted shaders for driver crashes and
    skip them. Its output is in `build-logs\totk-shaders-*.log`, and
    `totk-shaders.json` records the folder, shader list and drivers it warmed.
-   Nothing is kept as a backup: Twilight Sync then removes `.twilight-sync-backup-*`
+   Only save profiles are retained: Twilight Sync then removes `.twilight-sync-backup-*`
    folders, version folders built before the active executable, and unused build
    workspaces. The selected Triforce and Longshot installs and newer builds that
    await activation stay, including after restarting Twilight Sync. Their

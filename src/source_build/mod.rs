@@ -1355,9 +1355,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
 pub struct Revision {
     pub tag: String,
     pub commit: String,
-    pub(crate) sha256: String,
     pub(crate) oot_project: OotProject,
-    pub(crate) runtime_libraries: Vec<(String, String)>,
 }
 
 pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
@@ -1396,9 +1394,7 @@ pub fn selected_revision(path: &Path, game: GameId) -> Result<Revision> {
     Ok(Revision {
         tag: label.tag,
         commit: label.commit,
-        sha256: label.sha256,
         oot_project: label.oot_project,
-        runtime_libraries: label.runtime_libraries,
     })
 }
 
@@ -1639,12 +1635,7 @@ mod tests {
             "runtime_libraries": [[crate::totk_update::DLSS_DLL, "c".repeat(64)]],
         });
         fs::write(&receipt, serde_json::to_vec(&label)?)?;
-        assert_eq!(
-            selected_revision(&receipt, GameId::Totk)?
-                .runtime_libraries
-                .len(),
-            1
-        );
+        selected_revision(&receipt, GameId::Totk)?;
         label["game"] = serde_json::json!(GameId::Triforce);
         fs::write(&receipt, serde_json::to_vec(&label)?)?;
         assert!(selected_revision(&receipt, GameId::Triforce).is_err());

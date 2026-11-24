@@ -7,7 +7,10 @@ use crate::{
     source_build,
 };
 use anyhow::{Context, Result, ensure};
-pub(crate) use backup::{SourceBackup, mentions_backup, regular_metadata, source_version, within};
+pub(crate) use backup::{
+    CleanupProgress, CleanupReporter, SourceBackup, mentions_backup, preserve_retired_saves,
+    regular_metadata, retain_cleanup, retained_cleanup, source_version, within,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -609,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn source_promotion_compacts_only_disposable_old_files_after_finishing() -> Result<()> {
+    fn source_promotion_preserves_saves_and_removes_all_old_non_save_files() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (manager, destination, from) = setup(temp.path())?;
         fs::remove_file(manager.join("source-builds.json"))?;
@@ -648,24 +651,15 @@ mod tests {
         migration.finish(&manager)?;
         old.compact(&manager)?;
 
-        for path in [
-            "Triforce.exe",
-            "triforce_programs.bin",
-            "romfs\\copy.bin",
-            "romfs\\shared.bin",
-        ] {
-            assert!(!old.directory.join(path).try_exists()?, "{path}");
-        }
-        for (path, expected) in [
-            ("romfs\\different.bin", b"old".as_slice()),
-            ("romfs\\old-only.bin", b"unique old data"),
-            ("user\\earlier-save", b"older progress"),
-            ("mods\\mod", b"old mod"),
-            ("Game\\input.nup", b"local game input"),
-            ("mkw_vk_pipelines.bin\\extra", b"not a regular cache file"),
-        ] {
-            assert_eq!(fs::read(old.directory.join(path))?, expected, "{path}");
-        }
+        assert!(!old.directory.exists());
+        let archive = fs::read_dir(manager.join("retired-saves"))?
+            .next()
+            .context("Missing previous save backup")??
+            .path();
+        assert_eq!(
+            fs::read(archive.join("user").join("earlier-save"))?,
+            b"older progress"
+        );
         assert_eq!(
             fs::read(destination.join("romfs\\copy.bin"))?,
             b"same game data"
@@ -683,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn source_backup_keeps_a_referenced_folder_or_modified_program_intact() -> Result<()> {
+    fn source_backup_keeps_referenced_folders_but_does_not_compare_old_programs() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (manager, destination, from) = setup(temp.path())?;
         fs::remove_file(manager.join("source-builds.json"))?;
@@ -708,12 +702,9 @@ mod tests {
             old.directory.join("Triforce.exe"),
             b"locally modified executable",
         )?;
-        let error = old
-            .compact(&manager)
-            .err()
-            .context("A modified program must block cleanup")?;
-        assert!(error.to_string().contains("modified or missing"));
-        assert!(old.directory.join("triforce_programs.bin").is_file());
+        old.compact(&manager)?;
+        assert!(!old.directory.exists());
+        assert!(destination.join("Triforce.exe").is_file());
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 Generated third-party notices for Twilight Sync.
 Manifest fingerprints use UTF-8 text with LF-normalized line endings.
-Cargo.toml SHA-256: bbe6bf4adf1f71e5a4d8162bfe4047b6e6266c1c5570b5ba07fcf43f59cd71df
-Cargo.lock SHA-256: 53c463e8621ac577b040d4b95c4e3b5b495aefb83a2be6a9b0ce9f6a71149891
+Cargo.toml SHA-256: b7f6a1b3399fe63c8f08359d4ee0704bd3096b8d05204bb3d0ff6c48edbaf341
+Cargo.lock SHA-256: 8d810145241318c499033fda753df5488d2deded3795203e9e9670488c4575d0
 
 Twilight Sync - third-party notices
 ==================================
@@ -6779,7 +6779,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License
 ----------------------------------------------------------------------
 Used by:
-  twilight-sync 0.19.12 - https://crates.io/crates/twilight-sync/0.19.12
+  twilight-sync 0.19.13 - https://crates.io/crates/twilight-sync/0.19.13
 
 MIT License
 

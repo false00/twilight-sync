@@ -190,6 +190,8 @@ Native builds need at least **64 GiB free**, plus room for copied local data;
 the complete process can take an hour or more. Temporary workspaces are cleaned
 up after the build, and TotK keeps the setup it needs for in-game mod rebuilds.
 Saves, mods and settings are copied into the new build before it is selected.
+Retired installations keep only verified save-profile backups; old game assets,
+mods and settings are removed without comparing them against the replacement.
 Once games are idle, the previous build, install backups and older workspaces
 are removed, and TotK's prepared shaders are warmed in the graphics driver's
 cache for the folder it now runs from. Shader preparation may open a window,

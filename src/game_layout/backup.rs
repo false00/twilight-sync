@@ -1,19 +1,62 @@
 use super::{metadata_paths, pending, read};
 use crate::{
-    files::{ensure_safe_path, valid_hash},
+    files::{atomic_write, ensure_safe_path},
     install,
     protocol::GameId,
-    source_build,
+    source_build, totk_update,
 };
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
-use sha1::{Digest, Sha1};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
-    fs::{self, File, Metadata, OpenOptions},
-    io::{ErrorKind, Read},
+    fs::{self, Metadata, OpenOptions},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
+
+const RETAINED_CLEANUP: &str = "source-cleanup-retained.json";
+
+pub(crate) struct CleanupProgress<'a> {
+    pub path: &'a Path,
+    pub bytes: u64,
+    pub removing: bool,
+}
+
+pub(crate) type CleanupReporter<'a> = dyn FnMut(CleanupProgress<'_>) -> Result<()> + 'a;
+
+pub(crate) fn retained_cleanup(root: &Path) -> Result<Vec<PathBuf>> {
+    let path = root.join(RETAINED_CLEANUP);
+    ensure_safe_path(&path)?;
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let directories: Vec<PathBuf> =
+        serde_json::from_slice(&read(&path)?).context("Reading retained cleanup folders")?;
+    ensure!(
+        directories.len() <= 512,
+        "Too many retained cleanup folders"
+    );
+    for directory in &directories {
+        ensure_safe_path(directory)?;
+    }
+    Ok(directories)
+}
+
+pub(crate) fn retain_cleanup(root: &Path, directory: &Path, retain: bool) -> Result<()> {
+    ensure_safe_path(directory)?;
+    let mut directories = retained_cleanup(root)?;
+    directories.retain(|path| path != directory);
+    if retain {
+        directories.push(directory.into());
+    }
+    ensure!(
+        directories.len() <= 512,
+        "Too many retained cleanup folders"
+    );
+    atomic_write(
+        &root.join(RETAINED_CLEANUP),
+        &serde_json::to_vec(&directories)?,
+    )
+}
 
 pub(crate) fn mentions_backup(bytes: &[u8], name: &str) -> bool {
     bytes
@@ -21,7 +64,7 @@ pub(crate) fn mentions_backup(bytes: &[u8], name: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(name.as_bytes()))
 }
 
-/// "<prefix><tag>-<12 hex commit>-<6 random>": the version folders and workspaces source builds create.
+/// "<prefix><tag>-<12 hex commit>-<6 random>": managed source versions and workspaces.
 pub(crate) fn source_version(name: &str, prefix: &str) -> bool {
     let Some((revision, suffix)) = name
         .strip_prefix(prefix)
@@ -77,6 +120,7 @@ impl SourceBackup {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn compact_source_siblings(
         root: &Path,
         managed: &Path,
@@ -85,10 +129,29 @@ impl SourceBackup {
         exclude: Option<&Path>,
         metadata: &[PathBuf],
     ) -> Result<Vec<String>> {
+        Self::compact_source_siblings_with_progress(
+            root,
+            managed,
+            game,
+            active,
+            exclude,
+            metadata,
+            &mut |_| Ok(()),
+        )
+    }
+
+    pub(crate) fn compact_source_siblings_with_progress(
+        root: &Path,
+        managed: &Path,
+        game: GameId,
+        active: &Path,
+        exclude: Option<&Path>,
+        metadata: &[PathBuf],
+        progress: &mut CleanupReporter<'_>,
+    ) -> Result<Vec<String>> {
         ensure!(!pending(root)?, "Game folder promotion has not finished");
         ensure_safe_path(managed)?;
         ensure_safe_path(active)?;
-        let destination = active.parent().context("Missing active game directory")?;
         ensure!(
             within(active, managed) && active.is_file(),
             "Missing active managed game"
@@ -96,15 +159,16 @@ impl SourceBackup {
         let project = (game == GameId::Triforce)
             .then(|| source_build::OotProject::from_executable(active))
             .transpose()?;
-        let installed =
-            source_build::selected_revision(&destination.join("twilight-source.json"), game)?;
+        let installed = source_build::selected_revision(
+            &active
+                .parent()
+                .context("Missing active game directory")?
+                .join("twilight-source.json"),
+            game,
+        )?;
         ensure!(
             project.is_none_or(|project| project == installed.oot_project),
             "Wrong active OOT project"
-        );
-        ensure!(
-            install::digest_file(active, active.metadata()?.len())? == installed.sha256,
-            "The active program no longer matches its source receipt"
         );
         let filename = active
             .file_name()
@@ -112,10 +176,13 @@ impl SourceBackup {
         let selected_at = active.metadata()?.created()?;
         let mut results = Vec::new();
         let mut candidates = 0;
-        // Only inspect immediate versioned children of this one managed project.
         for entry in fs::read_dir(managed)? {
             let entry = entry?;
-            if !entry.file_name().to_string_lossy().starts_with("source-") {
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| source_version(name, "source-"))
+            {
                 continue;
             }
             candidates += 1;
@@ -125,42 +192,63 @@ impl SourceBackup {
             );
             let wrapper = entry.path();
             let directory = wrapper.join("game");
-            if within(active, &directory)
-                || exclude.is_some_and(|exclude| {
-                    within(&directory, exclude) && within(exclude, &directory)
-                })
-                || !regular_metadata(&wrapper)?.is_some_and(|m| m.is_dir())
-                || !regular_metadata(&directory)?.is_some_and(|m| m.is_dir())
+            if within(active, &wrapper) || exclude.is_some_and(|exclude| within(exclude, &wrapper))
             {
+                continue;
+            }
+            ensure_safe_path(&wrapper)?;
+            let executable = directory.join(filename);
+            let age = regular_metadata(&executable)?.unwrap_or(fs::metadata(&wrapper)?);
+            if !age.created().is_ok_and(|created| created <= selected_at) {
+                continue;
+            }
+            if !directory.try_exists()? {
+                let name = wrapper
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Invalid retired version folder")?;
+                let mut referenced = false;
+                for path in metadata_paths(root)
+                    .into_iter()
+                    .chain(metadata.iter().cloned())
+                {
+                    ensure_safe_path(&path)?;
+                    if path.try_exists()? && mentions_backup(&read(&path)?, name) {
+                        referenced = true;
+                        break;
+                    }
+                }
+                if referenced {
+                    results.push(format!(
+                        "The previous folder was kept because it is still referenced: {}.",
+                        wrapper.display()
+                    ));
+                    continue;
+                }
+                let saved = preserve_retired_saves(root, &wrapper, &[], progress)?;
+                source_build::games_stopped()?;
+                progress(CleanupProgress {
+                    path: &wrapper,
+                    bytes: 0,
+                    removing: true,
+                })?;
+                crate::post_update::remove_folder(&wrapper)?;
+                results.push(cleanup_summary(&wrapper, saved.as_deref(), 0));
                 continue;
             }
             let receipt = directory.join("twilight-source.json");
-            let Ok(revision) = source_build::selected_revision(&receipt, game) else {
-                continue;
-            };
-            if project.is_some_and(|project| project != revision.oot_project)
-                || Self::source_wrapper(&directory, &revision).is_none()
-            {
-                continue;
-            }
-            let executable = directory.join(filename);
-            if !executable.try_exists()? {
-                anyhow::bail!(
-                    "Earlier cleanup left data in {} without its verified executable. Inspect and resolve that folder before retrying.",
-                    directory.display()
-                );
-            }
-            if !regular_metadata(&executable)?.is_some_and(|m| {
-                m.is_file() && m.created().is_ok_and(|created| created <= selected_at)
-            }) {
-                continue;
+            if receipt.try_exists()? {
+                let revision = source_build::selected_revision(&receipt, game)?;
+                if project.is_some_and(|project| project != revision.oot_project) {
+                    continue;
+                }
             }
             let backup =
                 Self::previous(root, managed, game, &executable, active, metadata.to_vec())
                     .context("Invalid previous versioned build")?;
             results.push(
                 backup
-                    .compact(root)
+                    .compact_with_progress(root, progress)
                     .with_context(|| format!("Retiring {}", directory.display()))?,
             );
         }
@@ -191,7 +279,6 @@ impl SourceBackup {
             return None;
         }
         let mut directory = previous.parent()?;
-        // Official archives can nest their executable below the receipt root.
         if game == GameId::Dusklight && !directory.join("twilight-source.json").exists() {
             let mut candidate = directory;
             while within(candidate, managed) || (candidate != legacy && within(candidate, &legacy))
@@ -203,7 +290,6 @@ impl SourceBackup {
                 candidate = candidate.parent()?;
             }
         }
-        // Only a stable, known Games directory may contain the new install.
         if within(destination, directory) && directory != managed {
             return None;
         }
@@ -217,10 +303,23 @@ impl SourceBackup {
         })
     }
 
+    #[cfg(test)]
     pub fn compact(&self, root: &Path) -> Result<String> {
+        self.compact_with_progress(root, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn compact_with_progress(
+        &self,
+        root: &Path,
+        progress: &mut CleanupReporter<'_>,
+    ) -> Result<String> {
         ensure!(!pending(root)?, "Game folder promotion has not finished");
         ensure_safe_path(&self.directory)?;
         ensure_safe_path(&self.destination)?;
+        ensure!(
+            self.directory != root && self.directory != root.join("apps"),
+            "Cleanup requires a specific retired installation folder"
+        );
         if let Some(replacement) = &self.replacement {
             ensure_safe_path(replacement)?;
             ensure!(
@@ -228,11 +327,7 @@ impl SourceBackup {
                 "The replacement program was not found"
             );
         }
-        let mut protected = if within(&self.directory, &self.destination) {
-            self.replacement.iter().cloned().collect()
-        } else {
-            vec![self.destination.clone()]
-        };
+        let mut protected = vec![self.destination.clone()];
         for path in metadata_paths(root)
             .into_iter()
             .chain(self.extra_metadata.iter().cloned())
@@ -246,7 +341,7 @@ impl SourceBackup {
                 let name = self
                     .directory
                     .file_name()
-                    .and_then(|n| n.to_str())
+                    .and_then(|name| name.to_str())
                     .context("Invalid source backup folder name")?;
                 if mentions_backup(&bytes, name) {
                     return Ok(
@@ -263,256 +358,318 @@ impl SourceBackup {
             }
         }
         let program = self.directory.join(&self.executable);
-        if overlaps_any(&program, &protected) {
-            anyhow::bail!(
-                "The old program or its folder is still referenced: {}. Update the path before retrying cleanup.",
-                program.display()
-            );
-        }
+        let wrapper = self.directory.parent().filter(|parent| {
+            self.directory
+                .file_name()
+                .is_some_and(|name| name == "game")
+                && parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| source_version(name, "source-"))
+        });
         let receipt = self.directory.join("twilight-source.json");
         ensure_safe_path(&receipt)?;
-        if !receipt.try_exists()? {
-            if self.game == GameId::Dusklight
-                && self.directory.join("twilight-install.json").try_exists()?
-            {
-                return self.compact_release(&program, &protected);
+        if receipt.try_exists()? {
+            let revision = source_build::selected_revision(&receipt, self.game)?;
+            if self.game == GameId::Triforce {
+                ensure!(
+                    source_build::OotProject::from_executable(&program)? == revision.oot_project,
+                    "The previous OOT program does not match the project in its receipt"
+                );
             }
-            anyhow::bail!(
+            if let Some(wrapper) = wrapper {
+                let prefix = format!("source-{}-{}-", revision.tag, &revision.commit[..12]);
+                ensure!(
+                    wrapper
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&prefix)),
+                    "The old version folder does not match its source receipt"
+                );
+            }
+        } else if self.game == GameId::Dusklight
+            && self.directory.join("twilight-install.json").try_exists()?
+        {
+            install::previous_release_files(&self.directory, &program)?;
+        } else if self.game == GameId::Totk
+            && self.directory.join("totk-install.json").try_exists()?
+        {
+            totk_update::installed_release(&self.directory)?;
+        } else {
+            ensure!(
+                wrapper.is_some(),
                 "Cannot verify ownership of {}: no supported installation receipt.",
                 self.directory.display()
             );
         }
-        let revision = source_build::selected_revision(&receipt, self.game)?;
-        if self.game == GameId::Triforce {
-            ensure!(
-                source_build::OotProject::from_executable(&program)? == revision.oot_project,
-                "The previous OOT program does not match the project in its receipt"
-            );
-        }
         source_build::games_stopped()?;
-        let wrapper = Self::source_wrapper(&self.directory, &revision);
-        let mut cleanup = Compactor::new(protected);
-        if let Some(wrapper) = wrapper {
+        let retired = wrapper.unwrap_or(&self.directory);
+        if !within(&self.destination, retired) {
+            if protected.iter().any(|path| within(path, retired)) {
+                return Ok(format!(
+                    "The previous folder was kept because it is still referenced: {}.",
+                    retired.display()
+                ));
+            }
+            let saved = preserve_retired_saves(root, retired, &[], progress)?;
+            source_build::games_stopped()?;
+            progress(CleanupProgress {
+                path: retired,
+                bytes: 0,
+                removing: true,
+            })?;
+            crate::post_update::remove_folder(retired)?;
+            return Ok(cleanup_summary(retired, saved.as_deref(), 0));
+        }
+        let mut targets = Vec::new();
+        let mut kept = protected;
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if overlaps_any(&path, &kept)
+                || entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| source_version(name, "source-"))
+            {
+                kept.push(path);
+            } else {
+                targets.push(path);
+            }
+        }
+        let saved = preserve_retired_saves(root, &self.directory, &kept, progress)?;
+        source_build::games_stopped()?;
+        for path in targets {
+            progress(CleanupProgress {
+                path: &path,
+                bytes: 0,
+                removing: true,
+            })?;
+            crate::post_update::remove_path(&path)?;
+        }
+        Ok(cleanup_summary(
+            &self.directory,
+            saved.as_deref(),
+            kept.len(),
+        ))
+    }
+}
+
+fn cleanup_summary(previous: &Path, saved: Option<&Path>, kept: usize) -> String {
+    let saved = saved.map_or_else(String::new, |path| {
+        format!(
+            " Previous save data was verified and retained at {}.",
+            path.display()
+        )
+    });
+    let kept = if kept == 0 {
+        String::new()
+    } else {
+        " Active, referenced, and pending-version paths were kept.".into()
+    };
+    format!(
+        "Removed obsolete game files from {} without comparing game assets.{saved}{kept}",
+        previous.display()
+    )
+}
+
+pub(crate) fn preserve_retired_saves(
+    root: &Path,
+    folder: &Path,
+    excluded: &[PathBuf],
+    progress: &mut CleanupReporter<'_>,
+) -> Result<Option<PathBuf>> {
+    ensure_safe_path(folder)?;
+    progress(CleanupProgress {
+        path: folder,
+        bytes: 0,
+        removing: false,
+    })?;
+    let mut installs = vec![folder.to_path_buf(), folder.join("game")];
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| source_version(name, "source-"))
+        {
+            installs.push(entry.path().join("game"));
+        }
+    }
+    let mut sources = Vec::new();
+    for install in installs {
+        if excluded.iter().any(|path| within(&install, path)) {
+            continue;
+        }
+        for profile in ["user", "profile"] {
+            sources.push(install.join(profile));
+        }
+        let mut profiles = vec![
+            install.clone(),
+            install.join("data"),
+            install.join("bin").join("data"),
+        ];
+        for directory in [install.clone(), install.join("bin")] {
+            let descriptor = directory.join("data_location.json");
+            ensure_safe_path(&descriptor)?;
+            if !descriptor.try_exists()? {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&read(&descriptor)?)?;
             ensure!(
-                fs::read_dir(wrapper)?
-                    .all(|entry| entry.is_ok_and(|entry| entry.path() == self.directory)),
-                "Unexpected data beside the old game in {}. Move it out before retrying cleanup.",
-                wrapper.display()
+                value["version"] == 1
+                    && value["mode"]
+                        .as_str()
+                        .is_some_and(|mode| matches!(mode, "default" | "portable" | "custom")),
+                "Cannot locate retired Dusklight saves from {}",
+                descriptor.display()
             );
-            cleanup.plan = Some(HashMap::new());
-        }
-        let Some((program_lock, program_size)) =
-            cleanup.verify(&program, &revision.sha256, None)?
-        else {
-            anyhow::bail!(
-                "Cannot verify the old program at {}: modified or missing.",
-                program.display()
-            );
-        };
-        if wrapper.is_some() {
-            cleanup.remove(&receipt, receipt.metadata()?.len())?;
-            for (name, hash) in &revision.runtime_libraries {
-                let path = self.directory.join(name);
-                if let Some((_lock, size)) = cleanup.verify(&path, hash, None)? {
-                    cleanup.remove(&path, size)?;
-                }
-            }
-        }
-        if self.game == GameId::Triforce
-            && revision.oot_project == source_build::OotProject::Triforce
-        {
-            for name in [
-                "triforce_programs.bin",
-                "triforce_programs.idx",
-                "triforce_prepared.bin",
-                "triforce_pipelines.bin",
-                "triforce_pipelines.bin.built",
-                "triforce_shaders.bin",
-                "mkw_vk_pipelines.bin",
-                "mkw_vk_pipelines.bin.for",
-                "mkw_vk_pipelines_play.bin",
-                "mkw_vk_pipelines_play.bin.for",
-            ] {
-                cleanup.remove_cache(&self.directory.join(name))?;
-            }
-        }
-        if self.game == GameId::Triforce
-            && revision.oot_project == source_build::OotProject::Longshot
-        {
-            if wrapper.is_some() {
-                cleanup
-                    .remove_longshot_install_record(&self.directory, &revision.runtime_libraries)?;
-                cleanup.remove_prompt_outputs(&self.directory.join("prompts"))?;
-                for name in ["logs", "bug-reports"] {
-                    cleanup.preserve_missing(
-                        &self.directory.join(name),
-                        &self.destination.join(name),
-                        0,
-                    )?;
-                }
-            }
-            // Upstream stores these generated files in cache/, or loose in older releases.
-            let cache = self.directory.join("cache");
-            let mut locations = vec![self.directory.as_path()];
-            if regular_metadata(&cache)?.is_some_and(|m| m.is_dir()) {
-                locations.push(&cache);
-            }
-            for directory in locations {
-                for name in [
-                    "longshot_programs.bin",
-                    "longshot_programs.idx",
-                    "longshot_programs.zst.bin",
-                    "longshot_programs.zst.idx",
-                    "longshot_module_ids.bin",
-                    "longshot_pipelines.bin",
-                    "longshot_pipelines.bin.predicted",
-                    "longshot_pipelines.bin.predicted_keys",
-                    "longshot_pipelines.bin.built",
-                    "longshot_computes.bin",
-                    "longshot_compute_variants.bin",
-                    "longshot_pipeline_states.bin",
-                    "longshot_pipeline_states_v1.bin",
-                    "longshot_pipeline_states_shipped.bin",
-                    "longshot_prepared.bin",
-                    "longshot_vk_pipelines.bin",
-                    "longshot_vk_pipelines.stamp",
-                    "longshot_textures_drawn.bin",
-                    "mkw_vk_pipelines.bin",
-                    "mkw_vk_pipelines.stamp",
-                    "longshot_shaders.bin",
-                    "longshot_load_start.txt",
-                ] {
-                    cleanup.remove_cache(&directory.join(name))?;
-                }
-                for entry in fs::read_dir(directory)?.take(4096) {
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    if name.to_str().is_some_and(Self::longshot_play_cache) {
-                        cleanup.remove_cache(&entry.path())?;
+            for key in ["customPath", "previousPath"] {
+                if let Some(path) = value[key].as_str().filter(|path| !path.is_empty()) {
+                    let path = PathBuf::from(path);
+                    ensure_safe_path(&path)?;
+                    if within(&path, folder) {
+                        profiles.push(path);
                     }
                 }
             }
-            let prompts = cache.join("prompts");
-            if regular_metadata(&prompts)?.is_some_and(|m| m.is_dir()) {
-                for name in [
-                    "Common.blarc.key",
-                    "Common.blarc.zs",
-                    "Common.bntx.zs",
-                    "Common.key",
-                    "External.bfotf.zs",
-                ] {
-                    cleanup.remove_cache(&prompts.join(name))?;
+        }
+        for profile in profiles {
+            for region in ["USA", "EUR", "JAP"] {
+                for card in ["A", "B"] {
+                    sources.push(profile.join(region).join(format!("Card {card}")));
+                    sources.push(profile.join(format!("MemoryCard{card}.{region}.raw")));
                 }
-                cleanup.remove_empty_dir(&prompts)?;
-            }
-            cleanup.remove_empty_dir(&cache)?;
-        }
-        if wrapper.is_none() && self.game == GameId::Triforce {
-            let (exefs, renderer) = match revision.oot_project {
-                source_build::OotProject::Triforce => (".triforce_exefs", "triforce_vk.dll"),
-                source_build::OotProject::Longshot => (".longshot_exefs", "longshot_vk.dll"),
-            };
-            for name in [exefs, "image.bin", renderer, "SDL2.dll", "SDL3.dll"] {
-                cleanup.remove_duplicates(
-                    &self.directory.join(name),
-                    &self.destination.join(name),
-                    0,
-                )?;
             }
         }
-        if wrapper.is_none() && matches!(self.game, GameId::Triforce | GameId::Totk) {
-            cleanup.remove_duplicates(
-                &self.directory.join("romfs"),
-                &self.destination.join("romfs"),
-                0,
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
+    for source in sources {
+        if found.iter().any(|parent| source.starts_with(parent)) || overlaps_any(&source, excluded)
+        {
+            continue;
+        }
+        ensure_safe_path(&source)?;
+        if source.try_exists()? {
+            found.retain(|previous| !previous.starts_with(&source));
+            found.push(source);
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let backups = root.join("retired-saves");
+    ensure_safe_path(&backups)?;
+    fs::create_dir_all(&backups)?;
+    ensure_safe_path(&backups)?;
+    let backup = tempfile::Builder::new()
+        .prefix("retired-")
+        .tempdir_in(&backups)?;
+    let mut files = 0;
+    let mut bytes = 0;
+    for source in found {
+        let destination = backup.path().join(source.strip_prefix(folder)?);
+        copy_saved_path(&source, &destination, progress, &mut files, &mut bytes, 0)?;
+    }
+    atomic_write(
+        &backup.path().join("source.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "source": folder,
+            "saved_files": files,
+            "saved_bytes": bytes,
+        }))?,
+    )?;
+    Ok(Some(backup.keep()))
+}
+
+fn copy_saved_path(
+    source: &Path,
+    destination: &Path,
+    progress: &mut CleanupReporter<'_>,
+    files: &mut usize,
+    total: &mut u64,
+    depth: usize,
+) -> Result<()> {
+    progress(CleanupProgress {
+        path: source,
+        bytes: 0,
+        removing: false,
+    })?;
+    ensure!(depth <= 32, "Retired save data is nested too deeply");
+    ensure_safe_path(source)?;
+    ensure_safe_path(destination)?;
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_saved_path(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                progress,
+                files,
+                total,
+                depth + 1,
             )?;
         }
-        if let Some(wrapper) = wrapper {
-            cleanup.remove(&program, program_size)?;
-            cleanup.inspect_version(&self.directory, &self.destination, 0)?;
-            cleanup.retire_version(&self.directory, &program, &receipt, program_lock)?;
-            cleanup.remove_empty_dir(wrapper)?;
-            ensure!(
-                !wrapper.try_exists()?,
-                "Old version folder remains: {}",
-                wrapper.display()
-            );
-            return Ok(cleanup.summary(&self.directory));
-        }
-        ensure!(
-            cleanup.locked == 0,
-            "{} duplicate files are still in use; {} Retry cleanup after Windows releases them.",
-            cleanup.locked,
-            cleanup.summary(&self.directory)
-        );
-        cleanup.remove(&program, program_size)?;
-        drop(program_lock);
-        Ok(cleanup.summary(&self.directory))
+        return Ok(());
     }
-
-    fn source_wrapper<'a>(
-        directory: &'a Path,
-        revision: &source_build::Revision,
-    ) -> Option<&'a Path> {
-        let wrapper = directory.parent()?;
-        let name = wrapper.file_name()?.to_str()?;
-        let suffix = name.strip_prefix(&format!(
-            "source-{}-{}-",
-            revision.tag,
-            &revision.commit[..12]
-        ))?;
-        (directory.file_name()? == "game"
-            && suffix.len() == 6
-            && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
-        .then_some(wrapper)
+    *files += 1;
+    *total = total
+        .checked_add(metadata.len())
+        .context("Retired save size overflow")?;
+    ensure!(
+        metadata.is_file()
+            && *files <= 150_000
+            && metadata.len() <= 128 * 1024 * 1024
+            && *total <= 256 * 1024 * 1024 * 1024,
+        "Retired save data exceeds its backup limit"
+    );
+    let parent = destination
+        .parent()
+        .context("Missing retired-save backup folder")?;
+    fs::create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
     }
-
-    fn longshot_play_cache(name: &str) -> bool {
-        name.strip_prefix("longshot_vk_pipelines_play_")
-            .or_else(|| name.strip_prefix("mkw_vk_pipelines_play_"))
-            .and_then(|suffix| suffix.strip_suffix(".bin"))
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    let mut previous = options.open(source)?;
+    let mut copy = tempfile::NamedTempFile::new_in(parent)?;
+    let mut hash = Sha256::new();
+    let mut copied = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = previous.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied += count as u64;
+        ensure!(copied <= metadata.len(), "Retired save grew during backup");
+        copy.write_all(&buffer[..count])?;
+        hash.update(&buffer[..count]);
+        progress(CleanupProgress {
+            path: source,
+            bytes: count as u64,
+            removing: false,
+        })?;
     }
-
-    fn compact_release(&self, program: &Path, protected: &[PathBuf]) -> Result<String> {
-        let (files, versioned) = install::previous_release_files(&self.directory, program)?;
-        let executable = files
-            .iter()
-            .find(|f| f.path == self.executable)
-            .context("Missing previous release program record")?;
-        source_build::games_stopped()?;
-        let mut cleanup = Compactor::new(protected.to_vec());
-        if versioned {
-            cleanup.plan = Some(HashMap::new());
-        }
-        let Some((program_lock, program_size)) =
-            cleanup.verify(program, &executable.sha256, Some(executable.size))?
-        else {
-            anyhow::bail!(
-                "Cannot verify the old program at {}: modified or missing.",
-                program.display()
-            );
-        };
-        for file in &files {
-            if file.path != self.executable {
-                let path = self.directory.join(&file.path);
-                if let Some((_lock, size)) = cleanup.verify(&path, &file.sha256, Some(file.size))? {
-                    cleanup.remove(&path, size)?;
-                }
-            }
-        }
-        if versioned {
-            let receipt = self.directory.join("twilight-install.json");
-            cleanup.remove(program, program_size)?;
-            cleanup.remove(&receipt, receipt.metadata()?.len())?;
-            cleanup.inspect_version(&self.directory, &self.destination, 0)?;
-            cleanup.retire_version(&self.directory, program, &receipt, program_lock)?;
-            return Ok(cleanup.summary(&self.directory));
-        }
-        cleanup.remove(program, program_size)?;
-        drop(program_lock);
-        Ok(cleanup.summary(&self.directory))
-    }
+    ensure!(
+        copied == metadata.len(),
+        "Retired save changed during backup"
+    );
+    copy.as_file().sync_all()?;
+    ensure!(
+        install::digest_file(copy.path(), copied)? == hex::encode(hash.finalize()),
+        "Retired-save backup verification failed"
+    );
+    copy.persist_noclobber(destination)
+        .with_context(|| format!("Preserving retired save {}", source.display()))?;
+    Ok(())
 }
 
 pub(crate) fn within(path: &Path, base: &Path) -> bool {
@@ -582,416 +739,6 @@ pub(crate) fn regular_metadata(path: &Path) -> Result<Option<Metadata>> {
     }
 }
 
-fn open_for_comparison(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
-        // Keep both copies stable while comparing and unlink only the old name.
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
-    }
-    options
-        .open(path)
-        .with_context(|| format!("Opening {}", path.display()))
-}
-
-struct Compactor {
-    removed: usize,
-    preserved: usize,
-    locked: usize,
-    bytes: u64,
-    visited: usize,
-    old_buffer: Vec<u8>,
-    new_buffer: Vec<u8>,
-    protected: Vec<PathBuf>,
-    plan: Option<HashMap<PathBuf, (u64, std::time::SystemTime)>>,
-    directories: Vec<PathBuf>,
-}
-
-impl Compactor {
-    fn remove_cache(&mut self, path: &Path) -> Result<()> {
-        if !overlaps_any(path, &self.protected)
-            && let Some(metadata) = regular_metadata(path)?
-            && metadata.is_file()
-        {
-            self.remove(path, metadata.len())?;
-        }
-        Ok(())
-    }
-
-    fn new(protected: Vec<PathBuf>) -> Self {
-        Self {
-            removed: 0,
-            preserved: 0,
-            locked: 0,
-            bytes: 0,
-            visited: 0,
-            old_buffer: vec![0; 64 * 1024],
-            new_buffer: vec![0; 64 * 1024],
-            protected,
-            plan: None,
-            directories: Vec::new(),
-        }
-    }
-}
-
-impl Compactor {
-    fn remove_longshot_install_record(
-        &mut self,
-        directory: &Path,
-        libraries: &[(String, String)],
-    ) -> Result<()> {
-        #[derive(Deserialize)]
-        struct InstalledFile {
-            sha1: String,
-        }
-        let path = directory.join(".longshot_installed.json");
-        if !regular_metadata(&path)?.is_some_and(|m| m.is_file()) {
-            return Ok(());
-        }
-        let installed: HashMap<String, InstalledFile> = serde_json::from_slice(&read(&path)?)
-            .context("Reading Longshot's installation record")?;
-        ensure!(
-            installed.len() <= 4096,
-            "Longshot installation record exceeds its limit"
-        );
-        for name in source_build::oot_runtime_libraries(source_build::OotProject::Longshot) {
-            // Older source receipts did not record DLL hashes; never override a newer SHA-256 receipt.
-            if libraries.iter().any(|(recorded, _)| recorded == name) {
-                continue;
-            }
-            let Some(record) = installed.get(name) else {
-                continue;
-            };
-            ensure!(
-                record.sha1.len() == 40 && record.sha1.bytes().all(|b| b.is_ascii_hexdigit()),
-                "Invalid Longshot installed file hash: {name}"
-            );
-            let file = directory.join(name);
-            if overlaps_any(&file, &self.protected)
-                || !regular_metadata(&file)?.is_some_and(|m| m.is_file())
-            {
-                continue;
-            }
-            ensure_safe_path(&file)?;
-            let mut locked = open_for_comparison(&file)?;
-            let size = locked.metadata()?.len();
-            let mut hash = Sha1::new();
-            loop {
-                let count = locked.read(&mut self.old_buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&self.old_buffer[..count]);
-            }
-            if hex::encode(hash.finalize()).eq_ignore_ascii_case(&record.sha1) {
-                self.remove(&file, size)?;
-            }
-        }
-        self.remove_cache(&path)
-    }
-
-    fn remove_prompt_outputs(&mut self, directory: &Path) -> Result<()> {
-        #[derive(Deserialize)]
-        struct PromptRecord {
-            outputs: HashMap<PathBuf, Option<(u64, String)>>,
-        }
-        let key = directory.join(".prompt_key");
-        if !regular_metadata(&key)?.is_some_and(|m| m.is_file()) {
-            return Ok(());
-        }
-        let record: PromptRecord = serde_json::from_slice(&read(&key)?)
-            .context("Reading Longshot's generated prompt record")?;
-        ensure!(
-            record.outputs.len() <= 4096,
-            "Longshot prompt record exceeds its limit"
-        );
-        for (relative, output) in record.outputs {
-            ensure!(
-                !relative.as_os_str().is_empty()
-                    && relative
-                        .components()
-                        .all(|part| { matches!(part, std::path::Component::Normal(_)) }),
-                "Unsafe generated prompt path: {}",
-                relative.display()
-            );
-            if let Some((size, hash)) = output {
-                ensure!(valid_hash(&hash), "Invalid generated prompt hash");
-                let path = directory.join(relative);
-                if let Some((_lock, size)) = self.verify(&path, &hash, Some(size))? {
-                    self.remove(&path, size)?;
-                }
-            }
-        }
-        self.remove_cache(&key)
-    }
-
-    fn preserve_missing(&mut self, old: &Path, new: &Path, depth: usize) -> Result<()> {
-        if self.protected.iter().any(|path| within(old, path)) {
-            return Ok(());
-        }
-        self.visited += 1;
-        ensure!(
-            depth <= 32 && self.visited <= 500_000,
-            "Old diagnostics exceed the cleanup scan limit"
-        );
-        let Some(metadata) = regular_metadata(old)? else {
-            return Ok(());
-        };
-        ensure_safe_path(old)?;
-        ensure_safe_path(new)?;
-        if metadata.is_dir() {
-            for entry in fs::read_dir(old)? {
-                let entry = entry?;
-                self.preserve_missing(&entry.path(), &new.join(entry.file_name()), depth + 1)?;
-            }
-        } else if metadata.is_file() && !new.try_exists()? {
-            let parent = new.parent().context("Missing diagnostic destination")?;
-            fs::create_dir_all(parent)?;
-            let mut previous = open_for_comparison(old)?;
-            let mut copy = tempfile::NamedTempFile::new_in(parent)?;
-            ensure!(
-                std::io::copy(&mut previous, &mut copy)? == metadata.len(),
-                "Old diagnostic changed during preservation: {}",
-                old.display()
-            );
-            copy.as_file().sync_all()?;
-            copy.persist_noclobber(new)
-                .with_context(|| format!("Preserving old diagnostics at {}", new.display()))?;
-            self.preserved += 1;
-        }
-        Ok(())
-    }
-
-    fn verify(
-        &self,
-        path: &Path,
-        hash: &str,
-        expected: Option<u64>,
-    ) -> Result<Option<(File, u64)>> {
-        if overlaps_any(path, &self.protected)
-            || !regular_metadata(path)?.is_some_and(|m| m.is_file())
-        {
-            return Ok(None);
-        }
-        ensure_safe_path(path)?;
-        let locked = open_for_comparison(path)?;
-        let size = locked.metadata()?.len();
-        if expected.is_some_and(|expected| size != expected)
-            || install::digest_file(path, size)? != hash
-        {
-            return Ok(None);
-        }
-        Ok(Some((locked, size)))
-    }
-
-    fn remove(&mut self, path: &Path, bytes: u64) -> Result<()> {
-        ensure_safe_path(path)?;
-        if let Some(plan) = &mut self.plan {
-            let metadata = path.metadata()?;
-            ensure!(
-                metadata.len() == bytes,
-                "File changed during cleanup: {}",
-                path.display()
-            );
-            plan.insert(path.to_path_buf(), (bytes, metadata.modified()?));
-            return Ok(());
-        }
-        fs::remove_file(path).with_context(|| format!("Removing old file {}", path.display()))?;
-        self.removed += 1;
-        self.bytes = self.bytes.saturating_add(bytes);
-        Ok(())
-    }
-
-    fn remove_duplicates(&mut self, old: &Path, new: &Path, depth: usize) -> Result<()> {
-        if self.protected.iter().any(|path| within(old, path)) {
-            return Ok(());
-        }
-        self.visited += 1;
-        ensure!(
-            self.visited <= 500_000 && depth <= 32,
-            "Old game data exceeds the duplicate-check limit"
-        );
-        let (Some(a), Some(b)) = (regular_metadata(old)?, regular_metadata(new)?) else {
-            return Ok(());
-        };
-        if a.is_dir() && b.is_dir() {
-            for entry in fs::read_dir(old)? {
-                let name = entry?.file_name();
-                self.remove_duplicates(&old.join(&name), &new.join(name), depth + 1)?;
-            }
-            self.remove_empty_dir(old)?;
-        } else if a.is_file()
-            && b.is_file()
-            && a.len() == b.len()
-            && !overlaps_any(old, &self.protected)
-        {
-            ensure_safe_path(old)?;
-            ensure_safe_path(new)?;
-            let mut previous = open_for_comparison(old)?;
-            let mut current = open_for_comparison(new)?;
-            let size = previous.metadata()?.len();
-            if current.metadata()?.len() == size
-                && self.matches(&mut previous, &mut current, size)?
-            {
-                match self.remove(old, size) {
-                    Ok(()) => {}
-                    #[cfg(windows)]
-                    Err(error)
-                        if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.raw_os_error() == Some(32)) =>
-                    {
-                        self.locked += 1;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn remove_empty_dir(&self, path: &Path) -> Result<()> {
-        if self.plan.is_none()
-            && !overlaps_any(path, &self.protected)
-            && regular_metadata(path)?.is_some_and(|m| m.is_dir())
-        {
-            ensure_safe_path(path)?;
-            match fs::remove_dir(path) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Removing empty folder {}", path.display()));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn inspect_version(&mut self, old: &Path, new: &Path, depth: usize) -> Result<()> {
-        self.visited += 1;
-        ensure!(
-            depth <= 32 && self.visited <= 500_000,
-            "Old version exceeds the cleanup scan limit"
-        );
-        let metadata = regular_metadata(old)?
-            .with_context(|| format!("Unsupported path in old version: {}", old.display()))?;
-        ensure!(
-            !self.protected.iter().any(|path| within(old, path)),
-            "Old version is still referenced at {}. Update the path before retrying cleanup.",
-            old.display()
-        );
-        if metadata.is_dir() {
-            for entry in fs::read_dir(old)? {
-                let entry = entry?;
-                self.inspect_version(&entry.path(), &new.join(entry.file_name()), depth + 1)?;
-            }
-            self.directories.push(old.into());
-        } else {
-            ensure!(metadata.is_file(), "Unsupported file: {}", old.display());
-            if !self
-                .plan
-                .as_ref()
-                .is_some_and(|plan| plan.contains_key(old))
-            {
-                self.remove_duplicates(old, new, depth)?;
-            }
-            ensure!(
-                self.plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.contains_key(old)),
-                "Old version has data not verified in the replacement: {}. Preserve or move it before retrying cleanup.",
-                old.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn retire_version(
-        &mut self,
-        directory: &Path,
-        program: &Path,
-        receipt: &Path,
-        program_lock: File,
-    ) -> Result<()> {
-        source_build::games_stopped()?;
-        let mut plan = self.plan.take().context("Missing version cleanup plan")?;
-        for (path, &(size, modified)) in &plan {
-            ensure_safe_path(path)?;
-            let metadata = path.metadata()?;
-            ensure!(
-                metadata.len() == size && metadata.modified()? == modified,
-                "Old version changed during cleanup: {}",
-                path.display()
-            );
-        }
-        let program_size = plan.remove(program).context("Missing previous program")?.0;
-        let receipt_size = plan.remove(receipt).context("Missing previous receipt")?.0;
-        for (path, (size, _)) in plan {
-            self.remove(&path, size)?;
-        }
-        self.remove(program, program_size)?;
-        drop(program_lock);
-        for path in &self.directories {
-            if path != directory {
-                self.remove_empty_dir(path)?;
-                ensure!(
-                    !path.try_exists()?,
-                    "Old version gained files during cleanup: {}",
-                    path.display()
-                );
-            }
-        }
-        self.remove(receipt, receipt_size)?;
-        fs::remove_dir(directory)
-            .with_context(|| format!("Removing old version folder {}", directory.display()))
-    }
-
-    fn summary(&self, previous: &Path) -> String {
-        let preserved = if self.preserved > 0 {
-            format!(
-                " Preserved {} missing diagnostic files in the replacement.",
-                self.preserved
-            )
-        } else {
-            String::new()
-        };
-        let residual = if previous.is_dir() {
-            format!(
-                " Remaining data and unrecognized files were kept at {}.",
-                previous.display()
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            "Removed {} old program, cache, or duplicate data files ({:.2} GiB by file size).{preserved}{residual}",
-            self.removed,
-            self.bytes as f64 / (1024_u64.pow(3) as f64)
-        )
-    }
-
-    fn matches(&mut self, previous: &mut File, current: &mut File, mut size: u64) -> Result<bool> {
-        while size > 0 {
-            let count = size.min(self.old_buffer.len() as u64) as usize;
-            previous.read_exact(&mut self.old_buffer[..count])?;
-            current.read_exact(&mut self.new_buffer[..count])?;
-            if self.old_buffer[..count] != self.new_buffer[..count] {
-                return Ok(false);
-            }
-            size -= count as u64;
-        }
-        Ok(previous.read(&mut [0])? == 0 && current.read(&mut [0])? == 0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,8 +747,8 @@ mod tests {
 
     fn seed_source(path: &Path, game: GameId, project: &str, executable: &str) -> Result<PathBuf> {
         fs::create_dir_all(path)?;
-        let exe = path.join(executable);
-        fs::write(&exe, b"old verified program")?;
+        let executable = path.join(executable);
+        fs::write(&executable, b"old verified program")?;
         fs::write(
             path.join("twilight-source.json"),
             serde_json::to_vec(&json!({
@@ -1010,482 +757,381 @@ mod tests {
                 "sha256": sha256(b"old verified program"),
             }))?,
         )?;
-        Ok(exe)
+        Ok(executable)
     }
 
     #[test]
-    fn retires_longshot_without_touching_triforce_or_unique_files() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let managed = root.join("Games").join("Longshot");
-        let old = managed
-            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
-            .join("game");
-        let new = managed
-            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
-            .join("game");
-        let alternate = root.join("Games").join("Triforce");
-        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
-        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
-        let alternate_exe = seed_source(&alternate, GameId::Triforce, "triforce", "Triforce.exe")?;
-        fs::write(old.join("longshot_vk.dll"), b"old verified renderer")?;
-        fs::write(new.join("longshot_vk.dll"), b"replacement renderer")?;
-        let receipt = old.join("twilight-source.json");
-        let mut label: serde_json::Value = serde_json::from_slice(&fs::read(&receipt)?)?;
-        label["runtime_libraries"] = json!([["longshot_vk.dll", sha256(b"old verified renderer")]]);
-        fs::write(receipt, serde_json::to_vec(&label)?)?;
-        for directory in [&old, &new] {
-            fs::create_dir(directory.join("romfs"))?;
-            fs::write(directory.join("romfs").join("same"), b"same game data")?;
-            fs::write(directory.join("romfs").join("referenced"), b"same but kept")?;
+    fn all_games_retire_different_assets_and_preserve_old_saves_without_replacing_current_progress()
+    -> Result<()> {
+        for (game, project, name, executable, save) in [
+            (
+                GameId::Dusklight,
+                "triforce",
+                "Dusklight",
+                "dusklight.exe",
+                "data\\USA\\Card A\\01-GZ2E-gczelda2.gci",
+            ),
+            (
+                GameId::Totk,
+                "triforce",
+                "TotKRecomp",
+                "totk.exe",
+                "profile\\save\\account\\progress.sav",
+            ),
+            (
+                GameId::Triforce,
+                "triforce",
+                "Triforce",
+                "Triforce.exe",
+                "user\\save\\account\\progress.sav",
+            ),
+            (
+                GameId::Triforce,
+                "longshot",
+                "Longshot",
+                "longshot.exe",
+                "user\\save\\account\\progress.sav",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path();
+            let managed = root.join("Games").join(name);
+            let old_wrapper = managed.join("source-v1.2.3-aaaaaaaaaaaa-Abc123");
+            let old = old_wrapper.join("game");
+            let new = managed
+                .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+                .join("game");
+            let old_exe = seed_source(&old, game, project, executable)?;
+            let new_exe = seed_source(&new, game, project, executable)?;
+            fs::write(&old_exe, b"modified old program must not block removal")?;
+            for (directory, progress) in [
+                (&old, b"old progress".as_slice()),
+                (&new, b"current progress"),
+            ] {
+                let path = directory.join(save);
+                fs::create_dir_all(path.parent().context("Missing save parent")?)?;
+                fs::write(path, progress)?;
+                fs::write(directory.join("assets.bin"), progress)?;
+                fs::create_dir(directory.join("mods"))?;
+                fs::write(directory.join("mods").join("custom"), progress)?;
+            }
+            let unrelated = root.join("unmanaged");
+            fs::create_dir(&unrelated)?;
+            fs::write(unrelated.join("keep"), b"unrelated installation")?;
+            let mut read = 0;
+            let cleanup = SourceBackup::previous(root, &managed, game, &old_exe, &new_exe, vec![])
+                .context("Missing previous managed build")?;
+            let detail = cleanup.compact_with_progress(root, &mut |update| {
+                if update.bytes > 0 {
+                    assert!(!update.path.ends_with("assets.bin"));
+                    assert!(!update.path.ends_with(executable));
+                    read += update.bytes;
+                }
+                Ok(())
+            })?;
+            assert!(!old_wrapper.exists(), "{name}: {detail}");
+            assert_eq!(fs::read(new.join(save))?, b"current progress");
+            assert_eq!(
+                fs::read(new.join("mods").join("custom"))?,
+                b"current progress"
+            );
+            assert!(new_exe.is_file() && unrelated.join("keep").is_file());
+            let archive = fs::read_dir(root.join("retired-saves"))?
+                .next()
+                .context("Missing retired saves")??
+                .path();
+            assert_eq!(fs::read(archive.join("game").join(save))?, b"old progress");
+            assert_eq!(read, b"old progress".len() as u64);
+            assert!(detail.contains("without comparing game assets"));
         }
-        fs::write(old.join("romfs").join("unique"), b"old payload")?;
-        fs::write(old.join("longshot_env.txt"), b"user settings")?;
-        fs::create_dir(old.join("cache"))?;
-        fs::write(
-            old.join("cache").join("longshot_programs.zst.bin"),
-            b"generated",
-        )?;
-        fs::write(
-            old.join("cache").join("longshot_vk_pipelines_play_17.bin"),
-            b"generated",
-        )?;
-        fs::write(old.join("cache").join("custom.bin"), b"not a known cache")?;
-        fs::create_dir(old.join("mods"))?;
-        fs::write(old.join("mods").join("local"), b"user mod")?;
-        fs::write(
-            root.join("source-builds.json"),
-            serde_json::to_vec(&json!({
-                "triforce_install": alternate, "longshot_install": new,
-                "triforce": { "game_input": old.join("romfs").join("referenced") }
-            }))?,
-        )?;
-        assert!(
-            SourceBackup::previous(
+        Ok(())
+    }
+
+    #[test]
+    fn official_dusklight_and_totk_installs_use_saves_only_retirement() -> Result<()> {
+        for (game, project, executable, save) in [
+            (
+                GameId::Dusklight,
+                "Dusklight",
+                "dusklight.exe",
+                "custom-profile\\MemoryCardA.USA.raw",
+            ),
+            (
+                GameId::Totk,
+                "TotKRecomp",
+                "totk.exe",
+                "profile\\save\\account\\progress.sav",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path();
+            let managed = root.join("Games").join(project);
+            let previous = managed.join("v1.2.3-aaaaaaaaaaaa");
+            let old = seed_source(&previous, game, "triforce", executable)?;
+            fs::remove_file(previous.join("twilight-source.json"))?;
+            if game == GameId::Dusklight {
+                fs::write(
+                    previous.join("data_location.json"),
+                    serde_json::to_vec(&json!({
+                        "version": 1, "mode": "custom",
+                        "customPath": previous.join("custom-profile"),
+                    }))?,
+                )?;
+                fs::write(
+                    previous.join("twilight-install.json"),
+                    serde_json::to_vec(&json!({
+                        "version": 1, "tag": "v1.2.3", "archive_sha256": "a".repeat(64),
+                        "executable": executable,
+                        "files": [{"path": executable, "size": 20, "sha256": sha256(b"old verified program")}]
+                    }))?,
+                )?;
+            } else {
+                fs::write(
+                    previous.join("totk-install.json"),
+                    serde_json::to_vec(&json!({
+                        "format": 1, "release": "v1.2.3", "steps": {"complete": true}
+                    }))?,
+                )?;
+            }
+            let path = previous.join(save);
+            fs::create_dir_all(path.parent().context("Missing previous save folder")?)?;
+            fs::write(path, b"previous progress")?;
+            fs::write(previous.join("old-settings.ini"), b"discard old settings")?;
+            let next = seed_source(&managed.join("next"), game, "triforce", executable)?;
+            SourceBackup::previous(root, &managed, game, &old, &next, vec![])
+                .context("Missing previous official installation")?
+                .compact(root)?;
+            assert!(!previous.exists() && next.is_file());
+            let backup = fs::read_dir(root.join("retired-saves"))?
+                .next()
+                .context("Missing previous save backup")??
+                .path();
+            assert_eq!(fs::read(backup.join(save))?, b"previous progress");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn save_backup_failure_or_cancellation_keeps_the_old_install() -> Result<()> {
+        for cancel in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path();
+            let managed = root.join("Games").join("Longshot");
+            let old = managed
+                .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+                .join("game");
+            let new = managed
+                .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+                .join("game");
+            let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+            let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+            fs::create_dir_all(old.join("user").join("save"))?;
+            let bytes = vec![9; 192 * 1024];
+            let save = old.join("user").join("save").join("progress.sav");
+            fs::write(&save, &bytes)?;
+            if !cancel {
+                fs::write(root.join("retired-saves"), b"backup storage is unavailable")?;
+            }
+            let cleanup = SourceBackup::previous(
                 root,
                 &managed,
                 GameId::Triforce,
-                &alternate_exe,
+                &old_exe,
                 &new_exe,
-                vec![]
+                vec![],
             )
-            .is_none()
-        );
-        let error = SourceBackup::compact_source_siblings(
-            root,
-            &managed,
-            GameId::Triforce,
-            &new_exe,
-            None,
-            &[],
-        )
-        .err()
-        .context("Unaccounted-for data must block retirement")?;
-        assert!(format!("{error:#}").contains(&old.display().to_string()));
-        for path in [
-            old_exe.clone(),
-            old.join("romfs").join("same"),
-            old.join("cache").join("longshot_programs.zst.bin"),
-            old.join("romfs").join("referenced"),
-            old.join("romfs").join("unique"),
-            old.join("longshot_env.txt"),
-            old.join("mods").join("local"),
-            old.join("cache").join("custom.bin"),
-            new_exe.clone(),
-            alternate_exe,
-        ] {
-            assert!(path.is_file(), "{path:?}");
+            .context("Missing previous build")?;
+            let mut read = 0;
+            let error = cleanup
+                .compact_with_progress(root, &mut |update| {
+                    assert!(
+                        !update.removing,
+                        "Deletion began before saves were preserved"
+                    );
+                    read += update.bytes;
+                    if cancel && update.bytes > 0 {
+                        return Err(source_build::Cancelled.into());
+                    }
+                    Ok(())
+                })
+                .err()
+                .context("Failed save preservation did not stop removal")?;
+            assert_eq!(source_build::is_cancelled(&error), cancel);
+            if cancel {
+                assert!(read > 0 && read < bytes.len() as u64);
+            }
+            assert_eq!(fs::read(save)?, bytes);
+            assert!(old_exe.is_file() && new_exe.is_file());
         }
-        fs::remove_file(root.join("source-builds.json"))?;
-        for relative in [
-            "romfs/referenced",
-            "romfs/unique",
-            "longshot_env.txt",
-            "mods/local",
-            "cache/custom.bin",
-        ] {
-            let destination = new.join(relative);
-            fs::create_dir_all(destination.parent().context("Missing fixture parent")?)?;
-            fs::copy(old.join(relative), destination)?;
-        }
-        fs::create_dir(old.join("user"))?;
-        fs::create_dir(new.join("user"))?;
-        let old_save = old.join("user").join("progress.sav");
-        let new_save = new.join("user").join("progress.sav");
-        fs::write(&old_save, b"old progress")?;
-        fs::write(&new_save, b"different progress")?;
-        let error = SourceBackup::compact_source_siblings(
-            root,
-            &managed,
-            GameId::Triforce,
-            &new_exe,
-            None,
-            &[],
-        )
-        .err()
-        .context("Different progress must block retirement")?;
-        assert!(format!("{error:#}").contains("progress.sav"));
-        assert_eq!(fs::read(&new_save)?, b"different progress");
-        assert!(old_exe.is_file());
-        fs::copy(old_save, new_save)?;
+        Ok(())
+    }
+
+    #[test]
+    fn siblings_keep_other_projects_newer_builds_and_referenced_versions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let managed = root.join("Games").join("Longshot");
+        let old_wrapper = managed.join("source-v1.2.3-aaaaaaaaaaaa-Abc123");
+        let old = old_wrapper.join("game");
+        seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let active = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let active_exe = seed_source(&active, GameId::Triforce, "longshot", "longshot.exe")?;
+        let triforce = root.join("Games").join("Triforce");
+        let triforce_exe = seed_source(&triforce, GameId::Triforce, "triforce", "Triforce.exe")?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let newer = managed
+            .join("source-v1.2.5-cccccccccccc-Ghi789")
+            .join("game");
+        let newer_exe = seed_source(&newer, GameId::Triforce, "longshot", "longshot.exe")?;
+        fs::write(
+            root.join("source-builds.json"),
+            serde_json::to_vec(&json!({
+                "game_input": old.join("romfs")
+            }))?,
+        )?;
         SourceBackup::compact_source_siblings(
             root,
             &managed,
             GameId::Triforce,
-            &new_exe,
+            &active_exe,
             None,
             &[],
         )?;
-        assert!(!old.parent().context("Missing old wrapper")?.exists());
-        assert_eq!(fs::read(new.join("mods").join("local"))?, b"user mod");
+        assert!(old.is_dir());
+        fs::remove_file(root.join("source-builds.json"))?;
+        fs::remove_file(old.join("twilight-source.json"))?;
+        fs::remove_file(old.join("longshot.exe"))?;
+        SourceBackup::compact_source_siblings(
+            root,
+            &managed,
+            GameId::Triforce,
+            &active_exe,
+            None,
+            &[],
+        )?;
+        assert!(
+            !old_wrapper.exists(),
+            "A partially removed old version must be resumable"
+        );
+        assert!(active_exe.is_file() && newer_exe.is_file() && triforce_exe.is_file());
         Ok(())
     }
 
     #[test]
-    fn legacy_longshot_retirement_verifies_generated_assets_and_preserves_diagnostics() -> Result<()>
-    {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let managed = root.join("Games").join("Longshot");
-        let old = managed
-            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
-            .join("game");
-        let new = managed
-            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
-            .join("game");
-        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
-        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
-        fs::write(old.join("longshot_vk.dll"), b"old renderer")?;
-        fs::write(new.join("longshot_vk.dll"), b"new renderer")?;
-        fs::write(
-            old.join(".longshot_installed.json"),
-            serde_json::to_vec(&json!({
-                "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"old renderer"))}
-            }))?,
-        )?;
-        let new_record = serde_json::to_vec(&json!({
-            "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"new renderer"))}
-        }))?;
-        fs::write(new.join(".longshot_installed.json"), &new_record)?;
-        for directory in [&old, &new] {
-            fs::create_dir_all(directory.join("prompts"))?;
-            fs::create_dir_all(directory.join("cache").join("prompts"))?;
-            fs::create_dir_all(directory.join("logs"))?;
-            fs::create_dir_all(directory.join("bug-reports").join("pending"))?;
-            fs::create_dir_all(directory.join("user"))?;
-            fs::write(
-                directory.join("user").join("progress.sav"),
-                b"saved progress",
-            )?;
-        }
-        let prompt = old.join("prompts").join("External.bfotf");
-        fs::write(&prompt, b"generated old font")?;
-        fs::write(
-            new.join("prompts").join("External.bfotf"),
-            b"generated new font",
-        )?;
-        fs::write(
-            old.join("prompts").join("rsizetable.zs"),
-            b"generated table",
-        )?;
-        fs::write(
-            old.join("prompts").join(".prompt_key"),
-            serde_json::to_vec(&json!({"outputs": {
-                "External.bfotf": [18, sha256(b"generated old font")],
-                "rsizetable.zs": [15, sha256(b"generated table")]
-            }}))?,
-        )?;
-        fs::write(
-            new.join("prompts").join(".prompt_key"),
-            b"new prompt record",
-        )?;
-        fs::write(
-            old.join("longshot_pipeline_states_shipped.bin"),
-            b"old shipped cache",
-        )?;
-        fs::write(
-            new.join("longshot_pipeline_states_shipped.bin"),
-            b"new shipped cache",
-        )?;
-        fs::write(
-            old.join("cache").join("longshot_load_start.txt"),
-            b"old timings",
-        )?;
-        fs::write(
-            old.join("cache").join("prompts").join("Common.key"),
-            b"generated prompt cache",
-        )?;
-        fs::write(
-            old.join("logs").join("longshot_log.txt"),
-            b"old diagnostics",
-        )?;
-        fs::write(old.join("bug-reports").join("shown.txt"), b"")?;
-        fs::write(
-            old.join("bug-reports").join("pending").join("report.txt"),
-            b"pending report",
-        )?;
-        fs::write(old.join("custom.json"), b"unrecognized user data")?;
-        let cleanup =
-            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
-                .context("Expected a previous Longshot build")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Custom data must block cleanup")?;
-        assert!(format!("{error:#}").contains("custom.json"));
-        assert!(old_exe.is_file());
-        assert_eq!(fs::read(&prompt)?, b"generated old font");
-        assert_eq!(fs::read(new.join(".longshot_installed.json"))?, new_record);
-        fs::copy(old.join("custom.json"), new.join("custom.json"))?;
-
-        let new_log = new.join("logs").join("longshot_log.txt");
-        fs::write(&new_log, b"new diagnostics")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Existing diagnostics must not be overwritten")?;
-        assert!(format!("{error:#}").contains("longshot_log.txt"));
-        assert_eq!(fs::read(&new_log)?, b"new diagnostics");
-        assert_eq!(
-            fs::read(old.join("logs").join("longshot_log.txt"))?,
-            b"old diagnostics"
-        );
-        assert!(old_exe.is_file());
-        fs::write(&new_log, b"old diagnostics")?;
-
-        fs::write(&prompt, b"customized old font")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Modified prompt assets must be kept")?;
-        assert!(format!("{error:#}").contains("External.bfotf"));
-        assert!(old_exe.is_file());
-        fs::write(&prompt, b"generated old font")?;
-        let summary = cleanup.compact(root)?;
-        assert!(!old.parent().context("Missing old wrapper")?.exists());
-        assert!(summary.contains("Removed"));
-        assert_eq!(
-            fs::read(new.join("logs").join("longshot_log.txt"))?,
-            b"old diagnostics"
-        );
-        assert_eq!(
-            fs::read(new.join("bug-reports").join("pending").join("report.txt"))?,
-            b"pending report",
-        );
-        assert_eq!(
-            fs::read(new.join("user").join("progress.sav"))?,
-            b"saved progress"
-        );
-        assert_eq!(fs::read(new.join(".longshot_installed.json"))?, new_record);
-        assert_eq!(
-            fs::read(new.join("prompts").join("External.bfotf"))?,
-            b"generated new font"
-        );
-        assert_eq!(
-            fs::read(new.join("longshot_pipeline_states_shipped.bin"))?,
-            b"new shipped cache"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn longshot_install_records_do_not_override_receipts_or_references() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let managed = root.join("Games").join("Longshot");
-        let old = managed
-            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
-            .join("game");
-        let new = managed
-            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
-            .join("game");
-        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
-        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
-        fs::write(old.join("longshot_vk.dll"), b"modified renderer")?;
-        fs::write(new.join("longshot_vk.dll"), b"replacement renderer")?;
-        let receipt = old.join("twilight-source.json");
-        let mut label: serde_json::Value = serde_json::from_slice(&fs::read(&receipt)?)?;
-        label["runtime_libraries"] = json!([["longshot_vk.dll", sha256(b"verified renderer")]]);
-        fs::write(&receipt, serde_json::to_vec(&label)?)?;
-        let record = old.join(".longshot_installed.json");
-        fs::write(
-            &record,
-            serde_json::to_vec(&json!({
-                "longshot_vk.dll": {"sha1": hex::encode(Sha1::digest(b"modified renderer"))}
-            }))?,
-        )?;
-        let cleanup =
-            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
-                .context("Expected a previous Longshot build")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("The SHA-256 receipt must take priority")?;
-        assert!(format!("{error:#}").contains("longshot_vk.dll"));
-        assert!(old_exe.is_file());
-        assert_eq!(fs::read(old.join("longshot_vk.dll"))?, b"modified renderer");
-
-        fs::write(old.join("longshot_vk.dll"), b"verified renderer")?;
-        fs::write(
-            root.join("source-builds.json"),
-            serde_json::to_vec(&json!({"triforce": {"game_input": record}}))?,
-        )?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Referenced metadata must be kept")?;
-        assert!(format!("{error:#}").contains("still referenced"));
-        assert!(old_exe.is_file());
-        assert!(record.is_file());
-        Ok(())
-    }
-
-    #[test]
-    fn longshot_prompt_records_cannot_authorize_cleanup_outside_prompts() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path();
-        let managed = root.join("Games").join("Longshot");
-        let old = managed
-            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
-            .join("game");
-        let new = managed
-            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
-            .join("game");
-        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
-        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
-        fs::write(old.join("progress.sav"), b"unique progress")?;
-        fs::create_dir(old.join("prompts"))?;
-        fs::write(
-            old.join("prompts").join(".prompt_key"),
-            serde_json::to_vec(&json!({"outputs": {
-                "../progress.sav": [15, sha256(b"unique progress")]
-            }}))?,
-        )?;
-        let cleanup =
-            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
-                .context("Expected a previous Longshot build")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Prompt paths must not escape their directory")?;
-        assert!(format!("{error:#}").contains("Unsafe generated prompt path"));
-        assert!(old_exe.is_file());
-        assert_eq!(fs::read(old.join("progress.sav"))?, b"unique progress");
-        Ok(())
-    }
-
-    #[test]
-    fn another_version_blocks_building_even_after_partial_cleanup() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let managed = temp.path();
-        let active = managed
-            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
-            .join("game");
-        seed_source(&active, GameId::Triforce, "longshot", "longshot.exe")?;
-        fs::create_dir(managed.join("source-my-notes"))?;
-        SourceBackup::require_no_extra_source_versions(managed, Some(&active))?;
-        let leftover = managed
-            .join("source-v1.2.2-bbbbbbbbbbbb-Def456")
-            .join("game");
-        fs::create_dir_all(&leftover)?;
-        fs::write(leftover.join("progress.sav"), b"unresolved save")?;
-        let error = SourceBackup::require_no_extra_source_versions(managed, Some(&active))
-            .err()
-            .context("A leftover version must block a new build even without a receipt")?;
-        assert!(error.to_string().contains("Def456"));
-        assert_eq!(fs::read(leftover.join("progress.sav"))?, b"unresolved save");
-        assert!(active.join("longshot.exe").is_file());
-        Ok(())
-    }
-
-    #[test]
-    fn stable_parent_is_preserved_and_empty_versioned_build_is_removed() -> Result<()> {
+    fn stable_parent_cleanup_preserves_active_and_pending_version_folders() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let managed = root.join("Games").join("TotKRecomp");
-        let stage = managed.join("source-v1.2.3-aaaaaaaaaaaa-Abc123");
-        let old_exe = seed_source(&managed, GameId::Totk, "triforce", "totk.exe")?;
-        let staged_exe = seed_source(&stage.join("game"), GameId::Totk, "triforce", "totk.exe")?;
-        fs::write(managed.join("custom.txt"), b"local custom file")?;
-        fs::write(
-            root.join("settings.json"),
-            serde_json::to_vec(&json!({"next": staged_exe}))?,
-        )?;
-        SourceBackup::previous(root, &managed, GameId::Totk, &old_exe, &staged_exe, vec![])
-            .context("Expected the stable predecessor")?
-            .compact(root)?;
-        assert!(!old_exe.exists());
-        assert!(staged_exe.is_file());
-        assert_eq!(fs::read(managed.join("custom.txt"))?, b"local custom file");
-
-        let next_exe = seed_source(
-            &managed.join("next").join("game"),
-            GameId::Totk,
-            "triforce",
-            "totk.exe",
-        )?;
-        let cleanup =
-            SourceBackup::previous(root, &managed, GameId::Totk, &staged_exe, &next_exe, vec![])
-                .context("Expected the old staged build")?;
-        let error = cleanup
-            .compact(root)
-            .err()
-            .context("Referenced predecessor must not be retired")?;
-        assert!(error.to_string().contains("still referenced"));
-        assert!(staged_exe.is_file());
-        fs::remove_file(root.join("settings.json"))?;
+        let old = seed_source(&managed, GameId::Totk, "triforce", "totk.exe")?;
+        let active = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let next = seed_source(&active, GameId::Totk, "triforce", "totk.exe")?;
+        let pending = managed
+            .join("source-v1.2.5-cccccccccccc-Ghi789")
+            .join("game");
+        let pending_exe = seed_source(&pending, GameId::Totk, "triforce", "totk.exe")?;
+        fs::write(managed.join("old-assets.bin"), b"old assets")?;
+        let cleanup = SourceBackup::previous(root, &managed, GameId::Totk, &old, &next, vec![])
+            .context("Missing stable predecessor")?;
         cleanup.compact(root)?;
-        assert!(!stage.exists());
-        assert!(next_exe.is_file());
+        assert!(!old.exists() && !managed.join("old-assets.bin").exists());
+        assert!(next.is_file() && pending_exe.is_file());
         Ok(())
     }
 
+    #[cfg(windows)]
     #[test]
-    fn official_release_cleanup_uses_manifest_not_directory_contents() -> Result<()> {
+    fn non_save_assets_need_not_be_readable_during_retirement() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
         let temp = tempfile::tempdir()?;
         let root = temp.path();
-        let managed = root.join("Games").join("Dusklight");
-        let old = managed.join("v1.2.3-aaaaaaaaaaaa");
-        fs::create_dir_all(old.join("bin"))?;
-        let exe = old.join("bin").join("dusklight.exe");
-        for name in [
-            "bin\\dusklight.exe",
-            "owned.dll",
-            "edited.dll",
-            "custom.ini",
-        ] {
-            fs::write(old.join(name), b"verified")?;
+        let managed = root.join("Games").join("Longshot");
+        let old = managed
+            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+            .join("game");
+        let new = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+        let asset = old.join("assets.bin");
+        fs::write(&asset, b"old unreadable assets")?;
+        let _deny_reads = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(&asset)?;
+        SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
+            .context("Missing previous build")?
+            .compact(root)?;
+        assert!(!old.exists() && new_exe.is_file());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Creates an isolated 4,096-file cleanup benchmark"]
+    fn large_file_tree_cleanup_benchmark() -> Result<()> {
+        use std::time::Instant;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetProcessIoCounters, IO_COUNTERS,
+        };
+        fn counters() -> Result<IO_COUNTERS> {
+            let mut counters = IO_COUNTERS::default();
+            // The process pseudo-handle and initialized output storage remain valid for this call.
+            ensure!(
+                unsafe { GetProcessIoCounters(GetCurrentProcess(), &mut counters) } != 0,
+                "Reading benchmark I/O counters: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(counters)
         }
-        let hash = sha256(b"verified");
-        let files = ["bin\\dusklight.exe", "owned.dll", "edited.dll"]
-            .map(|path| json!({"path": path, "sha256": hash, "size": 8}));
-        fs::write(
-            old.join("twilight-install.json"),
-            serde_json::to_vec(&json!({
-                "version": 1, "tag": "v1.2.3", "archive_sha256": "a".repeat(64),
-                "executable": "bin\\dusklight.exe", "files": files
-            }))?,
-        )?;
-        fs::write(old.join("edited.dll"), b"modified")?;
-        let next = seed_source(
-            &managed.join("next"),
-            GameId::Dusklight,
-            "triforce",
-            "dusklight.exe",
-        )?;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let managed = root.join("Games").join("Longshot");
+        let old = managed
+            .join("source-v1.2.3-aaaaaaaaaaaa-Abc123")
+            .join("game");
+        let new = managed
+            .join("source-v1.2.4-bbbbbbbbbbbb-Def456")
+            .join("game");
+        let old_exe = seed_source(&old, GameId::Triforce, "longshot", "longshot.exe")?;
+        let new_exe = seed_source(&new, GameId::Triforce, "longshot", "longshot.exe")?;
+        let bytes = vec![37; 16 * 1024];
+        for directory in [&old, &new] {
+            for group in 0..64 {
+                let folder = directory.join("romfs").join(format!("area-{group:02}"));
+                fs::create_dir_all(&folder)?;
+                for file in 0..64 {
+                    fs::write(folder.join(format!("data-{file:02}.bin")), &bytes)?;
+                }
+            }
+        }
         let cleanup =
-            SourceBackup::previous(root, &managed, GameId::Dusklight, &exe, &next, vec![])
-                .context("Expected the official predecessor")?;
-        assert!(cleanup.compact(root).is_err());
-        assert!(exe.exists());
-        assert!(old.join("owned.dll").exists());
-        assert_eq!(fs::read(old.join("edited.dll"))?, b"modified");
-        assert_eq!(fs::read(old.join("custom.ini"))?, b"verified");
-        fs::write(next.with_file_name("edited.dll"), b"modified")?;
-        fs::write(next.with_file_name("custom.ini"), b"verified")?;
-        cleanup.compact(root)?;
-        assert!(!old.exists());
-        assert!(next.is_file());
+            SourceBackup::previous(root, &managed, GameId::Triforce, &old_exe, &new_exe, vec![])
+                .context("Missing previous benchmark build")?;
+        let before = counters()?;
+        let started = Instant::now();
+        let mut read = 0;
+        let summary = cleanup.compact_with_progress(root, &mut |update| {
+            read += update.bytes;
+            Ok(())
+        })?;
+        let elapsed = started.elapsed();
+        let after = counters()?;
+        println!(
+            "cleanup benchmark: files=4096, elapsed={elapsed:.3?}, saved_bytes_read={read}, metadata_io={}, read_io={}\n{summary}",
+            after.OtherOperationCount - before.OtherOperationCount,
+            after.ReadOperationCount - before.ReadOperationCount,
+        );
+        assert_eq!(
+            read, 0,
+            "A save-free installation must not read game assets"
+        );
+        assert!(!old.parent().context("Missing old wrapper")?.exists() && new_exe.is_file());
         Ok(())
     }
 }

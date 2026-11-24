@@ -41,7 +41,7 @@ browser. The optional official-package test runs only the bundled setup's
 ### Source builds and Triforce parity
 
 ```powershell
-cargo test --lib --locked -- source_build:: triforce totk::tests runtime::tests ui:: protocol::game_channel_tests lan::tests
+cargo test --lib --locked -- source_build:: game_layout:: post_update:: triforce totk::tests runtime::tests ui:: protocol::game_channel_tests lan::tests
 ```
 
 Fixtures verify source-commit/approval gating, refusal to run without game inputs,
@@ -56,6 +56,23 @@ without running SDK installers or game builds. Synthetic game files are never ex
 Process monitors default to explicit simulation in unit tests so unrelated games
 on a shared test host do not affect temporary fixtures; production monitoring is
 unchanged.
+
+Old-install cleanup tests cover save-only backups for Dusklight, TotK, Triforce
+and Longshot, preservation of differing older progress without replacing the
+selected save, cancellation during save copying, and failure before deletion.
+They verify that different or unreadable non-save assets do not block removal,
+active/pending/other-project installs stay intact, and partial retirement can
+resume. Runtime tests cover live progress, command guards and release on every
+outcome; deferred cleanup remains protected across restarts.
+
+An optional isolated cleanup benchmark creates 4,096 synthetic 16 KiB files in
+each installation, retires the old tree without reading game assets, and prints
+elapsed time, save bytes read and process I/O counts. Fixture creation and temporary-directory
+cleanup are outside the measured interval; no real installation is touched:
+
+```powershell
+cargo test --lib --locked game_layout::backup::tests::large_file_tree_cleanup_benchmark -- --ignored --exact --nocapture
+```
 
 Optional live checks execute no upstream code:
 
